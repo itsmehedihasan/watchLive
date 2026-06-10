@@ -122,7 +122,7 @@ export default function VideoPlayer({ channel }: Props) {
         <div className="text-7xl mb-5 animate-bounce">📺</div>
         <p className="text-gray-300 text-lg font-semibold">Select a channel to watch</p>
         <p className="text-gray-600 text-sm mt-2 hidden sm:block">Browse channels in the sidebar</p>
-        <p className="text-gray-600 text-sm mt-2 sm:hidden">Tap Guide to browse channels</p>
+        <p className="text-gray-600 text-sm mt-2 sm:hidden">Select a channel below</p>
       </div>
     );
   }
