@@ -142,22 +142,20 @@ export default function HomePage() {
           </svg>
         </button>
 
-        <div className="flex items-center gap-2 flex-shrink-0">
+        <button
+          onClick={() => { setSelected(null); setMobileChannelsOpen(false); }}
+          className="flex items-center gap-2 flex-shrink-0 cursor-pointer hover:opacity-80 transition-opacity"
+        >
           <span className="text-2xl">📺</span>
           <span className="font-bold text-base sm:text-lg tracking-tight">LiveTV</span>
-          {!loadingPlaylist && (
-            <span className="hidden sm:inline text-xs text-gray-500 bg-[#252525] px-2 py-0.5 rounded-full">
-              {channels.length} channels
-            </span>
-          )}
-          {!selected && totalViewers != null && (
-            <span className="text-xs text-gray-500 bg-[#252525] px-2 py-0.5 rounded-full flex items-center gap-1">
-              <span>👥</span>
-              <span>{totalViewers} active</span>
-            </span>
-          )}
-        </div>
+        </button>
 
+        {!selected && totalViewers != null && (
+          <span className="text-xs text-gray-500 bg-[#252525] px-2 py-0.5 rounded-full flex items-center gap-1">
+            <span>👥</span>
+            <span>{totalViewers} active</span>
+          </span>
+        )}
       </header>
 
 
