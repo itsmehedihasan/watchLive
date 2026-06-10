@@ -12,7 +12,7 @@ A browser-based live TV streaming app built with Next.js. Loads an M3U playlist,
 | UI | React 19, Tailwind CSS 4 |
 | Streaming | HLS.js 1.6.16 |
 | Language | TypeScript 5 |
-| Storage | In-memory (no database) |
+| Storage | Upstash Redis (serverless) |
 
 ---
 
@@ -24,14 +24,15 @@ app/
   page.tsx                Home page — channel list, search, header, session logic
   globals.css             Tailwind + custom animations
   api/
-    viewers/route.ts      Session heartbeat & viewer count API
-    proxy/route.ts        HLS stream/playlist proxy
+    viewers/route.ts      Session heartbeat & viewer count API (Node.js runtime)
+    proxy/route.ts        HLS stream/playlist proxy (Edge Runtime)
 
 components/
   VideoPlayer.tsx         Video player, carousel, controls
 
 lib/
   parseM3U.ts             M3U playlist parser and Channel data model
+  redis.ts                Singleton Upstash Redis client
 
 public/
   list.txt                M3U playlist (channel source)
@@ -122,20 +123,29 @@ Every **30 seconds**, and immediately when the user switches channels, the clien
 
 ### Server-Side Tracking (`app/api/viewers/route.ts`)
 
-The API stores two in-memory maps:
+Viewer state is stored in **Upstash Redis** — a serverless Redis instance accessible over HTTPS. This means counts are shared across all Vercel function instances and survive server restarts.
 
-```
-sessions   Map<sessionId → { ts: timestamp, channelId: string | null }>
-viewCounts Map<channelId → number>  (cumulative tune-in events, never decrements)
-```
+**Redis key schema:**
+
+| Key | Type | TTL | Purpose |
+|---|---|---|---|
+| `session:{sid}` | Hash (`channelId`, `ts`) | 60 s | Per-session data |
+| `session:channel:{sid}` | String | 60 s | Previous-channel lookup for DECR on switch |
+| `viewers:total` | String (int) | none | Global active session counter (INCR/DECR) |
+| `channel:viewers:{channelId}` | String (int) | 90 s | Active viewers on one channel |
+| `tunein:counts` | Sorted set | none | Cumulative tune-ins per channel (ZINCRBY) |
 
 On each POST:
 
-1. **Prune** — remove sessions not seen in the last 60 seconds
-2. **Detect channel change** — if the session switched to a new channel, increment `viewCounts[newChannelId]`
-3. **Upsert session** — update the session's timestamp and current channel
+1. Read `session:channel:{sid}` to get the previous channel
+2. Build a pipeline:
+   - Upsert session hash + refresh TTL
+   - If new session → `INCR viewers:total`
+   - If channel changed → `DECR channel:viewers:{prev}`, `ZINCRBY tunein:counts`, `INCR channel:viewers:{new}`
+   - If same channel → refresh TTL on `channel:viewers:{channelId}`
+3. Read pipeline: `viewers:total`, `channel:viewers:{channelId}`, top-5 from `tunein:counts`
 
-Response:
+Response (same shape as before):
 
 ```json
 {
@@ -153,9 +163,9 @@ Response:
 
 | Field | Meaning |
 |---|---|
-| `total` | Number of sessions active in the last 60 seconds (regardless of channel) |
+| `total` | Sessions active in the last 60 seconds (all channels) |
 | `channelCount` | Sessions currently on a specific channel |
-| `top[].count` | Cumulative tune-ins for that channel since last server restart |
+| `top[].count` | Cumulative tune-ins for that channel (persists across restarts) |
 
 ### Where Counts Are Displayed
 
@@ -163,17 +173,11 @@ Response:
 - **Now Playing bar** — `N watching` (viewers on the current channel)
 - **Carousel** — channels are ordered by `top[].count` to surface popular channels
 
-### Important Limitations
-
-- All state is in-memory. Counts reset on server restart.
-- Viewer counts are not shared across multiple server instances.
-- `viewCounts` tracks tune-in events, not unique viewers.
-
 ---
 
 ## HLS Stream Proxy (`app/api/proxy`)
 
-Stream URLs are routed through a local proxy to solve CORS restrictions on third-party CDNs.
+Stream URLs are routed through a proxy to solve CORS restrictions on third-party CDNs. The proxy runs on **Vercel Edge Runtime** — no cold starts, executes at the nearest PoP to the user.
 
 **Request:**
 ```
@@ -185,7 +189,7 @@ The proxy:
 1. Forwards the request with browser-like headers (User-Agent, Referer, Origin) to bypass hotlink protection
 2. Detects whether the response is an M3U8 playlist or a binary segment
 3. **Playlist** — rewrites all relative segment and key URLs to absolute proxied URLs, so subsequent requests also go through the proxy
-4. **Segments** — streams binary data directly to the client
+4. **Segments** — streams binary data with a 10-second edge cache (`Cache-Control: public, max-age=10`). HLS segments are write-once, so caching them reduces duplicate upstream fetches when multiple viewers watch the same channel
 
 The video player points HLS.js at the proxy URL — the app never fetches stream data directly from the CDN.
 
@@ -242,6 +246,19 @@ On mobile, the sidebar hides when a channel is selected. A "More Channels" butto
 
 ## Running the App
 
+### Environment variables
+
+Create a `.env.local` file in the project root (see `.env.local.example`):
+
+```
+UPSTASH_REDIS_REST_URL=https://<your-db>.upstash.io
+UPSTASH_REDIS_REST_TOKEN=<your-token>
+```
+
+Get these from [upstash.com](https://upstash.com) — free tier is sufficient. Add the same variables to your Vercel project settings before deploying.
+
+### Commands
+
 ```bash
 npm install
 npm run dev        # dev server on localhost:3000
@@ -264,8 +281,8 @@ node scripts/filter-bangladeshi.mjs
 ## Data Flow Summary
 
 ```
-Browser                         Server
-──────────────────────────────────────────────────────────────────
+Browser                         Server (Vercel)
+──────────────────────────────────────────────────────────────────────────
   Load page
     → fetch /list.txt           ← static file
     → parseM3U()
@@ -273,15 +290,15 @@ Browser                         Server
 
   Generate sessionId (sessionStorage)
 
-  POST /api/viewers             → upsert session, count viewers
-    ← { total, channelCount,      prune stale sessions (60s TTL)
-        top }                      return counts
-  (repeat every 30s or on
+  POST /api/viewers             → read prev channel from Redis
+    ← { total, channelCount,      pipeline: upsert session, INCR/DECR counters
+        top }                      read pipeline: total, channelCount, top-5
+  (repeat every 30s or on         ↕ Upstash Redis (shared across instances)
    channel switch)
 
   Select channel
     → HLS.js loads
-       /api/proxy?url=...       → fetch from CDN (browser headers)
-         ← playlist              rewrite URLs in playlist
-         ← segments              stream binary data
+       /api/proxy?url=...       → Edge Runtime (nearest PoP)
+         ← playlist               fetch from CDN, rewrite URLs
+         ← segments               stream binary, cache 10s at edge
 ```
