@@ -113,12 +113,17 @@ export default function HomePage() {
     return channels.filter(ch => ch.name.toLowerCase().includes(q) || ch.group.toLowerCase().includes(q));
   }, [channels, search]);
 
-  // Top-5 channels for the carousel; falls back to first 5 until view data arrives
+  // Top channels for carousel sorted by viewer count (default 0); always at least 5
   const carouselChannels = useMemo<Channel[]>(() => {
-    if (topChannelIds.length === 0) return channels.slice(0, 5);
-    return topChannelIds
+    const topIdSet = new Set(topChannelIds);
+    const top = topChannelIds
       .map(id => channels.find(ch => ch.id === id))
       .filter((ch): ch is Channel => ch != null);
+    if (top.length < 5) {
+      const extras = channels.filter(ch => !topIdSet.has(ch.id));
+      top.push(...extras.slice(0, 5 - top.length));
+    }
+    return top;
   }, [channels, topChannelIds]);
 
   const handleSelectChannel = useCallback((ch: Channel) => {
