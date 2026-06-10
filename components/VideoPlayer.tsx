@@ -200,12 +200,21 @@ export default function VideoPlayer({ channel, channelViewerCount, channels = []
             lowLatencyMode: false,               // standard HLS streams, not LL-HLS — low latency mode shrinks buffer and hurts quality
             capLevelToPlayerSize: false,         // never cap quality to player element size
             startLevel: -1,                      // ABR picks start, then we lock to highest after manifest
+            startFragPrefetch: true,             // begin loading first fragment during manifest parse — faster first frame
             maxMaxBufferLength: 60,              // larger buffer → smoother ABR decisions
+            backBufferLength: 0,                 // live TV — no need to keep back buffer; frees memory and avoids GC pauses
             abrEwmaDefaultEstimate: 5_000_000,  // assume 5 Mbps upfront so ABR starts at high quality immediately
           });
           hlsRef.current = hls;
           hls.loadSource(proxyUrl(channel.url));
           hls.attachMedia(video);
+
+          const updateQualityBadge = (levelIndex: number) => {
+            const level = hls.levels[levelIndex];
+            if (!level) return;
+            if (level.height) setQuality(`${level.height}p`);
+            else if (level.bitrate) setQuality(`${Math.round(level.bitrate / 1000)}k`);
+          };
 
           hls.once(Hls.Events.MANIFEST_PARSED, () => {
             if (cancelled) return;
@@ -213,11 +222,14 @@ export default function VideoPlayer({ channel, channelViewerCount, channels = []
               const maxLevel = hls.levels.length - 1;
               hls.currentLevel = maxLevel;
               hls.nextAutoLevel = maxLevel;      // prevent ABR from drifting back down after error recovery
-              const top = hls.levels[maxLevel];
-              if (top?.height) setQuality(`${top.height}p`);
+              updateQualityBadge(maxLevel);
             }
             setState('playing');
             video.play().catch(() => {});
+          });
+
+          hls.on(Hls.Events.LEVEL_SWITCHED, (_: unknown, data: { level: number }) => {
+            if (!cancelled) updateQualityBadge(data.level);
           });
 
           hls.on(Hls.Events.ERROR, (_: unknown, data: { fatal: boolean; type: string }) => {
