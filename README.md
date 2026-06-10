@@ -189,7 +189,8 @@ The proxy:
 1. Forwards the request with browser-like headers (User-Agent, Referer, Origin) to bypass hotlink protection
 2. Detects whether the response is an M3U8 playlist or a binary segment
 3. **Playlist** — rewrites all relative segment and key URLs to absolute proxied URLs, so subsequent requests also go through the proxy
-4. **Segments** — streams binary data with a 10-second edge cache (`Cache-Control: public, max-age=10`). HLS segments are write-once, so caching them reduces duplicate upstream fetches when multiple viewers watch the same channel
+4. **Playlists** — rewritten and served with a 3-second edge cache (`Cache-Control: public, s-maxage=3`). Concurrent viewers on the same channel share one upstream fetch per playlist update cycle instead of each triggering their own
+5. **Segments** — streamed with a 5-minute edge cache (`Cache-Control: public, max-age=30, s-maxage=300`). HLS segments are write-once and immutable by URL, so they can be cached aggressively — multiple viewers watching the same channel hit the edge cache instead of the upstream CDN
 
 The video player points HLS.js at the proxy URL — the app never fetches stream data directly from the CDN.
 
