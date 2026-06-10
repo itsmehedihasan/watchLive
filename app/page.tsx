@@ -104,7 +104,7 @@ export default function HomePage() {
 
 
       {/* ── Body ───────────────────────────────────────────────────────── */}
-      <div className="flex flex-col sm:flex-row flex-1 overflow-hidden">
+      <div className="flex flex-col sm:flex-row flex-1 overflow-hidden min-h-0">
 
         {/* Sidebar — collapsible on mobile when channel selected, side panel on desktop */}
         <aside className={`order-2 sm:order-1 flex-1 sm:flex-none sm:w-56 bg-[#161616] border-t sm:border-t-0 sm:border-r border-[#222] flex flex-col overflow-hidden min-h-0${!sidebarOpen ? ' sm:hidden' : ''}${selected && !mobileChannelsOpen ? ' hidden sm:flex' : ''}`}>
@@ -130,7 +130,7 @@ export default function HomePage() {
             </div>
 
             {/* Channel list */}
-            <div className="flex-1 overflow-y-auto pb-4">
+            <div className="flex-1 overflow-y-auto min-h-0 pb-6">
               {loadingPlaylist ? (
                 <div className="flex flex-col items-center justify-center h-40 gap-3 text-gray-500">
                   <div className="w-8 h-8 border-2 border-gray-600 border-t-blue-500 rounded-full animate-spin" />

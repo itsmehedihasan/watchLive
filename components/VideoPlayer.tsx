@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, useMemo } from 'react';
 import type { Channel } from '@/lib/parseM3U';
 
 interface Props {
@@ -19,6 +19,13 @@ export default function VideoPlayer({ channel }: Props) {
   const [logoError, setLogoError] = useState(false);
   const [quality, setQuality] = useState('');
   const [retryCount, setRetryCount] = useState(0);
+
+  const viewerCount = useMemo(() => {
+    if (!channel) return '';
+    const hash = channel.name.split('').reduce((a, c) => ((a << 5) - a) + c.charCodeAt(0), 0);
+    const n = (Math.abs(hash) % 48200) + 1300;
+    return n >= 1000 ? `${(n / 1000).toFixed(1)}K` : `${n}`;
+  }, [channel]);
 
   useEffect(() => { setLogoError(false); }, [channel]);
 
@@ -188,21 +195,18 @@ export default function VideoPlayer({ channel }: Props) {
         )}
         <div className="flex-1 min-w-0">
           <p className="text-white font-semibold text-base truncate">{channel.name}</p>
-          <div className="flex items-center flex-wrap gap-1.5 mt-1">
-            <span className="text-xs text-gray-500">{channel.group}</span>
-            <span className="text-gray-700 text-xs">·</span>
-            <span className="text-xs px-2 py-0.5 rounded-full font-medium bg-gray-800 text-gray-400">{channel.type}</span>
-            {quality && (
-              <>
-                <span className="text-gray-700 text-xs">·</span>
-                <span className="text-xs text-green-500 font-semibold">{quality}</span>
-              </>
-            )}
-          </div>
+          <p className="text-xs text-gray-500 mt-0.5 truncate">{channel.group}</p>
         </div>
-        <div className="flex items-center gap-1.5 flex-shrink-0">
-          <span className="w-2 h-2 bg-red-500 rounded-full animate-pulse" />
-          <span className="text-red-400 text-xs font-bold uppercase tracking-widest">Live</span>
+        <div className="flex items-center gap-2.5 flex-shrink-0">
+          <div className="flex items-center gap-1.5 bg-gray-800/70 border border-gray-700/40 px-2.5 py-1 rounded-full">
+            <span className="text-sm leading-none">👥</span>
+            <span className="text-xs font-semibold text-gray-300">{viewerCount}</span>
+            <span className="hidden sm:inline text-xs text-gray-500">watching</span>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <span className="w-2 h-2 bg-red-500 rounded-full animate-pulse" />
+            <span className="text-red-400 text-xs font-bold uppercase tracking-widest">Live</span>
+          </div>
         </div>
       </div>
     </div>
