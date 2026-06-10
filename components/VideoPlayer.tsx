@@ -71,10 +71,6 @@ function ChannelCarousel({ channels, onSelect }: { channels: Channel[]; onSelect
     return () => { if (timerRef.current) clearInterval(timerRef.current); };
   }, [total]);
 
-  const strip = total > 1
-    ? Array.from({ length: Math.min(5, total - 1) }, (_, i) => channels[(idx + 1 + i) % total])
-    : [];
-
   if (!featured) {
     return (
       <div className="flex flex-col items-center justify-center min-h-[300px] sm:min-h-[400px] bg-gray-950 rounded-2xl border border-gray-800">
@@ -85,84 +81,63 @@ function ChannelCarousel({ channels, onSelect }: { channels: Channel[]; onSelect
   }
 
   return (
-    <div className="flex flex-col gap-3">
-      {/* Featured card */}
-      <div className="relative bg-gray-950 rounded-2xl border border-gray-800 overflow-hidden min-h-[240px] sm:min-h-[340px]">
+    <div className="relative bg-gray-950 rounded-2xl border border-gray-800 overflow-hidden min-h-[240px] sm:min-h-[340px]">
 
-        {/* Background glow — decorative only */}
-        <div className="absolute inset-0 bg-gradient-to-br from-blue-950/30 via-transparent to-purple-950/20 pointer-events-none" />
+      {/* Background glow — decorative only */}
+      <div className="absolute inset-0 bg-gradient-to-br from-blue-950/30 via-transparent to-purple-950/20 pointer-events-none" />
 
-        {/* Animated content — key changes on every slide to restart the animation */}
-        <div
-          key={animKey}
-          className={`flex flex-col items-center justify-center gap-4 px-6 py-10 min-h-[240px] sm:min-h-[340px] ${slideDir === 'right' ? 'slide-from-right' : 'slide-from-left'}`}
-        >
-          <CarouselLogo logo={featured.logo} name={featured.name} />
-          <div className="text-center">
-            <p className="text-white font-bold text-xl sm:text-2xl leading-tight">{featured.name}</p>
-            <p className="text-gray-500 text-sm mt-1">{featured.group}</p>
-          </div>
-          <button
-            onClick={() => onSelect(featured)}
-            className="relative z-10 flex items-center gap-2 cursor-pointer bg-blue-600 hover:bg-blue-500 active:scale-95 text-white text-sm font-semibold px-6 py-2.5 rounded-full transition-all mt-1 shadow-lg shadow-blue-900/40"
-          >
-            <span className="w-2 h-2 bg-red-400 rounded-full animate-pulse" />
-            Watch Live
-          </button>
+      {/* Animated content — key changes on every slide to restart the animation */}
+      <div
+        key={animKey}
+        className={`flex flex-col items-center justify-center gap-4 px-6 py-10 min-h-[240px] sm:min-h-[340px] ${slideDir === 'right' ? 'slide-from-right' : 'slide-from-left'}`}
+      >
+        <CarouselLogo logo={featured.logo} name={featured.name} />
+        <div className="text-center">
+          <p className="text-white font-bold text-xl sm:text-2xl leading-tight">{featured.name}</p>
+          <p className="text-gray-500 text-sm mt-1">{featured.group}</p>
         </div>
-
-        {/* Prev arrow — z-20 so it's always above the content layer */}
         <button
-          onClick={() => { advance(-1); resetTimer(); }}
-          className="absolute left-3 top-1/2 -translate-y-1/2 z-20 cursor-pointer bg-black/60 hover:bg-black/90 text-white rounded-full w-9 h-9 flex items-center justify-center transition-all backdrop-blur-sm shadow-md"
-          aria-label="Previous channel"
+          onClick={() => onSelect(featured)}
+          className="relative z-10 flex items-center gap-2 cursor-pointer bg-blue-600 hover:bg-blue-500 active:scale-95 text-white text-sm font-semibold px-6 py-2.5 rounded-full transition-all mt-1 shadow-lg shadow-blue-900/40"
         >
-          <svg width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
-            <polyline points="15 18 9 12 15 6"/>
-          </svg>
+          <span className="w-2 h-2 bg-red-400 rounded-full animate-pulse" />
+          Watch Live
         </button>
-        <button
-          onClick={() => { advance(1); resetTimer(); }}
-          className="absolute right-3 top-1/2 -translate-y-1/2 z-20 cursor-pointer bg-black/60 hover:bg-black/90 text-white rounded-full w-9 h-9 flex items-center justify-center transition-all backdrop-blur-sm shadow-md"
-          aria-label="Next channel"
-        >
-          <svg width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
-            <polyline points="9 18 15 12 9 6"/>
-          </svg>
-        </button>
-
-        {/* Dot indicators — z-20 */}
-        {total > 1 && (
-          <div className="absolute bottom-3 left-1/2 -translate-x-1/2 flex gap-1.5 z-20">
-            {Array.from({ length: Math.min(total, 10) }).map((_, i) => (
-              <button
-                key={i}
-                onClick={() => { setSlideDir(i > idx ? 'right' : 'left'); setAnimKey(k => k + 1); setIdx(i); resetTimer(); }}
-                className={`cursor-pointer rounded-full transition-all ${
-                  i === idx % Math.min(total, 10)
-                    ? 'w-5 h-1.5 bg-blue-500'
-                    : 'w-1.5 h-1.5 bg-gray-600 hover:bg-gray-400'
-                }`}
-              />
-            ))}
-          </div>
-        )}
       </div>
 
-      {/* Thumbnail strip */}
-      {strip.length > 0 && (
-        <div className="grid grid-cols-5 gap-2">
-          {strip.map((ch) => (
+      {/* Prev arrow — z-20 so it's always above the content layer */}
+      <button
+        onClick={() => { advance(-1); resetTimer(); }}
+        className="absolute left-3 top-1/2 -translate-y-1/2 z-20 cursor-pointer bg-black/60 hover:bg-black/90 text-white rounded-full w-9 h-9 flex items-center justify-center transition-all backdrop-blur-sm shadow-md"
+        aria-label="Previous channel"
+      >
+        <svg width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
+          <polyline points="15 18 9 12 15 6"/>
+        </svg>
+      </button>
+      <button
+        onClick={() => { advance(1); resetTimer(); }}
+        className="absolute right-3 top-1/2 -translate-y-1/2 z-20 cursor-pointer bg-black/60 hover:bg-black/90 text-white rounded-full w-9 h-9 flex items-center justify-center transition-all backdrop-blur-sm shadow-md"
+        aria-label="Next channel"
+      >
+        <svg width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
+          <polyline points="9 18 15 12 9 6"/>
+        </svg>
+      </button>
+
+      {/* Dot indicators — z-20 */}
+      {total > 1 && (
+        <div className="absolute bottom-3 left-1/2 -translate-x-1/2 flex gap-1.5 z-20">
+          {Array.from({ length: Math.min(total, 10) }).map((_, i) => (
             <button
-              key={ch.id}
-              onClick={() => onSelect(ch)}
-              className="flex flex-col items-center gap-1.5 cursor-pointer bg-gray-900/60 hover:bg-gray-800/80 border border-gray-800 hover:border-gray-600 rounded-xl p-2 transition-all group/thumb"
-            >
-              <CarouselLogo logo={ch.logo} name={ch.name} />
-              <span className="text-[10px] sm:text-xs text-gray-400 group-hover/thumb:text-white truncate w-full text-center leading-tight">
-                {ch.name}
-              </span>
-            </button>
+              key={i}
+              onClick={() => { setSlideDir(i > idx ? 'right' : 'left'); setAnimKey(k => k + 1); setIdx(i); resetTimer(); }}
+              className={`cursor-pointer rounded-full transition-all ${
+                i === idx % Math.min(total, 10)
+                  ? 'w-5 h-1.5 bg-blue-500'
+                  : 'w-1.5 h-1.5 bg-gray-600 hover:bg-gray-400'
+              }`}
+            />
           ))}
         </div>
       )}
