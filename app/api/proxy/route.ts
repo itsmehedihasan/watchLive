@@ -77,7 +77,7 @@ export async function GET(request: NextRequest) {
         headers: {
           'Content-Type': 'application/vnd.apple.mpegurl',
           'Access-Control-Allow-Origin': '*',
-          'Cache-Control': 'no-cache, no-store',
+          'Cache-Control': 'public, max-age=2, s-maxage=3',
         },
       });
     }
@@ -89,7 +89,7 @@ export async function GET(request: NextRequest) {
       headers: {
         'Content-Type': contentType || 'video/MP2T',
         'Access-Control-Allow-Origin': '*',
-        'Cache-Control': 'public, max-age=10, s-maxage=10',
+        'Cache-Control': 'public, max-age=30, s-maxage=300',
       },
     });
   } catch (err) {
