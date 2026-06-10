@@ -76,8 +76,15 @@ export default function VideoPlayer({ channel }: Props) {
             video.play().catch(() => {});
           });
 
-          hls.on(Hls.Events.ERROR, (_: unknown, data: { fatal: boolean }) => {
-            if (data.fatal && !cancelled) setState('error');
+          hls.on(Hls.Events.ERROR, (_: unknown, data: { fatal: boolean; type: string }) => {
+            if (!data.fatal || cancelled) return;
+            if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+              hls.startLoad();
+            } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+              hls.recoverMediaError();
+            } else {
+              setState('error');
+            }
           });
         } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
           video.src = proxyUrl(channel.url);
