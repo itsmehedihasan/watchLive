@@ -121,7 +121,8 @@ export default function VideoPlayer({ channel }: Props) {
       <div className="flex flex-col items-center justify-center min-h-[300px] sm:min-h-[400px] bg-gray-950 rounded-2xl border border-gray-800">
         <div className="text-7xl mb-5 animate-bounce">📺</div>
         <p className="text-gray-300 text-lg font-semibold">Select a channel to watch</p>
-        <p className="text-gray-600 text-sm mt-2">Browse channels in the sidebar</p>
+        <p className="text-gray-600 text-sm mt-2 hidden sm:block">Browse channels in the sidebar</p>
+        <p className="text-gray-600 text-sm mt-2 sm:hidden">Tap Guide to browse channels</p>
       </div>
     );
   }
@@ -153,8 +154,8 @@ export default function VideoPlayer({ channel }: Props) {
         )}
         <video ref={videoRef} className="w-full h-full" controls playsInline />
 
-        {/* Hover overlay: quality badge + fullscreen button */}
-        <div className="absolute top-3 right-3 flex items-center gap-2 z-20 opacity-0 group-hover:opacity-100 transition-opacity duration-200">
+        {/* Hover overlay: quality badge + fullscreen button (always visible on touch devices) */}
+        <div className="absolute top-3 right-3 flex items-center gap-2 z-20 opacity-0 group-hover:opacity-100 transition-opacity duration-200 touch-visible">
           {quality && (
             <span className="bg-black/75 backdrop-blur-sm text-green-400 text-[11px] font-bold px-2.5 py-1 rounded-lg pointer-events-none">
               {quality}

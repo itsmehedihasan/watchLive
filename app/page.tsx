@@ -55,7 +55,7 @@ function FilterPill({
   return (
     <button
       onClick={onClick}
-      className={`flex-shrink-0 flex items-center gap-1 text-xs px-3 py-1.5 rounded-full font-medium transition-all duration-150 ${
+      className={`flex-shrink-0 flex items-center gap-1 text-xs px-3 py-2 sm:py-1.5 rounded-full font-medium transition-all duration-150 ${
         active ? activeClass : 'bg-[#252525] text-gray-400 hover:bg-[#333] hover:text-white'
       }`}
     >
@@ -73,7 +73,19 @@ export default function HomePage() {
   const [typeFilter, setTypeFilter] = useState('All');
   const [groupFilter, setGroupFilter] = useState('All');
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [isMobile, setIsMobile] = useState(false);
   const searchInputRef = useRef<HTMLInputElement>(null);
+
+  // Detect mobile; on first mobile detection close sidebar so player shows first
+  useEffect(() => {
+    const check = () => window.innerWidth < 640;
+    const mobile = check();
+    setIsMobile(mobile);
+    if (mobile) setSidebarOpen(false);
+    const onResize = () => setIsMobile(check());
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
 
   useEffect(() => {
     fetch('/list.txt')
@@ -82,6 +94,7 @@ export default function HomePage() {
         const parsed = parseM3U(text);
         setChannels(parsed);
         setLoadingPlaylist(false);
+        if (parsed.length > 0) setSelected(parsed[0]);
       })
       .catch(() => setLoadingPlaylist(false));
   }, []);
@@ -142,6 +155,12 @@ export default function HomePage() {
     setSearch('');
   }, []);
 
+  // Select channel and auto-close sidebar on mobile
+  const handleSelectChannel = useCallback((ch: Channel) => {
+    setSelected(ch);
+    if (isMobile) setSidebarOpen(false);
+  }, [isMobile]);
+
   const hasActiveFilter =
     typeFilter !== 'All' || groupFilter !== 'All' || search !== '';
 
@@ -153,14 +172,14 @@ export default function HomePage() {
         <button
           onClick={() => setSidebarOpen(v => !v)}
           title="Toggle sidebar"
-          className="text-gray-400 hover:text-white p-2 rounded-lg hover:bg-gray-800 transition-colors"
+          className="text-gray-400 hover:text-white p-2 rounded-lg hover:bg-gray-800 transition-colors flex-shrink-0"
         >
           <svg width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
             <line x1="3" y1="6" x2="21" y2="6" /><line x1="3" y1="12" x2="21" y2="12" /><line x1="3" y1="18" x2="21" y2="18" />
           </svg>
         </button>
 
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-shrink-0">
           <span className="text-2xl">📺</span>
           <span className="font-bold text-base sm:text-lg tracking-tight">LiveTV</span>
           {!loadingPlaylist && (
@@ -170,7 +189,14 @@ export default function HomePage() {
           )}
         </div>
 
-        <div className="ml-auto flex items-center gap-2">
+        {/* Mobile: show currently playing channel name when sidebar is closed */}
+        {selected && !sidebarOpen && (
+          <p className="flex-1 min-w-0 text-xs text-gray-400 truncate sm:hidden ml-1">
+            {selected.name}
+          </p>
+        )}
+
+        <div className="ml-auto flex items-center gap-2 flex-shrink-0">
           <div className="relative">
             <svg className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-500 pointer-events-none" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
               <circle cx="11" cy="11" r="8" /><line x1="21" y1="21" x2="16.65" y2="16.65" />
@@ -180,8 +206,8 @@ export default function HomePage() {
               value={search}
               onChange={e => setSearch(e.target.value)}
               ref={searchInputRef}
-              placeholder="Search  (/)"
-              className="bg-[#252525] rounded-full pl-8 pr-4 py-1.5 text-sm text-white placeholder-gray-600 border border-[#333] focus:border-blue-500 focus:outline-none w-40 sm:w-56 transition-colors"
+              placeholder="Search…"
+              className="bg-[#252525] rounded-full pl-8 pr-4 py-2 sm:py-1.5 text-sm text-white placeholder-gray-600 border border-[#333] focus:border-blue-500 focus:outline-none w-32 sm:w-56 transition-colors"
             />
             {search && (
               <button onClick={() => setSearch('')} className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-white">✕</button>
@@ -189,7 +215,7 @@ export default function HomePage() {
           </div>
           {hasActiveFilter && (
             <button onClick={resetFilters} className="text-xs text-red-400 hover:text-red-300 px-2 py-1.5 rounded-lg hover:bg-red-900/20 transition-colors whitespace-nowrap">
-              Clear filters
+              Clear
             </button>
           )}
         </div>
@@ -198,7 +224,7 @@ export default function HomePage() {
       {/* ── Filter bar ─────────────────────────────────────────────────── */}
       <div className="flex-shrink-0 bg-[#141414] border-b border-[#222] px-4 py-2 z-10">
         <div className="flex items-center gap-2 overflow-x-auto scrollbar-hide">
-          <span className="text-[11px] text-gray-600 font-medium uppercase tracking-wider flex-shrink-0 w-14">Type</span>
+          <span className="text-[11px] text-gray-600 font-medium uppercase tracking-wider flex-shrink-0 w-14 hidden sm:block">Type</span>
           <div className="flex items-center gap-1.5">
             {types.map(t => (
               <FilterPill key={t} active={typeFilter === t} onClick={() => setTypeFilter(t)} color="purple">
@@ -212,9 +238,47 @@ export default function HomePage() {
       {/* ── Body ───────────────────────────────────────────────────────── */}
       <div className="flex flex-1 overflow-hidden">
 
-        {/* Sidebar */}
+        {/* Mobile backdrop — tapping it closes the sidebar */}
         {sidebarOpen && (
-          <aside className="w-64 sm:w-72 flex-shrink-0 bg-[#161616] border-r border-[#222] flex flex-col overflow-hidden">
+          <div
+            className="fixed inset-0 bg-black/60 z-40 sm:hidden"
+            onClick={() => setSidebarOpen(false)}
+          />
+        )}
+
+        {/* Sidebar — full-screen overlay on mobile, side panel on desktop */}
+        {sidebarOpen && (
+          <aside className="fixed inset-0 z-50 w-full sm:relative sm:inset-auto sm:w-72 flex-shrink-0 bg-[#161616] border-r border-[#222] flex flex-col overflow-hidden">
+
+            {/* Mobile-only header with close button */}
+            <div className="sm:hidden flex items-center justify-between px-4 py-3 bg-[#181818] border-b border-[#2a2a2a] flex-shrink-0">
+              <div className="flex items-center gap-2">
+                <span className="font-semibold text-white text-sm">Channel Guide</span>
+                {!loadingPlaylist && (
+                  <span className="text-xs text-gray-500 bg-[#252525] px-2 py-0.5 rounded-full">
+                    {channels.length}
+                  </span>
+                )}
+              </div>
+              <button
+                onClick={() => setSidebarOpen(false)}
+                aria-label="Close channel guide"
+                className="text-gray-400 hover:text-white p-2 rounded-lg hover:bg-gray-800 -mr-1"
+              >
+                <svg width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                  <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
+                </svg>
+              </button>
+            </div>
+
+            {/* Mobile-only: now playing strip */}
+            {selected && (
+              <div className="sm:hidden flex items-center gap-2 px-4 py-2 bg-blue-950/40 border-b border-blue-900/30 flex-shrink-0">
+                <span className="w-1.5 h-1.5 bg-red-500 rounded-full animate-pulse flex-shrink-0" />
+                <span className="text-xs text-blue-300 truncate">Now: {selected.name}</span>
+              </div>
+            )}
+
             {/* Group filter */}
             <div className="px-3 py-2 border-b border-[#222] flex-shrink-0">
               <select
@@ -253,8 +317,8 @@ export default function HomePage() {
                     {chs.map(ch => (
                       <button
                         key={ch.id}
-                        onClick={() => setSelected(ch)}
-                        className={`w-full flex items-center gap-2.5 px-3 py-2 transition-colors text-left group ${
+                        onClick={() => handleSelectChannel(ch)}
+                        className={`w-full flex items-center gap-2.5 px-3 py-3 sm:py-2 transition-colors text-left group ${
                           selected?.id === ch.id
                             ? 'bg-blue-900/30 border-r-2 border-blue-500'
                             : 'hover:bg-[#222] border-r-2 border-transparent'
@@ -309,6 +373,20 @@ export default function HomePage() {
           </div>
         </main>
       </div>
+
+      {/* Mobile floating Guide button — shown on mobile when sidebar is closed */}
+      {!sidebarOpen && (
+        <button
+          className="fixed bottom-5 right-4 z-30 sm:hidden flex items-center gap-2 bg-blue-600 hover:bg-blue-500 active:scale-95 text-white pl-4 pr-5 py-3 rounded-full shadow-lg shadow-blue-900/50 font-medium text-sm transition-all"
+          onClick={() => setSidebarOpen(true)}
+          aria-label="Open channel guide"
+        >
+          <svg width="15" height="15" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
+            <line x1="3" y1="6" x2="21" y2="6" /><line x1="3" y1="12" x2="21" y2="12" /><line x1="3" y1="18" x2="21" y2="18" />
+          </svg>
+          Guide
+        </button>
+      )}
     </div>
   );
 }

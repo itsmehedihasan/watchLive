@@ -20,6 +20,13 @@ body {
   display: none;
 }
 
+/* Video overlay controls: always visible on touch devices (no hover) */
+@media (hover: none) {
+  .touch-visible {
+    opacity: 1 !important;
+  }
+}
+
 /* Custom scrollbar for sidebar */
 ::-webkit-scrollbar {
   width: 4px;
