@@ -34,6 +34,7 @@ export default function HomePage() {
   const [search, setSearch] = useState('');
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [mobileChannelsOpen, setMobileChannelsOpen] = useState(false);
+  const [viewerCount, setViewerCount] = useState<number | null>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -45,6 +46,28 @@ export default function HomePage() {
         setLoadingPlaylist(false);
       })
       .catch(() => setLoadingPlaylist(false));
+  }, []);
+
+  // Register this browser as an active viewer; heartbeat every 30s
+  useEffect(() => {
+    let sessionId = sessionStorage.getItem('livetv_sid');
+    if (!sessionId) {
+      sessionId = Math.random().toString(36).slice(2) + Date.now().toString(36);
+      sessionStorage.setItem('livetv_sid', sessionId);
+    }
+    const beat = () => {
+      fetch('/api/viewers', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId }),
+      })
+        .then(r => r.json())
+        .then((d: { count: number }) => setViewerCount(d.count))
+        .catch(() => {});
+    };
+    beat();
+    const t = setInterval(beat, 30_000);
+    return () => clearInterval(t);
   }, []);
 
   // / → focus search, Escape → clear + blur
@@ -98,6 +121,12 @@ export default function HomePage() {
               {channels.length} channels
             </span>
           )}
+          {viewerCount != null && (
+            <span className="text-xs text-gray-500 bg-[#252525] px-2 py-0.5 rounded-full flex items-center gap-1">
+              <span>👥</span>
+              <span>{viewerCount} watching</span>
+            </span>
+          )}
         </div>
 
       </header>
@@ -130,7 +159,7 @@ export default function HomePage() {
             </div>
 
             {/* Channel list */}
-            <div className="flex-1 overflow-y-auto min-h-0 pb-6">
+            <div className="flex-1 overflow-y-auto min-h-0 pb-12">
               {loadingPlaylist ? (
                 <div className="flex flex-col items-center justify-center h-40 gap-3 text-gray-500">
                   <div className="w-8 h-8 border-2 border-gray-600 border-t-blue-500 rounded-full animate-spin" />
@@ -178,7 +207,7 @@ export default function HomePage() {
         {/* Main player area */}
         <main className="order-1 sm:order-2 flex-shrink-0 sm:flex-1 overflow-y-auto p-4 sm:p-6 bg-[#0d0d0d]">
           <div className="max-w-5xl mx-auto">
-            <VideoPlayer channel={selected} />
+            <VideoPlayer channel={selected} viewerCount={viewerCount} />
             {selected && (
               <button
                 onClick={() => setMobileChannelsOpen(v => !v)}

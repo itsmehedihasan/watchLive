@@ -1,17 +1,23 @@
 'use client';
 
-import { useEffect, useRef, useState, useMemo } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { Channel } from '@/lib/parseM3U';
 
 interface Props {
   channel: Channel | null;
+  viewerCount?: number | null;
 }
 
 function proxyUrl(url: string) {
   return `/api/proxy?url=${encodeURIComponent(url)}`;
 }
 
-export default function VideoPlayer({ channel }: Props) {
+function formatViewers(n: number): string {
+  if (n >= 1000) return `${(n / 1000).toFixed(1)}K`;
+  return `${n}`;
+}
+
+export default function VideoPlayer({ channel, viewerCount }: Props) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const hlsRef = useRef<InstanceType<typeof import('hls.js')['default']> | null>(null);
@@ -20,12 +26,7 @@ export default function VideoPlayer({ channel }: Props) {
   const [quality, setQuality] = useState('');
   const [retryCount, setRetryCount] = useState(0);
 
-  const viewerCount = useMemo(() => {
-    if (!channel) return '';
-    const hash = channel.name.split('').reduce((a, c) => ((a << 5) - a) + c.charCodeAt(0), 0);
-    const n = (Math.abs(hash) % 48200) + 1300;
-    return n >= 1000 ? `${(n / 1000).toFixed(1)}K` : `${n}`;
-  }, [channel]);
+  const viewerLabel = viewerCount != null ? formatViewers(viewerCount) : null;
 
   useEffect(() => { setLogoError(false); }, [channel]);
 
@@ -198,11 +199,13 @@ export default function VideoPlayer({ channel }: Props) {
           <p className="text-xs text-gray-500 mt-0.5 truncate">{channel.group}</p>
         </div>
         <div className="flex items-center gap-2.5 flex-shrink-0">
-          <div className="flex items-center gap-1.5 bg-gray-800/70 border border-gray-700/40 px-2.5 py-1 rounded-full">
-            <span className="text-sm leading-none">👥</span>
-            <span className="text-xs font-semibold text-gray-300">{viewerCount}</span>
-            <span className="hidden sm:inline text-xs text-gray-500">watching</span>
-          </div>
+          {viewerLabel != null && (
+            <div className="flex items-center gap-1.5 bg-gray-800/70 border border-gray-700/40 px-2.5 py-1 rounded-full">
+              <span className="text-sm leading-none">👥</span>
+              <span className="text-xs font-semibold text-gray-300">{viewerLabel}</span>
+              <span className="hidden sm:inline text-xs text-gray-500">watching</span>
+            </div>
+          )}
           <div className="flex items-center gap-1.5">
             <span className="w-2 h-2 bg-red-500 rounded-full animate-pulse" />
             <span className="text-red-400 text-xs font-bold uppercase tracking-widest">Live</span>
