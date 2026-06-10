@@ -38,6 +38,8 @@ export default function HomePage() {
   const [totalViewers, setTotalViewers] = useState<number | null>(null);
   /** viewers watching the currently selected channel */
   const [channelViewers, setChannelViewers] = useState<number | null>(null);
+  /** channel IDs ranked by total tune-ins, used to build the carousel */
+  const [topChannelIds, setTopChannelIds] = useState<string[]>([]);
   const searchInputRef = useRef<HTMLInputElement>(null);
   // keep a ref so the heartbeat closure always reads the latest selected channel
   const selectedRef = useRef<Channel | null>(null);
@@ -76,9 +78,10 @@ export default function HomePage() {
         body: JSON.stringify({ sessionId: sid, channelId }),
       })
         .then(r => r.json())
-        .then((d: { total: number; channelCount: number | null }) => {
+        .then((d: { total: number; channelCount: number | null; top?: Array<{ id: string }> }) => {
           setTotalViewers(d.total);
           if (d.channelCount != null) setChannelViewers(d.channelCount);
+          if (d.top && d.top.length > 0) setTopChannelIds(d.top.map(x => x.id));
         })
         .catch(() => {});
     };
@@ -109,6 +112,14 @@ export default function HomePage() {
     const q = search.toLowerCase();
     return channels.filter(ch => ch.name.toLowerCase().includes(q) || ch.group.toLowerCase().includes(q));
   }, [channels, search]);
+
+  // Top-5 channels for the carousel; falls back to first 5 until view data arrives
+  const carouselChannels = useMemo<Channel[]>(() => {
+    if (topChannelIds.length === 0) return channels.slice(0, 5);
+    return topChannelIds
+      .map(id => channels.find(ch => ch.id === id))
+      .filter((ch): ch is Channel => ch != null);
+  }, [channels, topChannelIds]);
 
   const handleSelectChannel = useCallback((ch: Channel) => {
     setSelected(ch);
@@ -234,7 +245,7 @@ export default function HomePage() {
         {/* Main player area */}
         <main className="order-1 sm:order-2 flex-shrink-0 sm:flex-1 overflow-y-auto p-4 sm:p-6 bg-[#0d0d0d]">
           <div className="max-w-5xl mx-auto">
-            <VideoPlayer channel={selected} channelViewerCount={channelViewers} channels={channels} onSelectChannel={handleSelectChannel} />
+            <VideoPlayer channel={selected} channelViewerCount={channelViewers} channels={carouselChannels} onSelectChannel={handleSelectChannel} />
             {selected && (
               <button
                 onClick={() => setMobileChannelsOpen(v => !v)}
