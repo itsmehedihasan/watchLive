@@ -1,5 +1,7 @@
 import type { NextRequest } from 'next/server';
 
+export const runtime = 'edge';
+
 // Spoof a real browser so stream servers don't block us
 const BROWSER_HEADERS = {
   'User-Agent':
