@@ -27,11 +27,13 @@ export async function POST(req: Request) {
 
     channelId = typeof body.channelId === 'string' && body.channelId ? body.channelId : null;
 
+    const nowSeconds = Math.floor(Date.now() / 1000);
     const sessionKey = `session:${sid}`;
     const sessionChanKey = `session:channel:${sid}`;
 
-    // One GET to know the previous channel before building the write pipeline
-    const prevChannel = await redis.get<string>(sessionChanKey);
+    // Atomic SET GET: sets new value and returns old value in one round-trip.
+    // Prevents two concurrent heartbeats from both seeing null (race condition).
+    const prevChannel = await redis.set<string>(sessionChanKey, channelId ?? '', { ex: SESSION_TTL, get: true });
     const isNewSession = prevChannel === null;
     const channelChanged = !isNewSession && prevChannel !== (channelId ?? '');
 
@@ -39,11 +41,10 @@ export async function POST(req: Request) {
 
     p.hset(sessionKey, { channelId: channelId ?? '', ts: Date.now() });
     p.expire(sessionKey, SESSION_TTL);
-    p.set(sessionChanKey, channelId ?? '', { ex: SESSION_TTL });
-
-    if (isNewSession) {
-      p.incr('viewers:total');
-    }
+    // Track session in sorted set (score = last-seen timestamp).
+    // ZREMRANGEBYSCORE prunes sessions older than SESSION_TTL so ZCARD is always accurate.
+    p.zadd('session:active', { score: nowSeconds, member: sid });
+    p.zremrangebyscore('session:active', 0, nowSeconds - SESSION_TTL);
 
     if (channelChanged || isNewSession) {
       if (!isNewSession && prevChannel) {
@@ -64,13 +65,13 @@ export async function POST(req: Request) {
   }
 
   const readPipe = redis.pipeline();
-  readPipe.get('viewers:total');
+  readPipe.zcard('session:active');
   if (channelId) readPipe.get(`channel:viewers:${channelId}`);
   readPipe.zrange('tunein:counts', 0, 4, { rev: true, withScores: true });
 
   const results = await readPipe.exec();
 
-  const total = Math.max(0, parseInt((results[0] as string | null) ?? '0', 10) || 0);
+  const total = Math.max(0, (results[0] as number | null) ?? 0);
   let channelCount: number | null = null;
   let topRaw: unknown;
 
@@ -93,13 +94,13 @@ export async function GET(req: NextRequest) {
   const n = Math.min(parseInt(req.nextUrl.searchParams.get('top') ?? '5', 10), 20);
 
   const readPipe = redis.pipeline();
-  readPipe.get('viewers:total');
+  readPipe.zcard('session:active');
   if (cid) readPipe.get(`channel:viewers:${cid}`);
   readPipe.zrange('tunein:counts', 0, n - 1, { rev: true, withScores: true });
 
   const results = await readPipe.exec();
 
-  const total = Math.max(0, parseInt((results[0] as string | null) ?? '0', 10) || 0);
+  const total = Math.max(0, (results[0] as number | null) ?? 0);
   let channelCount: number | null = null;
   let topRaw: unknown;
 
