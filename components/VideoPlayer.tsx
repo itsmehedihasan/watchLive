@@ -158,10 +158,32 @@ export default function VideoPlayer({ channel, channelViewerCount, channels = []
   const [logoError, setLogoError] = useState(false);
   const [quality, setQuality] = useState('');
   const [retryCount, setRetryCount] = useState(0);
+  const [copied, setCopied] = useState(false);
 
   const viewerLabel = channelViewerCount != null ? formatViewers(channelViewerCount) : null;
 
-  useEffect(() => { setLogoError(false); }, [channel]);
+  useEffect(() => { setLogoError(false); setCopied(false); }, [channel]);
+
+  const copyStreamUrl = () => {
+    if (!channel) return;
+    navigator.clipboard.writeText(channel.url).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    }).catch(() => {
+      // fallback for older Android WebViews
+      const ta = document.createElement('textarea');
+      ta.value = channel.url;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.focus();
+      ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    });
+  };
 
   // F key → fullscreen
   useEffect(() => {
@@ -347,6 +369,31 @@ export default function VideoPlayer({ channel, channelViewerCount, channels = []
               <span className="hidden sm:inline text-xs text-gray-500">watching</span>
             </div>
           )}
+          <button
+            onClick={copyStreamUrl}
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold cursor-pointer transition-all active:scale-95 border ${
+              copied
+                ? 'bg-green-700/40 border-green-600/50 text-green-300'
+                : 'bg-gray-800/70 border-gray-700/40 text-gray-300 hover:bg-gray-700/70 hover:text-white'
+            }`}
+            title="Copy stream URL to use in your own player"
+          >
+            {copied ? (
+              <>
+                <svg width="13" height="13" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
+                  <polyline points="20 6 9 17 4 12"/>
+                </svg>
+                <span>Copied!</span>
+              </>
+            ) : (
+              <>
+                <svg width="13" height="13" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                  <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/>
+                </svg>
+                <span>Copy URL</span>
+              </>
+            )}
+          </button>
           <div className="flex items-center gap-1.5">
             <span className="w-2 h-2 bg-red-500 rounded-full animate-pulse" />
             <span className="text-red-400 text-xs font-bold uppercase tracking-widest">Live</span>
