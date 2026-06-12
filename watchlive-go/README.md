@@ -33,7 +33,8 @@ the new list. No rebuild or restart needed.
   RAM cache with single-flight upstream fetches (`X-Cache: HIT|MISS`)
 - `GET|POST /api/viewers` — heartbeat + live counts
   (`{total, channelCount, top}`); sessions expire 60 s after last heartbeat
-- `GET /api/channels` — parsed playlist as JSON
+- `GET /api/channels` — parsed playlist as JSON (gzip-compressed when the
+  client accepts it; ETag revalidation returns 304 while the list is unchanged)
 - `POST /api/reload` — force playlist re-read
 
 ## Tests

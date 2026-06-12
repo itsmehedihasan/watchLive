@@ -6,8 +6,12 @@
 package main
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
+	"crypto/sha256"
 	"embed"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -19,6 +23,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -38,10 +43,15 @@ var staticFS embed.FS
 var embeddedPlaylist []byte
 
 // channelStore holds the parsed playlist and reloads it when the source file
-// changes on disk.
+// changes on disk. The JSON and gzipped-JSON payloads for /api/channels are
+// precomputed once per reload — with 10k+ channels the list is megabytes, so
+// compressing per request would burn CPU for an identical result.
 type channelStore struct {
 	mu       sync.RWMutex
 	channels []playlist.Channel
+	jsonRaw  []byte
+	jsonGz   []byte
+	etag     string
 	path     string // external playlist path; empty → embedded only
 	modTime  time.Time
 }
@@ -72,11 +82,34 @@ func (cs *channelStore) reload() int {
 		log.Printf("playlist: parsed 0 channels, keeping current list")
 		return cs.count()
 	}
+
+	raw, err := json.Marshal(parsed)
+	if err != nil {
+		log.Printf("playlist: marshal: %v (keeping current list)", err)
+		return cs.count()
+	}
+	var buf bytes.Buffer
+	gz, _ := gzip.NewWriterLevel(&buf, gzip.BestCompression)
+	gz.Write(raw)
+	gz.Close()
+	sum := sha256.Sum256(raw)
+	etag := `"` + hex.EncodeToString(sum[:8]) + `"`
+
 	cs.mu.Lock()
 	cs.channels = parsed
+	cs.jsonRaw = raw
+	cs.jsonGz = buf.Bytes()
+	cs.etag = etag
 	cs.modTime = modTime
 	cs.mu.Unlock()
 	return len(parsed)
+}
+
+// payload returns the precomputed /api/channels response bodies.
+func (cs *channelStore) payload() (raw, gz []byte, etag string) {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	return cs.jsonRaw, cs.jsonGz, cs.etag
 }
 
 // reloadIfChanged reloads only when the external file's mtime moved.
@@ -95,12 +128,6 @@ func (cs *channelStore) reloadIfChanged() {
 		n := cs.reload()
 		log.Printf("playlist: reloaded %d channels from %s", n, cs.path)
 	}
-}
-
-func (cs *channelStore) get() []playlist.Channel {
-	cs.mu.RLock()
-	defer cs.mu.RUnlock()
-	return cs.channels
 }
 
 func (cs *channelStore) count() int {
@@ -145,9 +172,24 @@ func main() {
 	mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServerFS(staticSub)))
 
 	mux.HandleFunc("GET /api/channels", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Cache-Control", "no-store")
-		json.NewEncoder(w).Encode(channels.get())
+		raw, gz, etag := channels.payload()
+		h := w.Header()
+		h.Set("Content-Type", "application/json")
+		// no-cache (unlike no-store) lets the browser keep the body and
+		// revalidate with If-None-Match — unchanged lists cost one 304.
+		h.Set("Cache-Control", "no-cache")
+		h.Set("ETag", etag)
+		h.Set("Vary", "Accept-Encoding")
+		if r.Header.Get("If-None-Match") == etag {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+			h.Set("Content-Encoding", "gzip")
+			w.Write(gz)
+			return
+		}
+		w.Write(raw)
 	})
 
 	mux.HandleFunc("POST /api/reload", func(w http.ResponseWriter, r *http.Request) {
@@ -158,13 +200,8 @@ func main() {
 	})
 
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
-		chJSON, err := json.Marshal(channels.get())
-		if err != nil {
-			http.Error(w, "internal error", http.StatusInternalServerError)
-			return
-		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		if err := indexTmpl.Execute(w, struct{ ChannelsJSON template.JS }{template.JS(chJSON)}); err != nil {
+		if err := indexTmpl.Execute(w, nil); err != nil {
 			log.Printf("template: %v", err)
 		}
 	})

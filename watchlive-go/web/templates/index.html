@@ -43,6 +43,10 @@
           </div>
         </div>
         <div id="channelList" class="channel-list">
+          <div id="listLoading" class="list-loading">
+            <div class="spinner-sm"></div>
+            <span>Loading playlist…</span>
+          </div>
           <div id="emptyState" class="empty-state" hidden>
             <span class="empty-emoji">😕</span>
             <span>No channels found</span>
@@ -136,7 +140,6 @@
     </div>
   </div>
 
-  <script>window.__CHANNELS__ = {{.ChannelsJSON}};</script>
   <script src="/static/hls.min.js"></script>
   <script src="/static/app.js"></script>
 </body>

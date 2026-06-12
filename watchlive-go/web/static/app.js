@@ -4,7 +4,8 @@
   'use strict';
 
   // ── State ────────────────────────────────────────────────────────────────
-  var channels = Array.isArray(window.__CHANNELS__) ? window.__CHANNELS__ : [];
+  var channels = [];            // fetched from /api/channels (gzipped, ETag-cached)
+  var channelsLoading = true;
   var selected = null;          // currently playing channel or null
   var search = '';
   var sidebarOpen = true;       // desktop sidebar visibility
@@ -21,7 +22,8 @@
     sidebar: $('sidebar'), sidebarToggle: $('sidebarToggle'), homeBtn: $('homeBtn'),
     activeBadge: $('activeBadge'), totalViewers: $('totalViewers'),
     search: $('search'), searchClear: $('searchClear'),
-    channelList: $('channelList'), emptyState: $('emptyState'), emptyClear: $('emptyClear'),
+    channelList: $('channelList'), listLoading: $('listLoading'),
+    emptyState: $('emptyState'), emptyClear: $('emptyClear'),
     channelCount: $('channelCount'),
     carousel: $('carousel'), carouselContent: $('carouselContent'),
     carouselPrev: $('carouselPrev'), carouselNext: $('carouselNext'), carouselDots: $('carouselDots'),
@@ -61,13 +63,20 @@
     return img;
   }
 
-  function renderChannelList() {
-    var list = filteredChannels();
+  // Cap how many channel buttons exist in the DOM at once — with 10k+
+  // channels, rendering them all would stall every keystroke. Search
+  // narrows into the long tail.
+  var RENDER_CAP = 500;
 
-    // Remove previous channel buttons, keep the empty-state node.
+  function renderChannelList() {
+    var matches = filteredChannels();
+    var list = matches.slice(0, RENDER_CAP);
+
+    // Remove previous channel buttons, keep the loading/empty-state nodes.
     Array.prototype.slice.call(els.channelList.querySelectorAll('.channel-item')).forEach(function (n) { n.remove(); });
 
-    els.emptyState.hidden = list.length !== 0;
+    els.listLoading.hidden = !channelsLoading;
+    els.emptyState.hidden = channelsLoading || list.length !== 0;
 
     var frag = document.createDocumentFragment();
     list.forEach(function (ch) {
@@ -88,7 +97,10 @@
     });
     els.channelList.appendChild(frag);
 
-    els.channelCount.textContent = 'Showing ' + list.length + ' of ' + channels.length + ' channels';
+    els.channelCount.textContent = channelsLoading ? ''
+      : matches.length > RENDER_CAP
+        ? 'Showing first ' + RENDER_CAP + ' of ' + matches.length + ' matches — search to narrow'
+        : 'Showing ' + matches.length + ' of ' + channels.length + ' channels';
   }
 
   function renderLayout() {
@@ -377,7 +389,11 @@
     els.searchClear.hidden = !value;
     renderChannelList();
   }
-  els.search.addEventListener('input', function () { setSearch(els.search.value); });
+  var searchDebounce = null;
+  els.search.addEventListener('input', function () {
+    if (searchDebounce) clearTimeout(searchDebounce);
+    searchDebounce = setTimeout(function () { setSearch(els.search.value); }, 150);
+  });
   els.searchClear.addEventListener('click', function () { setSearch(''); });
   els.emptyClear.addEventListener('click', function () { setSearch(''); });
 
@@ -431,10 +447,29 @@
   }
 
   // ── Init ─────────────────────────────────────────────────────────────────
+  function loadChannels() {
+    fetch('/api/channels')
+      .then(function (r) {
+        if (!r.ok) throw new Error('channels fetch failed: ' + r.status);
+        return r.json();
+      })
+      .then(function (data) {
+        channels = Array.isArray(data) ? data : [];
+        channelsLoading = false;
+        renderChannelList();
+        if (!selected) renderCarousel();
+      })
+      .catch(function () {
+        channelsLoading = false;
+        renderChannelList(); // falls through to the empty state
+      });
+  }
+
   renderLayout();
   renderChannelList();
   renderCarousel();
   resetCarouselTimer();
+  loadChannels();
   beat();
   setInterval(beat, 30000);
 })();
