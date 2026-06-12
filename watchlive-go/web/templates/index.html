@@ -53,7 +53,10 @@
             <button id="emptyClear" class="link-btn">Clear search</button>
           </div>
         </div>
-        <div id="channelCount" class="sidebar-footer"></div>
+        <div class="sidebar-footer">
+          <span id="channelCount"></span>
+          <button id="syncBtn" class="sync-btn" title="Re-download the channel list from the source">⟳ Sync</button>
+        </div>
       </aside>
 
       <!-- Main player area -->
@@ -99,6 +102,18 @@
                     <path d="M8 3H5a2 2 0 00-2 2v3m18 0V5a2 2 0 00-2-2h-3m0 18h3a2 2 0 002-2v-3M3 16v3a2 2 0 002 2h3"/>
                   </svg>
                 </button>
+              </div>
+            </div>
+
+            <!-- Stream options: server picker + quality selector -->
+            <div id="streamOptions" class="stream-options" hidden>
+              <div id="serverRow" class="server-row" hidden>
+                <span class="opt-label">Server</span>
+                <div id="serverButtons" class="server-buttons"></div>
+              </div>
+              <div id="qualityWrap" class="quality-wrap" hidden>
+                <label class="opt-label" for="qualitySelect">Quality</label>
+                <select id="qualitySelect"></select>
               </div>
             </div>
 

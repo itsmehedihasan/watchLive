@@ -1,27 +1,44 @@
 // Package playlist parses M3U/M3U8 channel playlists into Channel entries.
-// It is a faithful port of the original lib/parseM3U.ts.
+// Entries that refer to the same channel under different names — e.g.
+// "CNN (720p)" and "CNN (1080p) [Geo-blocked]" — are grouped into one
+// Channel with multiple Servers.
 package playlist
 
 import (
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 )
 
-// Channel is a single playable entry from the playlist.
+// Server is one stream source for a channel.
+type Server struct {
+	URL string `json:"url"`
+	// Label carries quality/status hints stripped from the original entry
+	// name, e.g. "1080p" or "720p · Geo-blocked".
+	Label string `json:"label,omitempty"`
+}
+
+// Channel is a single channel in the UI, backed by one or more servers.
 type Channel struct {
-	ID    string `json:"id"`
-	Name  string `json:"name"`
-	Logo  string `json:"logo"`
-	Group string `json:"group"`
-	URL   string `json:"url"`
-	Type  string `json:"type"`
+	ID      string   `json:"id"`
+	Name    string   `json:"name"`
+	Logo    string   `json:"logo"`
+	Group   string   `json:"group"`
+	Type    string   `json:"type"`
+	Servers []Server `json:"servers"`
 }
 
 var (
 	logoRe  = regexp.MustCompile(`tvg-logo="([^"]*)"`)
 	groupRe = regexp.MustCompile(`group-title="([^"]*)"`)
 	httpRe  = regexp.MustCompile(`(?i)^https?://`)
+	// Quality suffixes like "(720p)", "(1080p)", "(2160p)" and resolution
+	// forms like "(640x360)" — used as iptv-org naming convention.
+	qualityRe = regexp.MustCompile(`\s*\((\d{3,4}p|\d+x\d+)\)`)
+	// Bracketed status tags like "[Geo-blocked]", "[Not 24/7]".
+	statusRe = regexp.MustCompile(`\s*\[([^\]]*)\]`)
+	spaceRe  = regexp.MustCompile(`\s{2,}`)
 )
 
 // classify maps a group-title to one of the fixed UI categories.
@@ -45,9 +62,34 @@ func classify(group string) string {
 	}
 }
 
-// Parse extracts channels from M3U content. Duplicate (group, name, url)
-// triples are dropped; channels sharing a display name are suffixed
-// "Name - 1", "Name - 2", … to keep names unique in the UI.
+// normalizeName strips quality and status decorations from an entry name.
+// It returns the clean display name and a label describing what was
+// stripped, e.g. ("CNN", "1080p · Geo-blocked").
+func normalizeName(name string) (clean, label string) {
+	var parts []string
+	if m := qualityRe.FindStringSubmatch(name); m != nil {
+		parts = append(parts, m[1])
+	}
+	for _, m := range statusRe.FindAllStringSubmatch(name, -1) {
+		if tag := strings.TrimSpace(m[1]); tag != "" {
+			parts = append(parts, tag)
+		}
+	}
+	clean = qualityRe.ReplaceAllString(name, "")
+	clean = statusRe.ReplaceAllString(clean, "")
+	clean = strings.TrimSpace(spaceRe.ReplaceAllString(clean, " "))
+	return clean, strings.Join(parts, " · ")
+}
+
+type rawEntry struct {
+	name, logo, group, url string
+}
+
+// Parse extracts channels from M3U content. Entries in the same group whose
+// normalized names match (case-insensitive) are merged into one channel; each
+// distinct URL becomes a Server, in order of appearance. The group is part of
+// the merge key so that identically named channels from different groups
+// (e.g. countries) stay separate.
 func Parse(content string) []Channel {
 	rawLines := strings.Split(content, "\n")
 	lines := make([]string, len(rawLines))
@@ -55,7 +97,7 @@ func Parse(content string) []Channel {
 		lines[i] = strings.TrimSpace(l)
 	}
 
-	var channels []Channel
+	var entries []rawEntry
 	seen := make(map[string]struct{})
 
 	for i, line := range lines {
@@ -102,28 +144,55 @@ func Parse(content string) []Channel {
 			continue
 		}
 		seen[key] = struct{}{}
-		channels = append(channels, Channel{
-			ID:    strconv.Itoa(len(channels)),
-			Name:  name,
-			Logo:  logo,
-			Group: group,
-			URL:   url,
-			Type:  classify(group),
-		})
+		entries = append(entries, rawEntry{name: name, logo: logo, group: group, url: url})
 	}
 
-	// Number duplicate names: "Channel" → "Channel - 1", "Channel - 2", …
-	nameCount := make(map[string]int)
-	for _, ch := range channels {
-		nameCount[ch.Name]++
-	}
-	nameCursor := make(map[string]int)
-	for idx := range channels {
-		name := channels[idx].Name
-		if nameCount[name] > 1 {
-			nameCursor[name]++
-			channels[idx].Name = name + " - " + strconv.Itoa(nameCursor[name])
+	// Group entries by normalized name into channels with servers.
+	var channels []Channel
+	byKey := make(map[string]int)
+
+	for _, e := range entries {
+		clean, label := normalizeName(e.name)
+		if clean == "" {
+			clean = e.name
 		}
+		key := strings.ToLower(e.group) + "||" + strings.ToLower(clean)
+
+		idx, ok := byKey[key]
+		if !ok {
+			idx = len(channels)
+			byKey[key] = idx
+			channels = append(channels, Channel{
+				Name:  clean,
+				Logo:  e.logo,
+				Group: e.group,
+				Type:  classify(e.group),
+			})
+		}
+		ch := &channels[idx]
+		if ch.Logo == "" {
+			ch.Logo = e.logo
+		}
+
+		dup := false
+		for _, s := range ch.Servers {
+			if s.URL == e.url {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			ch.Servers = append(ch.Servers, Server{URL: e.url, Label: label})
+		}
+	}
+
+	// Sort A→Z (case-insensitive); IDs are assigned after sorting so they
+	// stay sequential in display order.
+	sort.SliceStable(channels, func(i, j int) bool {
+		return strings.ToLower(channels[i].Name) < strings.ToLower(channels[j].Name)
+	})
+	for i := range channels {
+		channels[i].ID = strconv.Itoa(i)
 	}
 
 	return channels

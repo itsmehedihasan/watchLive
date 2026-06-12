@@ -17,6 +17,7 @@ import (
 	"flag"
 	"fmt"
 	"html/template"
+	"io"
 	"io/fs"
 	"log"
 	"net/http"
@@ -52,20 +53,25 @@ type channelStore struct {
 	jsonRaw  []byte
 	jsonGz   []byte
 	etag     string
-	path     string // external playlist path; empty → embedded only
-	modTime  time.Time
+	path     string // curated playlist path; empty → embedded only
+	// syncPath holds the playlist downloaded from the upstream source via
+	// /api/sync. It is loaded after (appended to) the curated list and is the
+	// only file sync overwrites — list.txt stays user-owned.
+	syncPath    string
+	modTime     time.Time
+	syncModTime time.Time
 }
 
-func newChannelStore(path string) *channelStore {
-	cs := &channelStore{path: path}
+func newChannelStore(path, syncPath string) *channelStore {
+	cs := &channelStore{path: path, syncPath: syncPath}
 	cs.reload()
 	return cs
 }
 
-// reload re-reads the playlist source. Returns the number of channels loaded.
+// reload re-reads the playlist sources. Returns the number of channels loaded.
 func (cs *channelStore) reload() int {
-	content := embeddedPlaylist
-	var modTime time.Time
+	content := append([]byte{}, embeddedPlaylist...)
+	var modTime, syncModTime time.Time
 	if cs.path != "" {
 		if data, err := os.ReadFile(cs.path); err == nil {
 			content = data
@@ -75,6 +81,14 @@ func (cs *channelStore) reload() int {
 		} else if !errors.Is(err, os.ErrNotExist) {
 			log.Printf("playlist: read %s: %v (keeping current list)", cs.path, err)
 			return cs.count()
+		}
+	}
+	if cs.syncPath != "" {
+		if data, err := os.ReadFile(cs.syncPath); err == nil {
+			content = append(append(content, '\n'), data...)
+			if info, err := os.Stat(cs.syncPath); err == nil {
+				syncModTime = info.ModTime()
+			}
 		}
 	}
 	parsed := playlist.Parse(string(content))
@@ -101,6 +115,7 @@ func (cs *channelStore) reload() int {
 	cs.jsonGz = buf.Bytes()
 	cs.etag = etag
 	cs.modTime = modTime
+	cs.syncModTime = syncModTime
 	cs.mu.Unlock()
 	return len(parsed)
 }
@@ -112,21 +127,25 @@ func (cs *channelStore) payload() (raw, gz []byte, etag string) {
 	return cs.jsonRaw, cs.jsonGz, cs.etag
 }
 
-// reloadIfChanged reloads only when the external file's mtime moved.
+// reloadIfChanged reloads only when a source file's mtime moved.
 func (cs *channelStore) reloadIfChanged() {
-	if cs.path == "" {
-		return
+	var cur, curSync time.Time
+	if cs.path != "" {
+		if info, err := os.Stat(cs.path); err == nil {
+			cur = info.ModTime()
+		}
 	}
-	info, err := os.Stat(cs.path)
-	if err != nil {
-		return
+	if cs.syncPath != "" {
+		if info, err := os.Stat(cs.syncPath); err == nil {
+			curSync = info.ModTime()
+		}
 	}
 	cs.mu.RLock()
-	changed := !info.ModTime().Equal(cs.modTime)
+	changed := !cur.Equal(cs.modTime) || !curSync.Equal(cs.syncModTime)
 	cs.mu.RUnlock()
 	if changed {
 		n := cs.reload()
-		log.Printf("playlist: reloaded %d channels from %s", n, cs.path)
+		log.Printf("playlist: reloaded %d channels", n)
 	}
 }
 
@@ -139,6 +158,7 @@ func (cs *channelStore) count() int {
 func main() {
 	addr := flag.String("addr", ":3000", "listen address")
 	playlistPath := flag.String("playlist", "", "path to external M3U playlist (default: list.txt next to the binary, falling back to the embedded copy)")
+	syncURL := flag.String("sync-url", "https://iptv-org.github.io/iptv/index.country.m3u", "upstream playlist downloaded by POST /api/sync (country-grouped variant)")
 	cacheMB := flag.Int64("cache-mb", 200, "segment cache size in MB")
 	flag.Parse()
 
@@ -152,9 +172,10 @@ func main() {
 			path = "list.txt"
 		}
 	}
+	syncPath := filepath.Join(filepath.Dir(path), "list.sync.m3u")
 
-	channels := newChannelStore(path)
-	log.Printf("playlist: %d channels loaded (external source: %s)", channels.count(), path)
+	channels := newChannelStore(path, syncPath)
+	log.Printf("playlist: %d channels loaded (curated: %s, synced: %s)", channels.count(), path, syncPath)
 
 	store := viewers.NewStore()
 	proxyHandler := proxy.New(*cacheMB << 20)
@@ -174,7 +195,7 @@ func main() {
 	mux.HandleFunc("GET /api/channels", func(w http.ResponseWriter, r *http.Request) {
 		raw, gz, etag := channels.payload()
 		h := w.Header()
-		h.Set("Content-Type", "application/json")
+		h.Set("Content-Type", "application/json; charset=utf-8")
 		// no-cache (unlike no-store) lets the browser keep the body and
 		// revalidate with If-None-Match — unchanged lists cost one 304.
 		h.Set("Cache-Control", "no-cache")
@@ -190,6 +211,50 @@ func main() {
 			return
 		}
 		w.Write(raw)
+	})
+
+	// syncMu serializes syncs; a double-click must not race two downloads
+	// into the same file.
+	var syncMu sync.Mutex
+	mux.HandleFunc("POST /api/sync", func(w http.ResponseWriter, r *http.Request) {
+		syncMu.Lock()
+		defer syncMu.Unlock()
+
+		client := &http.Client{Timeout: 2 * time.Minute}
+		resp, err := client.Get(*syncURL)
+		if err != nil {
+			http.Error(w, "sync: download failed: "+err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			http.Error(w, fmt.Sprintf("sync: upstream returned %d", resp.StatusCode), http.StatusBadGateway)
+			return
+		}
+		data, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+		if err != nil {
+			http.Error(w, "sync: read failed: "+err.Error(), http.StatusBadGateway)
+			return
+		}
+		if !strings.HasPrefix(strings.TrimSpace(string(data[:min(len(data), 64)])), "#EXTM3U") {
+			http.Error(w, "sync: response is not an M3U playlist", http.StatusBadGateway)
+			return
+		}
+		// Atomic replace: never leave a half-written playlist on disk.
+		tmp := syncPath + ".tmp"
+		if err := os.WriteFile(tmp, data, 0o644); err != nil {
+			http.Error(w, "sync: write failed: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if err := os.Rename(tmp, syncPath); err != nil {
+			os.Remove(tmp)
+			http.Error(w, "sync: replace failed: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		n := channels.reload()
+		log.Printf("sync: downloaded %d KB from %s → %d channels", len(data)/1024, *syncURL, n)
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		fmt.Fprintf(w, `{"channels":%d}`, n)
 	})
 
 	mux.HandleFunc("POST /api/reload", func(w http.ResponseWriter, r *http.Request) {

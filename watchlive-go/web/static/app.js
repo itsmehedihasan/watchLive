@@ -7,6 +7,8 @@
   var channels = [];            // fetched from /api/channels (gzipped, ETag-cached)
   var channelsLoading = true;
   var selected = null;          // currently playing channel or null
+  var serverIdx = 0;            // index into selected.servers
+  var failedServers = {};       // server indexes that hit fatal errors this selection
   var search = '';
   var sidebarOpen = true;       // desktop sidebar visibility
   var mobileChannelsOpen = false;
@@ -24,12 +26,14 @@
     search: $('search'), searchClear: $('searchClear'),
     channelList: $('channelList'), listLoading: $('listLoading'),
     emptyState: $('emptyState'), emptyClear: $('emptyClear'),
-    channelCount: $('channelCount'),
+    channelCount: $('channelCount'), syncBtn: $('syncBtn'),
     carousel: $('carousel'), carouselContent: $('carouselContent'),
     carouselPrev: $('carouselPrev'), carouselNext: $('carouselNext'), carouselDots: $('carouselDots'),
     playerSection: $('playerSection'), videoContainer: $('videoContainer'), video: $('video'),
     loadingOverlay: $('loadingOverlay'), errorOverlay: $('errorOverlay'), retryBtn: $('retryBtn'),
     qualityBadge: $('qualityBadge'), fsBtn: $('fsBtn'),
+    streamOptions: $('streamOptions'), serverRow: $('serverRow'), serverButtons: $('serverButtons'),
+    qualityWrap: $('qualityWrap'), qualitySelect: $('qualitySelect'),
     npLogo: $('npLogo'), npLogoFallback: $('npLogoFallback'),
     npName: $('npName'), npGroup: $('npGroup'),
     viewerPill: $('viewerPill'), viewerCount: $('viewerCount'),
@@ -37,6 +41,27 @@
   };
 
   function proxyUrl(url) { return '/api/proxy?url=' + encodeURIComponent(url); }
+
+  // ── Dead-channel marks ───────────────────────────────────────────────────
+  // A channel is marked dead when playback exhausted every server. Keyed by
+  // name (IDs shift when the playlist is re-synced); persisted per browser.
+  var deadMarks = {};
+  try { deadMarks = JSON.parse(localStorage.getItem('livetv_dead')) || {}; } catch (e) { /* fresh start */ }
+
+  function deadKey(ch) { return ch.name.toLowerCase(); }
+  function isDead(ch) { return !!deadMarks[deadKey(ch)]; }
+
+  function setDead(ch, dead) {
+    var key = deadKey(ch);
+    if (dead === !!deadMarks[key]) return;
+    if (dead) deadMarks[key] = Date.now();
+    else delete deadMarks[key];
+    try { localStorage.setItem('livetv_dead', JSON.stringify(deadMarks)); } catch (e) { /* quota — marks stay in memory */ }
+    // Update the existing sidebar button in place.
+    Array.prototype.slice.call(els.channelList.querySelectorAll('.channel-item')).forEach(function (btn) {
+      if (btn.dataset.id === ch.id) btn.classList.toggle('dead', dead);
+    });
+  }
 
   function formatViewers(n) { return n >= 1000 ? (n / 1000).toFixed(1) + 'K' : String(n); }
 
@@ -63,44 +88,120 @@
     return img;
   }
 
-  // Cap how many channel buttons exist in the DOM at once — with 10k+
-  // channels, rendering them all would stall every keystroke. Search
-  // narrows into the long tail.
+  // Cap how many channel buttons exist in the DOM at once during search —
+  // with 10k+ channels, rendering them all would stall every keystroke.
   var RENDER_CAP = 500;
+
+  // Country/group sections the user has expanded (group name → true).
+  var expandedGroups = {};
+
+  function makeChannelButton(ch) {
+    var btn = document.createElement('button');
+    btn.className = 'channel-item' + (selected && selected.id === ch.id ? ' selected' : '') + (isDead(ch) ? ' dead' : '');
+    btn.dataset.id = ch.id;
+    btn.appendChild(logoOrFallback(ch, 'channel-logo', 'channel-logo-fallback'));
+    var name = document.createElement('span');
+    name.className = 'channel-name';
+    name.textContent = ch.name;
+    btn.appendChild(name);
+    if (selected && selected.id === ch.id) {
+      var dot = document.createElement('span');
+      dot.className = 'channel-live-dot';
+      btn.appendChild(dot);
+    }
+    btn.addEventListener('click', function () { selectChannel(ch); });
+    return btn;
+  }
 
   function renderChannelList() {
     var matches = filteredChannels();
-    var list = matches.slice(0, RENDER_CAP);
+    var keepScroll = els.channelList.scrollTop; // survive accordion re-renders
 
-    // Remove previous channel buttons, keep the loading/empty-state nodes.
-    Array.prototype.slice.call(els.channelList.querySelectorAll('.channel-item')).forEach(function (n) { n.remove(); });
+    // Remove previous dynamic nodes, keep the loading/empty-state nodes.
+    Array.prototype.slice.call(els.channelList.querySelectorAll('.channel-item, .group-section')).forEach(function (n) { n.remove(); });
 
     els.listLoading.hidden = !channelsLoading;
-    els.emptyState.hidden = channelsLoading || list.length !== 0;
+    els.emptyState.hidden = channelsLoading || matches.length !== 0;
 
     var frag = document.createDocumentFragment();
-    list.forEach(function (ch) {
-      var btn = document.createElement('button');
-      btn.className = 'channel-item' + (selected && selected.id === ch.id ? ' selected' : '');
-      btn.appendChild(logoOrFallback(ch, 'channel-logo', 'channel-logo-fallback'));
-      var name = document.createElement('span');
-      name.className = 'channel-name';
-      name.textContent = ch.name;
-      btn.appendChild(name);
-      if (selected && selected.id === ch.id) {
-        var dot = document.createElement('span');
+
+    if (search) {
+      // Searching: flat capped result list across all groups.
+      matches.slice(0, RENDER_CAP).forEach(function (ch) { frag.appendChild(makeChannelButton(ch)); });
+      els.channelList.appendChild(frag);
+      els.channelList.scrollTop = 0; // new result set starts at the top
+      els.channelCount.textContent = channelsLoading ? ''
+        : matches.length > RENDER_CAP
+          ? 'Showing first ' + RENDER_CAP + ' of ' + matches.length + ' matches — search to narrow'
+          : matches.length + ' match' + (matches.length === 1 ? '' : 'es');
+      return;
+    }
+
+    // Browsing: collapsible sections per group (country). Only expanded
+    // sections render their channel buttons, which keeps the DOM small.
+    var byGroup = {};
+    var groupNames = [];
+    matches.forEach(function (ch) {
+      var g = ch.group || 'Other';
+      if (!byGroup[g]) { byGroup[g] = []; groupNames.push(g); }
+      byGroup[g].push(ch);
+    });
+    groupNames.sort(function (a, b) {
+      a = a.toLowerCase(); b = b.toLowerCase();
+      return a < b ? -1 : a > b ? 1 : 0;
+    });
+
+    groupNames.forEach(function (g) {
+      var section = document.createElement('div');
+      section.className = 'group-section';
+
+      var head = document.createElement('button');
+      head.className = 'group-header' + (expandedGroups[g] ? ' open' : '');
+      var caret = document.createElement('span');
+      caret.className = 'group-caret';
+      caret.textContent = '▸';
+      var title = document.createElement('span');
+      title.className = 'group-title';
+      title.textContent = g;
+      var count = document.createElement('span');
+      count.className = 'group-count';
+      count.textContent = String(byGroup[g].length);
+      head.appendChild(caret);
+      head.appendChild(title);
+      head.appendChild(count);
+      head.addEventListener('click', function () {
+        expandedGroups[g] = !expandedGroups[g];
+        renderChannelList();
+      });
+      section.appendChild(head);
+
+      if (expandedGroups[g]) {
+        byGroup[g].forEach(function (ch) { section.appendChild(makeChannelButton(ch)); });
+      }
+      frag.appendChild(section);
+    });
+
+    els.channelList.appendChild(frag);
+    els.channelList.scrollTop = keepScroll;
+    els.channelCount.textContent = channelsLoading ? ''
+      : channels.length + ' channels · ' + groupNames.length + ' countries';
+  }
+
+  // Update which sidebar button is highlighted without rebuilding the list —
+  // a rebuild would reset the user's scroll position.
+  function updateListSelection() {
+    Array.prototype.slice.call(els.channelList.querySelectorAll('.channel-item')).forEach(function (btn) {
+      var isSel = !!selected && btn.dataset.id === selected.id;
+      btn.classList.toggle('selected', isSel);
+      var dot = btn.querySelector('.channel-live-dot');
+      if (isSel && !dot) {
+        dot = document.createElement('span');
         dot.className = 'channel-live-dot';
         btn.appendChild(dot);
+      } else if (!isSel && dot) {
+        dot.remove();
       }
-      btn.addEventListener('click', function () { selectChannel(ch); });
-      frag.appendChild(btn);
     });
-    els.channelList.appendChild(frag);
-
-    els.channelCount.textContent = channelsLoading ? ''
-      : matches.length > RENDER_CAP
-        ? 'Showing first ' + RENDER_CAP + ' of ' + matches.length + ' matches — search to narrow'
-        : 'Showing ' + matches.length + ' of ' + channels.length + ' channels';
   }
 
   function renderLayout() {
@@ -219,12 +320,69 @@
     els.video.onerror = null;
   }
 
-  function startPlayback(channel) {
+  function currentServer() {
+    if (!selected || !selected.servers || selected.servers.length === 0) return null;
+    return selected.servers[Math.min(serverIdx, selected.servers.length - 1)];
+  }
+
+  // Try the next server that hasn't failed yet; show the error screen when
+  // every server for this channel has been exhausted.
+  function failover() {
+    if (!selected) return;
+    failedServers[serverIdx] = true;
+    renderServerRow();
+    for (var i = 0; i < selected.servers.length; i++) {
+      if (!failedServers[i]) {
+        serverIdx = i;
+        renderServerRow();
+        startPlayback();
+        return;
+      }
+    }
+    setDead(selected, true);
+    setPlayerState('error');
+  }
+
+  function populateQualityOptions(h) {
+    var sel = els.qualitySelect;
+    sel.innerHTML = '';
+    var auto = document.createElement('option');
+    auto.value = '-1';
+    auto.textContent = 'Auto';
+    sel.appendChild(auto);
+    // hls.js orders levels ascending by bitrate; show highest first.
+    for (var i = h.levels.length - 1; i >= 0; i--) {
+      var level = h.levels[i];
+      var opt = document.createElement('option');
+      opt.value = String(i);
+      opt.textContent = level.height ? level.height + 'p' : Math.round(level.bitrate / 1000) + 'k';
+      sel.appendChild(opt);
+    }
+    sel.value = '-1';
+    els.qualityWrap.hidden = h.levels.length < 2;
+    renderStreamOptionsBar();
+  }
+
+  els.qualitySelect.addEventListener('change', function () {
+    if (!hls) return;
+    // -1 = Auto (adaptive); any other index pins that level.
+    hls.currentLevel = parseInt(els.qualitySelect.value, 10);
+  });
+
+  function startPlayback() {
+    var server = currentServer();
+    if (!server) { setPlayerState('error'); return; }
     destroyPlayer();
     var token = playToken;
     var video = els.video;
     setPlayerState('loading');
     setQuality('');
+    els.qualityWrap.hidden = true;
+    renderStreamOptionsBar();
+    // One recovery attempt per error type, then move on to the next server —
+    // retrying a dead stream forever would never surface the failover.
+    var netRecoveries = 0;
+    var mediaRecoveries = 0;
 
     if (window.Hls && Hls.isSupported()) {
       hls = new Hls({
@@ -238,7 +396,7 @@
         abrEwmaDefaultEstimate: 5000000,    // assume 5 Mbps upfront so ABR starts high
       });
       var h = hls;
-      h.loadSource(proxyUrl(channel.url));
+      h.loadSource(proxyUrl(server.url));
       h.attachMedia(video);
 
       var updateQualityBadge = function (levelIndex) {
@@ -250,13 +408,9 @@
 
       h.once(Hls.Events.MANIFEST_PARSED, function () {
         if (token !== playToken) return;
-        if (h.levels.length > 0) {
-          var maxLevel = h.levels.length - 1;
-          h.currentLevel = maxLevel;
-          h.nextAutoLevel = maxLevel;       // prevent ABR drifting back down after error recovery
-          updateQualityBadge(maxLevel);
-        }
+        populateQualityOptions(h);
         setPlayerState('playing');
+        if (selected) setDead(selected, false); // it played — not dead after all
         video.play().catch(function () {});
       });
 
@@ -266,28 +420,38 @@
 
       h.on(Hls.Events.ERROR, function (_, data) {
         if (!data.fatal || token !== playToken) return;
-        if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+        if (data.type === Hls.ErrorTypes.NETWORK_ERROR && netRecoveries < 1) {
+          netRecoveries++;
           h.startLoad();
-        } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+        } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR && mediaRecoveries < 1) {
+          mediaRecoveries++;
           h.recoverMediaError();
         } else {
-          setPlayerState('error');
+          failover();
         }
       });
     } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-      video.src = proxyUrl(channel.url);
+      video.src = proxyUrl(server.url);
       video.onloadedmetadata = function () {
         if (token !== playToken) return;
         setPlayerState('playing');
+        if (selected) setDead(selected, false);
         video.play().catch(function () {});
       };
-      video.onerror = function () { if (token === playToken) setPlayerState('error'); };
+      video.onerror = function () { if (token === playToken) failover(); };
     } else {
       setPlayerState('error');
     }
   }
 
-  els.retryBtn.addEventListener('click', function () { if (selected) startPlayback(selected); });
+  els.retryBtn.addEventListener('click', function () {
+    if (!selected) return;
+    // Fresh start: forget which servers failed and retry from the first.
+    failedServers = {};
+    serverIdx = 0;
+    renderServerRow();
+    startPlayback();
+  });
 
   function toggleFullscreen() {
     if (!document.fullscreenElement) els.videoContainer.requestFullscreen().catch(function () {});
@@ -313,6 +477,42 @@
     renderViewerPill();
   }
 
+  // The options bar collapses entirely when neither picker is relevant
+  // (single-server channel playing a single-resolution stream).
+  function renderStreamOptionsBar() {
+    els.streamOptions.hidden = els.serverRow.hidden && els.qualityWrap.hidden;
+  }
+
+  function renderServerRow() {
+    var servers = selected && selected.servers ? selected.servers : [];
+    els.serverRow.hidden = servers.length < 2;
+    els.serverButtons.innerHTML = '';
+    if (servers.length >= 2) {
+      servers.forEach(function (server, i) {
+        var btn = document.createElement('button');
+        btn.className = 'server-btn' + (i === serverIdx ? ' active' : '') + (failedServers[i] ? ' failed' : '');
+        btn.textContent = String(i + 1);
+        if (server.label) {
+          var lbl = document.createElement('span');
+          lbl.className = 'server-label';
+          lbl.textContent = server.label;
+          btn.appendChild(lbl);
+        }
+        btn.title = server.url;
+        btn.addEventListener('click', function () {
+          // A manual pick is a fresh vote of confidence — clear failed marks
+          // so auto-failover can walk the full list again from here.
+          failedServers = {};
+          serverIdx = i;
+          renderServerRow();
+          startPlayback();
+        });
+        els.serverButtons.appendChild(btn);
+      });
+    }
+    renderStreamOptionsBar();
+  }
+
   function renderViewerPill() {
     if (channelViewers == null) { els.viewerPill.hidden = true; return; }
     els.viewerPill.hidden = false;
@@ -327,8 +527,9 @@
   }
 
   els.copyBtn.addEventListener('click', function () {
-    if (!selected) return;
-    var url = selected.url;
+    var server = currentServer();
+    if (!server) return;
+    var url = server.url;
     var done = function () {
       setCopied(true);
       if (copiedTimer) clearTimeout(copiedTimer);
@@ -358,12 +559,15 @@
   // ── Selection ────────────────────────────────────────────────────────────
   function selectChannel(ch) {
     selected = ch;
+    serverIdx = 0;
+    failedServers = {};
     mobileChannelsOpen = false;
     channelViewers = null; // reset immediately on channel switch
     renderLayout();
-    renderChannelList();
+    updateListSelection();
     renderNowPlaying();
-    startPlayback(ch);
+    renderServerRow();
+    startPlayback();
     beat(); // immediate heartbeat to get fresh counts
   }
 
@@ -373,7 +577,7 @@
     destroyPlayer();
     setPlayerState('idle');
     renderLayout();
-    renderChannelList();
+    updateListSelection();
     renderCarousel();
     beat();
   }
@@ -445,6 +649,30 @@
       })
       .catch(function () {});
   }
+
+  // ── Sync ─────────────────────────────────────────────────────────────────
+  els.syncBtn.addEventListener('click', function () {
+    var btn = els.syncBtn;
+    btn.disabled = true;
+    btn.textContent = 'Syncing…';
+    fetch('/api/sync', { method: 'POST' })
+      .then(function (r) {
+        if (!r.ok) throw new Error('sync failed: ' + r.status);
+        return r.json();
+      })
+      .then(function () {
+        btn.textContent = '⟳ Sync';
+        btn.disabled = false;
+        loadChannels(); // pull the refreshed list into the UI
+      })
+      .catch(function () {
+        btn.textContent = 'Sync failed';
+        setTimeout(function () {
+          btn.textContent = '⟳ Sync';
+          btn.disabled = false;
+        }, 3000);
+      });
+  });
 
   // ── Init ─────────────────────────────────────────────────────────────────
   function loadChannels() {

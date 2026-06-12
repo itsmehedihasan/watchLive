@@ -129,9 +129,45 @@ input { font-family: inherit; }
 .link-btn:hover { color: #93c5fd; }
 
 .sidebar-footer {
-  flex-shrink: 0; padding: 8px 12px;
+  flex-shrink: 0; padding: 6px 12px;
   border-top: 1px solid var(--border-dim);
-  font-size: 11px; color: #4b5563; text-align: center;
+  font-size: 11px; color: #4b5563;
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+}
+.sync-btn {
+  flex-shrink: 0; padding: 4px 10px; border-radius: 6px;
+  font-size: 11px; font-weight: 600;
+  background: rgba(31, 41, 55, .7);
+  border: 1px solid rgba(55, 65, 81, .4);
+  color: #9ca3af;
+  transition: all .15s;
+}
+.sync-btn:hover:not(:disabled) { background: rgba(55, 65, 81, .7); color: #fff; }
+.sync-btn:disabled { opacity: .6; cursor: default; }
+
+/* Channel observed dead this session (all servers failed) */
+.channel-item.dead { box-shadow: inset 3px 0 0 #dc2626; }
+
+/* ── Country/group accordion ────────────────────────────────── */
+.group-section { border-bottom: 1px solid #1c1c1c; }
+.group-header {
+  width: 100%; display: flex; align-items: center; gap: 8px;
+  padding: 10px 12px; text-align: left;
+  font-size: 13px; font-weight: 600; color: #d1d5db;
+  transition: background .15s;
+}
+.group-header:hover { background: #1e1e1e; }
+.group-header.open { color: #fff; background: #1a1a1a; }
+.group-caret {
+  color: #6b7280; font-size: 11px;
+  transition: transform .15s; flex-shrink: 0;
+}
+.group-header.open .group-caret { transform: rotate(90deg); color: #60a5fa; }
+.group-title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.group-count {
+  margin-left: auto; flex-shrink: 0;
+  font-size: 11px; font-weight: 400; color: #6b7280;
+  background: var(--input-bg); padding: 1px 8px; border-radius: 999px;
 }
 
 /* ── Carousel ───────────────────────────────────────────────── */
@@ -258,6 +294,43 @@ input { font-family: inherit; }
 }
 .overlay-btn:hover { background: #000; }
 
+/* ── Stream options (servers + quality) ─────────────────────── */
+.stream-options {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 16px; flex-wrap: wrap;
+  background: rgba(17, 24, 39, .6);
+  border: 1px solid #1f2937; border-radius: 12px;
+  padding: 10px 16px; margin-top: 12px;
+}
+.opt-label {
+  font-size: 11px; font-weight: 700; color: #6b7280;
+  text-transform: uppercase; letter-spacing: .08em;
+}
+.server-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; min-width: 0; }
+.server-buttons { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.server-btn {
+  padding: 5px 12px; border-radius: 8px;
+  font-size: 12px; font-weight: 600;
+  background: rgba(31, 41, 55, .7);
+  border: 1px solid rgba(55, 65, 81, .4);
+  color: #d1d5db;
+  transition: all .15s;
+}
+.server-btn:hover { background: rgba(55, 65, 81, .7); color: #fff; }
+.server-btn.active { background: rgba(30, 58, 138, .5); border-color: var(--blue-light); color: #93c5fd; }
+.server-btn.failed { color: #6b7280; text-decoration: line-through; }
+.server-btn .server-label { font-weight: 400; color: #6b7280; margin-left: 4px; }
+.server-btn.active .server-label { color: #60a5fa; }
+
+.quality-wrap { display: flex; align-items: center; gap: 10px; }
+#qualitySelect {
+  background: var(--input-bg); color: #fff;
+  border: 1px solid #333; border-radius: 8px;
+  padding: 5px 10px; font-size: 12px; font-weight: 600;
+  outline: none; cursor: pointer;
+}
+#qualitySelect:focus { border-color: var(--blue-light); }
+
 /* ── Now Playing bar ────────────────────────────────────────── */
 .now-playing {
   display: flex; align-items: center; gap: 12px;
@@ -346,8 +419,10 @@ input { font-family: inherit; }
     order: 1; flex: none; width: 224px;
     border-top: 0; border-right: 1px solid var(--border-dim);
   }
-  .sidebar.collapsed { display: none; }
+  /* mobile-hidden must lose to collapsed: a selected channel adds
+     mobile-hidden, and the hamburger must still be able to collapse. */
   .sidebar.mobile-hidden { display: flex; }
+  .sidebar.collapsed { display: none; }
   .channel-item { padding: 8px 12px; }
   .main { order: 2; flex: 1; padding: 24px; }
   .carousel { min-height: 340px; }
