@@ -1,8 +1,8 @@
 // watchlive is a single-binary live TV streaming server: it serves the web
 // UI, proxies HLS streams through an in-memory segment cache, and tracks
-// live viewer counts. All assets are embedded; an external list.txt next to
-// the binary (or via -playlist) overrides the embedded channel playlist and
-// is hot-reloaded so channels can be added without a restart.
+// live viewer counts. All assets are embedded; list.m3u next to the binary
+// (or via -playlist) is the channel playlist and is hot-reloaded so channels
+// can be added without a restart.
 package main
 
 import (
@@ -40,9 +40,6 @@ var templateFS embed.FS
 //go:embed web/static
 var staticFS embed.FS
 
-//go:embed list.txt
-var embeddedPlaylist []byte
-
 // channelStore holds the parsed playlist and reloads it when the source file
 // changes on disk. The JSON and gzipped-JSON payloads for /api/channels are
 // precomputed once per reload — with 10k+ channels the list is megabytes, so
@@ -53,45 +50,34 @@ type channelStore struct {
 	jsonRaw  []byte
 	jsonGz   []byte
 	etag     string
-	path     string // curated playlist path; empty → embedded only
-	// syncPath holds the playlist downloaded from the upstream source via
-	// /api/sync. It is loaded after (appended to) the curated list and is the
-	// only file sync overwrites — list.txt stays user-owned.
-	syncPath    string
-	modTime     time.Time
-	syncModTime time.Time
+	path     string
+	modTime  time.Time
 }
 
-func newChannelStore(path, syncPath string) *channelStore {
-	cs := &channelStore{path: path, syncPath: syncPath}
+func newChannelStore(path string) *channelStore {
+	cs := &channelStore{path: path}
 	cs.reload()
 	return cs
 }
 
-// reload re-reads the playlist sources. Returns the number of channels loaded.
+// reload re-reads the playlist from disk. Returns the number of channels loaded.
 func (cs *channelStore) reload() int {
-	content := append([]byte{}, embeddedPlaylist...)
-	var modTime, syncModTime time.Time
-	if cs.path != "" {
-		if data, err := os.ReadFile(cs.path); err == nil {
-			content = data
-			if info, err := os.Stat(cs.path); err == nil {
-				modTime = info.ModTime()
-			}
-		} else if !errors.Is(err, os.ErrNotExist) {
+	data, err := os.ReadFile(cs.path)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
 			log.Printf("playlist: read %s: %v (keeping current list)", cs.path, err)
-			return cs.count()
+		} else {
+			log.Printf("playlist: %s not found", cs.path)
 		}
+		return cs.count()
 	}
-	if cs.syncPath != "" {
-		if data, err := os.ReadFile(cs.syncPath); err == nil {
-			content = append(append(content, '\n'), data...)
-			if info, err := os.Stat(cs.syncPath); err == nil {
-				syncModTime = info.ModTime()
-			}
-		}
+	info, _ := os.Stat(cs.path)
+	var modTime time.Time
+	if info != nil {
+		modTime = info.ModTime()
 	}
-	parsed := playlist.Parse(string(content))
+
+	parsed := playlist.Parse(string(data))
 	if len(parsed) == 0 {
 		log.Printf("playlist: parsed 0 channels, keeping current list")
 		return cs.count()
@@ -115,7 +101,6 @@ func (cs *channelStore) reload() int {
 	cs.jsonGz = buf.Bytes()
 	cs.etag = etag
 	cs.modTime = modTime
-	cs.syncModTime = syncModTime
 	cs.mu.Unlock()
 	return len(parsed)
 }
@@ -127,21 +112,14 @@ func (cs *channelStore) payload() (raw, gz []byte, etag string) {
 	return cs.jsonRaw, cs.jsonGz, cs.etag
 }
 
-// reloadIfChanged reloads only when a source file's mtime moved.
+// reloadIfChanged reloads only when the file's mtime moved.
 func (cs *channelStore) reloadIfChanged() {
-	var cur, curSync time.Time
-	if cs.path != "" {
-		if info, err := os.Stat(cs.path); err == nil {
-			cur = info.ModTime()
-		}
-	}
-	if cs.syncPath != "" {
-		if info, err := os.Stat(cs.syncPath); err == nil {
-			curSync = info.ModTime()
-		}
+	info, err := os.Stat(cs.path)
+	if err != nil {
+		return
 	}
 	cs.mu.RLock()
-	changed := !cur.Equal(cs.modTime) || !curSync.Equal(cs.syncModTime)
+	changed := !info.ModTime().Equal(cs.modTime)
 	cs.mu.RUnlock()
 	if changed {
 		n := cs.reload()
@@ -157,25 +135,22 @@ func (cs *channelStore) count() int {
 
 func main() {
 	addr := flag.String("addr", ":3000", "listen address")
-	playlistPath := flag.String("playlist", "", "path to external M3U playlist (default: list.txt next to the binary, falling back to the embedded copy)")
-	syncURL := flag.String("sync-url", "https://iptv-org.github.io/iptv/index.country.m3u", "upstream playlist downloaded by POST /api/sync (country-grouped variant)")
+	playlistPath := flag.String("playlist", "", "path to M3U playlist (default: list.m3u next to the binary)")
+	syncURL := flag.String("sync-url", "https://iptv-org.github.io/iptv/index.country.m3u", "upstream playlist downloaded by POST /api/sync")
 	cacheMB := flag.Int64("cache-mb", 200, "segment cache size in MB")
 	flag.Parse()
 
-	// Default external playlist: list.txt next to the executable, so editing
-	// it adds channels without rebuilding.
 	path := *playlistPath
 	if path == "" {
 		if exe, err := os.Executable(); err == nil {
-			path = filepath.Join(filepath.Dir(exe), "list.txt")
+			path = filepath.Join(filepath.Dir(exe), "list.m3u")
 		} else {
-			path = "list.txt"
+			path = "list.m3u"
 		}
 	}
-	syncPath := filepath.Join(filepath.Dir(path), "list.sync.m3u")
 
-	channels := newChannelStore(path, syncPath)
-	log.Printf("playlist: %d channels loaded (curated: %s, synced: %s)", channels.count(), path, syncPath)
+	channels := newChannelStore(path)
+	log.Printf("playlist: %d channels loaded from %s", channels.count(), path)
 
 	store := viewers.NewStore()
 	proxyHandler := proxy.New(*cacheMB << 20)
@@ -221,8 +196,7 @@ func main() {
 		w.Write(raw)
 	})
 
-	// syncMu serializes syncs; a double-click must not race two downloads
-	// into the same file.
+	// syncMu serializes syncs; a double-click must not race two downloads.
 	var syncMu sync.Mutex
 	mux.HandleFunc("POST /api/sync", func(w http.ResponseWriter, r *http.Request) {
 		syncMu.Lock()
@@ -249,12 +223,12 @@ func main() {
 			return
 		}
 		// Atomic replace: never leave a half-written playlist on disk.
-		tmp := syncPath + ".tmp"
+		tmp := path + ".tmp"
 		if err := os.WriteFile(tmp, data, 0o644); err != nil {
 			http.Error(w, "sync: write failed: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
-		if err := os.Rename(tmp, syncPath); err != nil {
+		if err := os.Rename(tmp, path); err != nil {
 			os.Remove(tmp)
 			http.Error(w, "sync: replace failed: "+err.Error(), http.StatusInternalServerError)
 			return
