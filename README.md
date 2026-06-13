@@ -1,6 +1,8 @@
 # watchlive (Go)
 
-Single-binary live TV streaming server: web UI, HLS stream proxy, and live viewer counter in one ~9 MB executable with zero runtime dependencies. All assets are embedded; the only external file you need is `list.txt`.
+Single-binary live TV streaming server: web UI, HLS stream proxy, and live viewer counter in one ~9 MB executable with zero runtime dependencies. All assets are embedded; the only external file you need is `list.m3u`.
+
+The UI has two independent browse panels: a **category** accordion on the left (News / Sports / Movies / Music / Kids / Religious / Entertainment) and a **country** accordion on the right with search and sync. Categories come from iptv-org's channel database, joined on `tvg-id`.
 
 ---
 
@@ -101,7 +103,7 @@ go build -o import.exe ./cmd/import
 | `GET`        | `/api/proxy?url=<url>`      | HLS proxy: spoofs browser headers, rewrites playlist URLs, serves segments from LRU cache (`X-Cache: HIT\|MISS`) |
 | `GET\|POST`  | `/api/viewers`              | Heartbeat + live counts (`{total, channelCount, top}`); sessions expire 60 s after last heartbeat |
 | `POST`       | `/api/reload`               | Force playlist re-read from disk                                                            |
-| `POST`       | `/api/sync`                 | Download fresh streams from `-sync-url` into `list.sync.m3u`                               |
+| `POST`       | `/api/sync`                 | Download upstream, **merge** new streams into `list.m3u` (dedup by URL — never removes existing), then stamp `tvg-genre` on every entry from iptv-org's category DB. Returns `{channels,added,tagged}` |
 
 ---
 
@@ -116,11 +118,12 @@ go test ./...
 ## Layout
 
 ```
-main.go                    server wiring, embeds, hot reload, graceful shutdown
-internal/playlist/         M3U parser and channel grouping
+main.go                    server wiring, embeds, hot reload, merge-sync, graceful shutdown
+internal/playlist/         M3U parser and channel grouping (reads tvg-genre)
+internal/genre/            iptv-org category lookup + tvg-genre injection
 internal/proxy/            HLS proxy + LRU segment cache + singleflight
 internal/viewers/          session-derived live viewer counts
-web/templates/index.html   page template
+web/templates/index.html   page template (category + country sidebars)
 web/static/                app.js, style.css, vendored hls.min.js (v1.6.16)
 cmd/import/                CLI tool to fetch and merge streams from iptv-org
 list.m3u                   channel playlist (hot-reloaded from disk)

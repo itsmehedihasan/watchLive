@@ -29,6 +29,7 @@ import (
 	"syscall"
 	"time"
 
+	"watchlive/internal/genre"
 	"watchlive/internal/playlist"
 	"watchlive/internal/proxy"
 	"watchlive/internal/viewers"
@@ -230,9 +231,39 @@ func main() {
 			http.Error(w, "sync: response is not an M3U playlist", http.StatusBadGateway)
 			return
 		}
+
+		// Merge, never overwrite: keep every existing entry and append only the
+		// upstream entries whose stream URL we don't already have. This is what
+		// lets a local list larger than upstream survive a sync untouched.
+		existing, err := os.ReadFile(path)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			http.Error(w, "sync: read existing failed: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		merged, added := mergeNewEntries(existing, data)
+
+		// Stamp tvg-genre on every entry (existing + new) from iptv-org's
+		// category database so the UI can group by category. Best-effort: if
+		// the database is unreachable, fall through with the un-enriched merge.
+		stamped := 0
+		if gm, err := genre.Load(); err != nil {
+			log.Printf("sync: genre enrich skipped: %v", err)
+		} else {
+			merged, stamped = gm.Inject(merged)
+		}
+
+		if added == 0 && stamped == 0 {
+			// Nothing new and nothing to enrich — leave the file as is.
+			n := channels.count()
+			log.Printf("sync: %d KB from %s → no changes (kept %d)", len(data)/1024, *syncURL, n)
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			fmt.Fprintf(w, `{"channels":%d,"added":0}`, n)
+			return
+		}
+
 		// Atomic replace: never leave a half-written playlist on disk.
 		tmp := path + ".tmp"
-		if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		if err := os.WriteFile(tmp, merged, 0o644); err != nil {
 			http.Error(w, "sync: write failed: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -242,9 +273,9 @@ func main() {
 			return
 		}
 		n := channels.reload()
-		log.Printf("sync: downloaded %d KB from %s → %d channels", len(data)/1024, *syncURL, n)
+		log.Printf("sync: %d KB from %s → +%d new entries, %d genre-tagged (%d channels)", len(data)/1024, *syncURL, added, stamped, n)
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		fmt.Fprintf(w, `{"channels":%d}`, n)
+		fmt.Fprintf(w, `{"channels":%d,"added":%d,"tagged":%d}`, n, added, stamped)
 	})
 
 	mux.HandleFunc("POST /api/reload", func(w http.ResponseWriter, r *http.Request) {
@@ -299,6 +330,66 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("shutdown: %v", err)
 	}
+}
+
+// mergeNewEntries appends entries from upstream whose stream URL is not already
+// present in existing, deduplicating by URL. Existing content is preserved
+// verbatim; each appended entry keeps its #EXTINF line plus any directive lines
+// (e.g. #EXTVLCOPT) and the URL. Returns the merged playlist and the number of
+// entries added — added==0 means nothing changed and existing is returned as is.
+func mergeNewEntries(existing, upstream []byte) ([]byte, int) {
+	seen := make(map[string]bool)
+	for _, line := range strings.Split(string(existing), "\n") {
+		if u := strings.TrimSpace(line); isStreamURL(u) {
+			seen[u] = true
+		}
+	}
+
+	var out strings.Builder
+	out.Write(existing)
+	if len(existing) > 0 && !strings.HasSuffix(string(existing), "\n") {
+		out.WriteByte('\n')
+	}
+
+	var block []string // lines of the entry currently being read
+	var blockURL string
+	added := 0
+
+	flush := func() {
+		if blockURL != "" && !seen[blockURL] {
+			seen[blockURL] = true
+			added++
+			for _, l := range block {
+				out.WriteString(l)
+				out.WriteByte('\n')
+			}
+		}
+		block = block[:0]
+		blockURL = ""
+	}
+
+	for _, raw := range strings.Split(string(upstream), "\n") {
+		line := strings.TrimSpace(raw)
+		if strings.HasPrefix(line, "#EXTINF") {
+			flush() // finalize the previous entry before starting a new one
+			block = append(block, line)
+		} else if len(block) > 0 && line != "" {
+			block = append(block, line)
+			if blockURL == "" && isStreamURL(line) {
+				blockURL = line
+			}
+		}
+	}
+	flush()
+
+	if added == 0 {
+		return existing, 0
+	}
+	return []byte(out.String()), added
+}
+
+func isStreamURL(line string) bool {
+	return strings.HasPrefix(line, "http://") || strings.HasPrefix(line, "https://")
 }
 
 func displayAddr(addr string) string {

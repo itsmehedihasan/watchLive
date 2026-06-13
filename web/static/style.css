@@ -410,21 +410,40 @@ input { font-family: inherit; }
 ::-webkit-scrollbar-thumb { background: #333; border-radius: 999px; }
 ::-webkit-scrollbar-thumb:hover { background: #444; }
 
+/* ── Category sidebar (left) ────────────────────────────────── */
+/* A second .sidebar; shares the accordion styles. The heading replaces the
+   search box the country sidebar has. */
+.sidebar-heading {
+  flex-shrink: 0; padding: 12px 14px 8px;
+  font-size: 11px; font-weight: 600; letter-spacing: .05em;
+  text-transform: uppercase; color: #6b7280;
+  border-bottom: 1px solid var(--border-dim);
+}
+.group-more {
+  padding: 8px 14px; font-size: 11px; color: #6b7280; line-height: 1.4;
+}
+
 /* ── Desktop (≥640px) ───────────────────────────────────────── */
 @media (min-width: 640px) {
   .body { flex-direction: row; }
   .header-burger { display: flex; }
   .brand-name { font-size: 18px; }
   .sidebar {
-    order: 1; flex: none; width: 224px;
-    border-top: 0; border-right: 1px solid var(--border-dim);
+    flex: none; border-top: 0;
   }
-  /* mobile-hidden must lose to collapsed: a selected channel adds
-     mobile-hidden, and the hamburger must still be able to collapse. */
-  .sidebar.mobile-hidden { display: flex; }
-  .sidebar.collapsed { display: none; }
-  .channel-item { padding: 8px 12px; }
+  /* Left = categories, right = countries; main fills the middle. */
+  .category-sidebar {
+    order: 1; width: 208px; border-right: 1px solid var(--border-dim);
+  }
   .main { order: 2; flex: 1; padding: 24px; }
+  .country-sidebar {
+    order: 3; width: 224px; border-left: 1px solid var(--border-dim);
+  }
+  /* mobile-hidden must lose on desktop: a selected channel adds mobile-hidden,
+     and the hamburger must still be able to collapse the country sidebar. */
+  .sidebar.mobile-hidden { display: flex; }
+  .country-sidebar.collapsed { display: none; }
+  .channel-item { padding: 8px 12px; }
   .carousel { min-height: 340px; }
   .carousel-content { min-height: 340px; }
   .carousel-logo, .carousel-logo-fallback { width: 80px; height: 80px; }

@@ -105,6 +105,7 @@
     npName: $('npName'), npGroup: $('npGroup'),
     viewerPill: $('viewerPill'), viewerCount: $('viewerCount'),
     copyBtn: $('copyBtn'), moreChannels: $('moreChannels'),
+    categorySidebar: $('categorySidebar'), categoryList: $('categoryList'), catLoading: $('catLoading'),
   };
 
   function proxyUrl(url) { return '/api/proxy?url=' + encodeURIComponent(url); }
@@ -124,8 +125,9 @@
     if (dead) deadMarks[key] = Date.now();
     else delete deadMarks[key];
     try { localStorage.setItem('livetv_dead', JSON.stringify(deadMarks)); } catch (e) { /* quota — marks stay in memory */ }
-    // Update the existing sidebar button in place.
-    Array.prototype.slice.call(els.channelList.querySelectorAll('.channel-item')).forEach(function (btn) {
+    // Update the existing sidebar buttons in place (channel can appear in both
+    // the country and category lists).
+    Array.prototype.slice.call(document.querySelectorAll('.channel-item')).forEach(function (btn) {
       if (btn.dataset.id === ch.id) btn.classList.toggle('dead', dead);
     });
   }
@@ -254,10 +256,73 @@
       : channels.length + ' channels · ' + groupNames.length + ' countries';
   }
 
+  // ── Category sidebar (left) ─────────────────────────────────────────────────
+  // An accordion grouped by ch.type. Independent of the country sidebar:
+  // expanding a category lists its channel names directly (no country nesting),
+  // capped like search so a huge bucket can't stall the page.
+  var CATEGORY_ORDER = ['News', 'Sports', 'Movies', 'Music', 'Kids', 'Religious', 'Entertainment'];
+  var expandedCats = {};        // category name → true when open
+
+  function renderCategorySidebar() {
+    var keepScroll = els.categoryList.scrollTop;
+    Array.prototype.slice.call(els.categoryList.querySelectorAll('.channel-item, .group-section')).forEach(function (n) { n.remove(); });
+    els.catLoading.hidden = !channelsLoading;
+    if (channelsLoading) return;
+
+    var byCat = {};
+    channels.forEach(function (ch) {
+      var t = ch.type || 'Entertainment';
+      (byCat[t] || (byCat[t] = [])).push(ch);
+    });
+
+    var frag = document.createDocumentFragment();
+    CATEGORY_ORDER.forEach(function (cat) {
+      var list = byCat[cat];
+      if (!list || list.length === 0) return; // hide empty categories
+
+      var section = document.createElement('div');
+      section.className = 'group-section';
+
+      var head = document.createElement('button');
+      head.className = 'group-header' + (expandedCats[cat] ? ' open' : '');
+      var caret = document.createElement('span');
+      caret.className = 'group-caret';
+      caret.textContent = '▸';
+      var title = document.createElement('span');
+      title.className = 'group-title';
+      title.textContent = cat;
+      var count = document.createElement('span');
+      count.className = 'group-count';
+      count.textContent = String(list.length);
+      head.appendChild(caret);
+      head.appendChild(title);
+      head.appendChild(count);
+      head.addEventListener('click', function () {
+        expandedCats[cat] = !expandedCats[cat];
+        renderCategorySidebar();
+      });
+      section.appendChild(head);
+
+      if (expandedCats[cat]) {
+        list.slice(0, RENDER_CAP).forEach(function (ch) { section.appendChild(makeChannelButton(ch)); });
+        if (list.length > RENDER_CAP) {
+          var more = document.createElement('div');
+          more.className = 'group-more';
+          more.textContent = 'Showing first ' + RENDER_CAP + ' of ' + list.length + ' — search on the right to narrow';
+          section.appendChild(more);
+        }
+      }
+      frag.appendChild(section);
+    });
+
+    els.categoryList.appendChild(frag);
+    els.categoryList.scrollTop = keepScroll;
+  }
+
   // Update which sidebar button is highlighted without rebuilding the list —
   // a rebuild would reset the user's scroll position.
   function updateListSelection() {
-    Array.prototype.slice.call(els.channelList.querySelectorAll('.channel-item')).forEach(function (btn) {
+    Array.prototype.slice.call(document.querySelectorAll('.channel-item')).forEach(function (btn) {
       var isSel = !!selected && btn.dataset.id === selected.id;
       btn.classList.toggle('selected', isSel);
       var dot = btn.querySelector('.channel-live-dot');
@@ -276,6 +341,9 @@
     // selected or "More Channels" was tapped.
     els.sidebar.classList.toggle('collapsed', !sidebarOpen);
     els.sidebar.classList.toggle('mobile-hidden', !!selected && !mobileChannelsOpen);
+    // The category sidebar mirrors the country one on mobile (both hidden once
+    // a channel plays, revealed together by "More Channels").
+    els.categorySidebar.classList.toggle('mobile-hidden', !!selected && !mobileChannelsOpen);
     els.carousel.hidden = !!selected;
     els.playerSection.hidden = !selected;
     els.activeBadge.hidden = !!selected || els.totalViewers.textContent === '';
@@ -751,6 +819,7 @@
       .then(function (data) {
         channels = Array.isArray(data) ? data : [];
         channelsLoading = false;
+        renderCategorySidebar();
         renderChannelList();
         if (!selected) renderCarousel();
       })
@@ -761,6 +830,7 @@
   }
 
   renderLayout();
+  renderCategorySidebar();
   renderChannelList();
   renderCarousel();
   resetCarouselTimer();

@@ -32,6 +32,7 @@ type Channel struct {
 var (
 	logoRe  = regexp.MustCompile(`tvg-logo="([^"]*)"`)
 	groupRe = regexp.MustCompile(`group-title="([^"]*)"`)
+	genreRe = regexp.MustCompile(`tvg-genre="([^"]*)"`)
 	httpRe  = regexp.MustCompile(`(?i)^https?://`)
 	// Quality suffixes like "(720p)", "(1080p)", "(2160p)" and resolution
 	// forms like "(640x360)" — used as iptv-org naming convention.
@@ -82,7 +83,7 @@ func normalizeName(name string) (clean, label string) {
 }
 
 type rawEntry struct {
-	name, logo, group, url string
+	name, logo, group, url, genre string
 }
 
 // Parse extracts channels from M3U content. Entries in the same group whose
@@ -115,6 +116,13 @@ func Parse(content string) []Channel {
 			group = strings.TrimSpace(m[1])
 		}
 
+		// tvg-genre, when present (stamped from iptv-org metadata), is an
+		// explicit UI category that overrides group-based classification.
+		genre := ""
+		if m := genreRe.FindStringSubmatch(line); m != nil {
+			genre = strings.TrimSpace(m[1])
+		}
+
 		name := ""
 		if idx := strings.LastIndex(line, ","); idx >= 0 {
 			name = strings.TrimSpace(line[idx+1:])
@@ -144,7 +152,7 @@ func Parse(content string) []Channel {
 			continue
 		}
 		seen[key] = struct{}{}
-		entries = append(entries, rawEntry{name: name, logo: logo, group: group, url: url})
+		entries = append(entries, rawEntry{name: name, logo: logo, group: group, url: url, genre: genre})
 	}
 
 	// Group entries by normalized name into channels with servers.
@@ -162,11 +170,18 @@ func Parse(content string) []Channel {
 		if !ok {
 			idx = len(channels)
 			byKey[key] = idx
+			// An explicit tvg-genre wins; otherwise fall back to classifying
+			// the group title (which for country-grouped lists is just a code,
+			// so most land in Entertainment until enriched).
+			typ := e.genre
+			if typ == "" {
+				typ = classify(e.group)
+			}
 			channels = append(channels, Channel{
 				Name:  clean,
 				Logo:  e.logo,
 				Group: e.group,
-				Type:  classify(e.group),
+				Type:  typ,
 			})
 		}
 		ch := &channels[idx]
