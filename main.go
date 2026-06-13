@@ -140,11 +140,19 @@ func main() {
 	cacheMB := flag.Int64("cache-mb", 200, "segment cache size in MB")
 	flag.Parse()
 
+	// Default playlist resolution: prefer list.m3u next to the executable, but
+	// fall back to ./list.m3u (the working directory) when it isn't there. The
+	// fallback matters for `go run .`, where the binary lives in a temp build
+	// dir that never contains the playlist.
 	path := *playlistPath
 	if path == "" {
 		if exe, err := os.Executable(); err == nil {
-			path = filepath.Join(filepath.Dir(exe), "list.m3u")
-		} else {
+			candidate := filepath.Join(filepath.Dir(exe), "list.m3u")
+			if _, err := os.Stat(candidate); err == nil {
+				path = candidate
+			}
+		}
+		if path == "" {
 			path = "list.m3u"
 		}
 	}
