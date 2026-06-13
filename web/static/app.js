@@ -106,6 +106,9 @@
     viewerPill: $('viewerPill'), viewerCount: $('viewerCount'),
     copyBtn: $('copyBtn'), moreChannels: $('moreChannels'),
     categorySidebar: $('categorySidebar'), categoryList: $('categoryList'), catLoading: $('catLoading'),
+    healthToggle: $('healthToggle'), healthStatus: $('healthStatus'),
+    healthOverlay: $('healthOverlay'), healthOverlayProgress: $('healthOverlayProgress'),
+    healthOverlayFill: $('healthOverlayFill'),
   };
 
   function proxyUrl(url) { return '/api/proxy?url=' + encodeURIComponent(url); }
@@ -132,15 +135,43 @@
     });
   }
 
+  // ── Server-side health filter ("Working only") ──────────────────────────
+  // When on, the server probes every stream and we hide the ones it can't
+  // reach (offline / blocked / geo-restricted). `health[id]` is true=alive,
+  // false=dead; absent means not yet probed. During a probe pass we hide only
+  // confirmed-dead channels (alive + not-yet-checked stay visible), so the list
+  // shrinks as dead ones drop out and ends up showing only working channels.
+  var healthOn = false;
+  var health = {};
+  var healthProbing = false;
+  var healthDone = 0, healthTotal = 0;
+  var healthPoll = null;
+  var healthOverlayDismissed = false; // user hid the loader but probe continues
+
+  function passesHealth(ch) {
+    if (!healthOn) return true;
+    return health[ch.id] !== false;
+  }
+
+  function countAlive() {
+    var n = 0;
+    for (var id in health) { if (health[id]) n++; }
+    return n;
+  }
+
   function formatViewers(n) { return n >= 1000 ? (n / 1000).toFixed(1) + 'K' : String(n); }
 
   // ── Channel list (sidebar) ───────────────────────────────────────────────
   function filteredChannels() {
-    if (!search) return channels;
-    var q = search.toLowerCase();
-    return channels.filter(function (ch) {
-      return ch.name.toLowerCase().indexOf(q) !== -1 || ch.group.toLowerCase().indexOf(q) !== -1;
-    });
+    var base = channels;
+    if (search) {
+      var q = search.toLowerCase();
+      base = channels.filter(function (ch) {
+        return ch.name.toLowerCase().indexOf(q) !== -1 || ch.group.toLowerCase().indexOf(q) !== -1;
+      });
+    }
+    if (healthOn) base = base.filter(passesHealth);
+    return base;
   }
 
   function logoOrFallback(ch, imgClass, fbClass) {
@@ -163,6 +194,9 @@
 
   // Country/group sections the user has expanded (group name → true).
   var expandedGroups = {};
+  // The search string the country list was last painted for, so a re-render
+  // triggered by something other than typing (health updates) preserves scroll.
+  var lastRenderedSearch = null;
 
   function makeChannelButton(ch) {
     var btn = document.createElement('button');
@@ -198,7 +232,10 @@
       // Searching: flat capped result list across all groups.
       matches.slice(0, RENDER_CAP).forEach(function (ch) { frag.appendChild(makeChannelButton(ch)); });
       els.channelList.appendChild(frag);
-      els.channelList.scrollTop = 0; // new result set starts at the top
+      // A new query starts at the top; a re-render of the same query (e.g. a
+      // health-probe update) keeps the user's scroll position.
+      els.channelList.scrollTop = (search === lastRenderedSearch) ? keepScroll : 0;
+      lastRenderedSearch = search;
       els.channelCount.textContent = channelsLoading ? ''
         : matches.length > RENDER_CAP
           ? 'Showing first ' + RENDER_CAP + ' of ' + matches.length + ' matches — search to narrow'
@@ -252,8 +289,10 @@
 
     els.channelList.appendChild(frag);
     els.channelList.scrollTop = keepScroll;
+    lastRenderedSearch = '';
+    var shown = healthOn ? matches.length : channels.length;
     els.channelCount.textContent = channelsLoading ? ''
-      : channels.length + ' channels · ' + groupNames.length + ' countries';
+      : shown + (healthOn ? ' working' : ' channels') + ' · ' + groupNames.length + ' countries';
   }
 
   // ── Category sidebar (left) ─────────────────────────────────────────────────
@@ -271,6 +310,7 @@
 
     var byCat = {};
     channels.forEach(function (ch) {
+      if (!passesHealth(ch)) return;
       var t = ch.type || 'Entertainment';
       (byCat[t] || (byCat[t] = [])).push(ch);
     });
@@ -785,6 +825,93 @@
       .catch(function () {});
   }
 
+  // ── Health filter lifecycle ──────────────────────────────────────────────
+  function renderHealthLists() {
+    renderCategorySidebar();
+    renderChannelList();
+  }
+
+  function updateHealthStatus() {
+    var el = els.healthStatus;
+    if (!healthOn) { el.hidden = true; el.textContent = ''; }
+    else {
+      el.hidden = false;
+      if (healthProbing) {
+        el.textContent = 'Checking ' + healthDone + ' / ' + healthTotal + ' · ' + countAlive() + ' live';
+      } else if (healthTotal) {
+        el.textContent = countAlive() + ' working of ' + healthTotal;
+      } else {
+        el.textContent = 'Starting…';
+      }
+    }
+    updateHealthOverlay();
+  }
+
+  // The full-screen loader is up only while a pass is actively probing; it
+  // comes down the moment the server reports the pass finished (or the filter
+  // is switched off).
+  function updateHealthOverlay() {
+    var show = healthOn && healthProbing && !healthOverlayDismissed;
+    els.healthOverlay.hidden = !show;
+    if (!show) return;
+    els.healthOverlayProgress.textContent = healthTotal
+      ? healthDone + ' / ' + healthTotal + ' checked · ' + countAlive() + ' live'
+      : 'Starting…';
+    var pct = healthTotal ? Math.round((healthDone / healthTotal) * 100) : 0;
+    els.healthOverlayFill.style.width = pct + '%';
+  }
+
+  function applyHealthSnapshot(snap) {
+    if (!snap) return;
+    healthDone = snap.done || 0;
+    healthTotal = snap.total || 0;
+    if (snap.status) {
+      for (var id in snap.status) { health[id] = snap.status[id]; }
+    }
+    healthProbing = !!snap.running;
+    if (!snap.running) stopHealthPolling();
+    if (healthOn) renderHealthLists();
+    updateHealthStatus();
+  }
+
+  function pollHealth() {
+    fetch('/api/health')
+      .then(function (r) { return r.json(); })
+      .then(applyHealthSnapshot)
+      .catch(function () {});
+  }
+
+  function startHealthProbe() {
+    healthProbing = true;
+    healthOverlayDismissed = false; // a fresh pass shows the loader again
+    updateHealthStatus();
+    fetch('/api/health', { method: 'POST' })
+      .then(function (r) { return r.json(); })
+      .then(applyHealthSnapshot)
+      .catch(function () {});
+    if (!healthPoll) healthPoll = setInterval(pollHealth, 1500);
+  }
+
+  function stopHealthPolling() {
+    if (healthPoll) { clearInterval(healthPoll); healthPoll = null; }
+    healthProbing = false;
+  }
+
+  $('healthOverlayHide').addEventListener('click', function () {
+    healthOverlayDismissed = true;
+    updateHealthOverlay();
+  });
+
+  els.healthToggle.addEventListener('click', function () {
+    healthOn = !healthOn;
+    els.healthToggle.classList.toggle('on', healthOn);
+    els.healthToggle.setAttribute('aria-checked', healthOn ? 'true' : 'false');
+    if (healthOn) startHealthProbe();
+    else stopHealthPolling();
+    renderHealthLists();
+    updateHealthStatus();
+  });
+
   // ── Sync ─────────────────────────────────────────────────────────────────
   els.syncBtn.addEventListener('click', function () {
     var btn = els.syncBtn;
@@ -819,9 +946,16 @@
       .then(function (data) {
         channels = Array.isArray(data) ? data : [];
         channelsLoading = false;
+        // IDs are reassigned on every (re)load, so previous verdicts no longer
+        // map to the right channels — drop them and re-probe if the filter is on.
+        health = {};
+        healthDone = healthTotal = 0;
+        stopHealthPolling();
+        if (healthOn) startHealthProbe();
         renderCategorySidebar();
         renderChannelList();
         if (!selected) renderCarousel();
+        updateHealthStatus();
       })
       .catch(function () {
         channelsLoading = false;

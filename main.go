@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"watchlive/internal/genre"
+	"watchlive/internal/health"
 	"watchlive/internal/playlist"
 	"watchlive/internal/proxy"
 	"watchlive/internal/viewers"
@@ -134,6 +135,23 @@ func (cs *channelStore) count() int {
 	return len(cs.channels)
 }
 
+// healthTargets snapshots the current channels as probe targets along with the
+// list's etag. The etag lets the prober reuse results until the playlist
+// actually changes (a re-sync reassigns IDs, so old verdicts would be wrong).
+func (cs *channelStore) healthTargets() ([]health.Target, string) {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	targets := make([]health.Target, 0, len(cs.channels))
+	for _, ch := range cs.channels {
+		urls := make([]string, 0, len(ch.Servers))
+		for _, s := range ch.Servers {
+			urls = append(urls, s.URL)
+		}
+		targets = append(targets, health.Target{ID: ch.ID, URLs: urls})
+	}
+	return targets, cs.etag
+}
+
 func main() {
 	addr := flag.String("addr", ":3000", "listen address")
 	playlistPath := flag.String("playlist", "", "path to M3U playlist (default: list.m3u next to the binary)")
@@ -163,6 +181,7 @@ func main() {
 
 	store := viewers.NewStore()
 	proxyHandler := proxy.New(*cacheMB << 20)
+	prober := health.New()
 
 	indexTmpl := template.Must(template.ParseFS(templateFS, "web/templates/index.html"))
 	staticSub, err := fs.Sub(staticFS, "web/static")
@@ -285,6 +304,20 @@ func main() {
 		fmt.Fprintf(w, `{"channels":%d}`, n)
 	})
 
+	// Server-side stream health. POST starts (or reuses) a probe pass over the
+	// current playlist; GET returns its progress and verdicts. The "Working
+	// only" toggle in the UI drives this: it kicks off a pass and polls until
+	// done, hiding channels the server couldn't reach.
+	mux.HandleFunc("POST /api/health", func(w http.ResponseWriter, r *http.Request) {
+		targets, etag := channels.healthTargets()
+		snap := prober.Start(targets, etag)
+		log.Printf("health: probe requested (%d channels, running=%v done=%d)", snap.Total, snap.Running, snap.Done)
+		writeJSON(w, r, snap)
+	})
+	mux.HandleFunc("GET /api/health", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, r, prober.Snapshot())
+	})
+
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		if err := indexTmpl.Execute(w, nil); err != nil {
@@ -390,6 +423,27 @@ func mergeNewEntries(existing, upstream []byte) ([]byte, int) {
 
 func isStreamURL(line string) bool {
 	return strings.HasPrefix(line, "http://") || strings.HasPrefix(line, "https://")
+}
+
+// writeJSON marshals v and writes it, gzipping when the client accepts it. The
+// health snapshot carries a status entry per channel, so for a large playlist
+// it is hundreds of KB — worth compressing even on localhost.
+func writeJSON(w http.ResponseWriter, r *http.Request, v any) {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	h := w.Header()
+	h.Set("Content-Type", "application/json; charset=utf-8")
+	if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+		h.Set("Content-Encoding", "gzip")
+		gz := gzip.NewWriter(w)
+		gz.Write(raw)
+		gz.Close()
+		return
+	}
+	w.Write(raw)
 }
 
 func displayAddr(addr string) string {

@@ -46,6 +46,14 @@
             <span>Loading…</span>
           </div>
         </div>
+        <div class="sidebar-footer category-footer">
+          <button id="healthToggle" class="health-toggle" role="switch" aria-checked="false"
+                  title="Probe every stream from the server and hide ones that are offline, blocked or geo-restricted">
+            <span class="health-switch"><span class="health-knob"></span></span>
+            <span class="health-toggle-label">Working only</span>
+          </button>
+          <span id="healthStatus" class="health-status" hidden></span>
+        </div>
       </aside>
 
       <!-- Main player area -->
@@ -170,6 +178,16 @@
         </div>
       </aside>
     </div>
+  </div>
+
+  <!-- Full-screen loader shown while the "Working only" probe is running -->
+  <div id="healthOverlay" class="health-overlay" hidden>
+    <div class="spinner"></div>
+    <p class="health-overlay-title">Checking channels…</p>
+    <p id="healthOverlayProgress" class="health-overlay-progress overlay-muted"></p>
+    <div class="health-overlay-bar"><div id="healthOverlayFill" class="health-overlay-fill"></div></div>
+    <p class="health-overlay-hint">Hiding streams that are offline, blocked or geo-restricted</p>
+    <button id="healthOverlayHide" class="health-overlay-hide">Hide — keep checking in background</button>
   </div>
 
   <script src="/static/hls.min.js"></script>
