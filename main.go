@@ -190,7 +190,15 @@ func main() {
 	mux.Handle("GET /api/proxy", proxyHandler)
 	mux.Handle("OPTIONS /api/proxy", proxyHandler)
 	mux.Handle("/api/viewers", &viewers.Handler{Store: store})
-	mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServerFS(staticSub)))
+	// Service-Worker-Allowed widens the SW scope from /static/ to / so the SW
+	// can intercept navigations to the root and control the full app.
+	swHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/static/sw.js" {
+			w.Header().Set("Service-Worker-Allowed", "/")
+		}
+		http.StripPrefix("/static/", http.FileServerFS(staticSub)).ServeHTTP(w, r)
+	})
+	mux.Handle("GET /static/", swHandler)
 
 	mux.HandleFunc("GET /api/channels", func(w http.ResponseWriter, r *http.Request) {
 		raw, gz, etag := channels.payload()
