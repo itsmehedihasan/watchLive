@@ -1,0 +1,43 @@
+name: release
+
+# Build a ready-to-run Windows bundle and attach it to the GitHub Release when a
+# version tag (e.g. v1.0.0) is pushed.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  windows-bundle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.5'
+
+      - name: Build Windows binary
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: '0'
+        run: go build -ldflags "-s -w" -o dist/watchlive.exe .
+
+      - name: Stage bundle
+        run: |
+          cp WatchLive.bat dist/
+          cp README.md dist/
+
+      - name: Zip bundle
+        run: |
+          cd dist
+          zip -r ../watchlive-windows-amd64.zip .
+
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: watchlive-windows-amd64.zip

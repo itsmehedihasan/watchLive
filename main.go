@@ -20,8 +20,10 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
@@ -41,6 +43,14 @@ var templateFS embed.FS
 
 //go:embed web/static
 var staticFS embed.FS
+
+// seedPlaylist is a starter channel list compiled into the binary. It is the
+// cold-start fallback when no list.m3u exists next to the binary yet, so the
+// app shows channels immediately on first run — even with no network. A real
+// list.m3u (written by the background refresh, or user-provided) always wins.
+//
+//go:embed seed.m3u
+var seedPlaylist []byte
 
 // channelStore holds the parsed playlist and reloads it when the source file
 // changes on disk. The JSON and gzipped-JSON payloads for /api/channels are
@@ -69,23 +79,35 @@ func newChannelStore(path string) *channelStore {
 	return cs
 }
 
-// reload re-reads the playlist from disk. Returns the number of channels loaded.
+// reload re-reads the playlist from disk. When the file doesn't exist yet, it
+// falls back to the embedded seed playlist so the first run is never empty.
+// Returns the number of channels loaded.
 func (cs *channelStore) reload() int {
 	data, err := os.ReadFile(cs.path)
 	if err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
 			log.Printf("playlist: read %s: %v (keeping current list)", cs.path, err)
-		} else {
-			log.Printf("playlist: %s not found", cs.path)
+			return cs.count()
 		}
-		return cs.count()
+		// No list.m3u yet — serve the embedded seed (zero modTime: reloadIfChanged
+		// keys off the on-disk file, which is still absent). The background refresh
+		// writes a real list.m3u and a later reload picks it up.
+		log.Printf("playlist: %s not found, loading embedded seed", cs.path)
+		return cs.setFromBytes(seedPlaylist, time.Time{})
 	}
 	info, _ := os.Stat(cs.path)
 	var modTime time.Time
 	if info != nil {
 		modTime = info.ModTime()
 	}
+	return cs.setFromBytes(data, modTime)
+}
 
+// setFromBytes parses an M3U payload and, if it yields any channels, swaps it in
+// as the current list along with the precomputed JSON/gzip/etag. A payload that
+// parses to zero channels (or fails to marshal) is rejected and the current list
+// is kept. Returns the channel count after the attempt.
+func (cs *channelStore) setFromBytes(data []byte, modTime time.Time) int {
 	parsed := playlist.Parse(string(data))
 	if len(parsed) == 0 {
 		log.Printf("playlist: parsed 0 channels, keeping current list")
@@ -246,6 +268,7 @@ func main() {
 	sourceURL := flag.String("source-url", "https://iptv-org.github.io/iptv/index.m3u", "upstream playlist fetched at startup and by Sync; list.m3u is the offline fallback")
 	noRefresh := flag.Bool("no-refresh", false, "skip the startup fetch from -source-url and use the local list.m3u as-is")
 	cacheMB := flag.Int64("cache-mb", 200, "segment cache size in MB")
+	open := flag.Bool("open", true, "open the web UI in the default browser once the server is listening")
 	flag.Parse()
 
 	// Default playlist resolution: prefer list.m3u next to the executable, but
@@ -401,12 +424,24 @@ func main() {
 		}
 	}()
 
+	// Bind explicitly before serving so a failure (e.g. the port is already in
+	// use) is reported clearly and we only open the browser once the listener is
+	// actually accepting connections — no "can't connect" race.
+	ln, err := net.Listen("tcp", *addr)
+	if err != nil {
+		log.Fatalf("listen on %s: %v (is the port already in use? pass -addr to pick another)", *addr, err)
+	}
+	url := "http://localhost" + displayAddr(*addr)
 	go func() {
-		log.Printf("listening on http://localhost%s", displayAddr(*addr))
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Printf("listening on %s", url)
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("server: %v", err)
 		}
 	}()
+
+	if *open {
+		openBrowser(url)
+	}
 
 	<-ctx.Done()
 	log.Println("shutting down…")
@@ -496,6 +531,16 @@ func writeJSON(w http.ResponseWriter, r *http.Request, v any) {
 		return
 	}
 	w.Write(raw)
+}
+
+// openBrowser launches the default browser at url (Windows). Best-effort: a
+// failure is logged, not fatal — the URL is also printed to the console.
+func openBrowser(url string) {
+	// "start" is a cmd builtin; the empty "" is its (ignored) window-title arg,
+	// which keeps a url containing spaces or & from being misread as the title.
+	if err := exec.Command("cmd", "/c", "start", "", url).Start(); err != nil {
+		log.Printf("open browser: %v (open %s manually)", err, url)
+	}
 }
 
 func displayAddr(addr string) string {
