@@ -3,3 +3,6 @@ watchlive.exe~
 watchlive
 list.m3u
 list.txt.bak
+list.m3u.bak
+health.json
+health.json.tmp

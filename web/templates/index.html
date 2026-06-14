@@ -3,180 +3,166 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, minimum-scale=1, maximum-scale=5">
-  <meta name="theme-color" content="#181818">
+  <meta name="theme-color" content="#080a0f">
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="apple-mobile-web-app-title" content="LiveTV">
   <link rel="manifest" href="/static/manifest.json">
   <link rel="apple-touch-icon" href="/static/icon-192.svg">
-  <title>LiveTV — Watch Bangla, Sports &amp; More</title>
-  <meta name="description" content="Free live streaming of Bangla, Hindi, Sports, News, Movies and more channels.">
+  <title>LiveTV — Multi-View</title>
+  <meta name="description" content="Watch up to four live channels at once — news, sports, movies and more.">
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-  <div class="app">
+  <div class="wall">
 
-    <!-- ── Header ─────────────────────────────────────────────── -->
-    <header class="header">
-      <button id="sidebarToggle" class="icon-btn header-burger" title="Toggle sidebar">
+    <!-- ── Left tool rail ─────────────────────────────────────────── -->
+    <aside class="rail">
+      <!-- Volume (global) -->
+      <section class="rail-section">
+        <div class="rail-label">Volume</div>
+        <button id="muteBtn" class="rail-icon-btn" title="Mute / unmute audio cell" aria-pressed="false">
+          <svg class="ico-vol" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+            <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
+            <path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M18.5 5.5a9 9 0 0 1 0 13"/>
+          </svg>
+          <svg class="ico-muted" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" hidden>
+            <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
+            <line x1="22" y1="9" x2="16" y2="15"/><line x1="16" y1="9" x2="22" y2="15"/>
+          </svg>
+        </button>
+        <input id="volume" class="vol-slider" type="range" min="0" max="100" value="100"
+               orient="vertical" aria-label="Volume" title="Volume">
+      </section>
+
+      <!-- Grid size -->
+      <section class="rail-section">
+        <div class="rail-label">Grid</div>
+        <div class="rail-row">
+          <button id="gridAdd" class="rail-icon-btn" title="Add a screen">
+            <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+              <rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/>
+              <rect x="3" y="14" width="7" height="7" rx="1"/>
+              <line x1="17.5" y1="14" x2="17.5" y2="21"/><line x1="14" y1="17.5" x2="21" y2="17.5"/>
+            </svg>
+          </button>
+          <button id="gridRemove" class="rail-icon-btn" title="Remove the last screen">
+            <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+              <rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/>
+              <rect x="3" y="14" width="7" height="7" rx="1"/>
+              <line x1="14" y1="17.5" x2="21" y2="17.5"/>
+            </svg>
+          </button>
+        </div>
+      </section>
+
+      <!-- Audio source picker (one button per cell) -->
+      <section class="rail-section">
+        <div class="rail-label">Audio</div>
+        <div id="audioButtons" class="rail-grid"></div>
+      </section>
+
+      <div class="rail-spacer"></div>
+
+      <button id="shareBtn" class="rail-icon-btn rail-bottom" title="Share this view">
         <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
-          <line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/>
+          <circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/>
+          <line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/>
         </svg>
       </button>
-      <button id="homeBtn" class="brand">
-        <span class="brand-emoji">📺</span>
-        <span class="brand-name">LiveTV</span>
+      <button id="signInBtn" class="rail-signin">Sign in</button>
+    </aside>
+
+    <!-- ── Drawer toggles (float the browse sidebars) ─────────────── -->
+    <button id="leftDrawerToggle" class="drawer-toggle drawer-toggle-left" title="Browse by category">
+      <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+        <line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/>
+      </svg>
+    </button>
+    <button id="rightDrawerToggle" class="drawer-toggle drawer-toggle-right" title="Browse by country">
+      <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+        <line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/>
+      </svg>
+    </button>
+
+    <!-- ── Video grid ─────────────────────────────────────────────── -->
+    <main id="grid" class="grid" data-count="1"></main>
+
+  </div>
+
+  <!-- Floating overlay scrim shared by drawers + picker -->
+  <div id="scrim" class="scrim" hidden></div>
+
+  <!-- Left floating drawer: browse by category -->
+  <aside id="categorySidebar" class="drawer drawer-left" hidden>
+    <div class="drawer-head">
+      <span class="drawer-title">Categories</span>
+      <button class="drawer-close" data-close-drawer title="Close">✕</button>
+    </div>
+    <div id="categoryList" class="channel-list">
+      <div id="catLoading" class="list-loading">
+        <div class="spinner-sm"></div><span>Loading…</span>
+      </div>
+    </div>
+    <div class="drawer-foot">
+      <button id="healthToggle" class="health-toggle" role="switch" aria-checked="false"
+              title="Probe every stream from the server and hide ones that are offline, blocked or geo-restricted">
+        <span class="health-switch"><span class="health-knob"></span></span>
+        <span class="health-toggle-label">Working only</span>
       </button>
-      <span id="activeBadge" class="active-badge" hidden>
-        <span>👥</span>
-        <span><span id="totalViewers">0</span> active</span>
-      </span>
-    </header>
+      <span id="healthStatus" class="health-status" hidden></span>
+    </div>
+  </aside>
 
-    <!-- ── Body ───────────────────────────────────────────────── -->
-    <div class="body">
+  <!-- Right floating drawer: browse by country + search + sync -->
+  <aside id="sidebar" class="drawer drawer-right" hidden>
+    <div class="drawer-head">
+      <span class="drawer-title">Countries</span>
+      <button class="drawer-close" data-close-drawer title="Close">✕</button>
+    </div>
+    <div class="search-wrap">
+      <div class="search-box">
+        <svg class="search-icon" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+          <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+        </svg>
+        <input id="search" type="text" placeholder="Search channels…" autocomplete="off">
+        <button id="searchClear" class="search-clear" hidden>✕</button>
+      </div>
+    </div>
+    <div id="channelList" class="channel-list">
+      <div id="listLoading" class="list-loading">
+        <div class="spinner-sm"></div><span>Loading playlist…</span>
+      </div>
+      <div id="emptyState" class="empty-state" hidden>
+        <span class="empty-emoji">😕</span><span>No channels found</span>
+        <button id="emptyClear" class="link-btn">Clear search</button>
+      </div>
+    </div>
+    <div class="drawer-foot drawer-foot-split">
+      <span id="channelCount"></span>
+      <button id="syncBtn" class="sync-btn" title="Re-download the channel list from the source">⟳ Sync</button>
+    </div>
+  </aside>
 
-      <!-- Left sidebar: browse by category (independent of the country one) -->
-      <aside id="categorySidebar" class="sidebar category-sidebar">
-        <div class="sidebar-heading">Categories</div>
-        <div id="categoryList" class="channel-list">
-          <div id="catLoading" class="list-loading">
-            <div class="spinner-sm"></div>
-            <span>Loading…</span>
-          </div>
+  <!-- ── Channel picker modal (per-cell) ────────────────────────── -->
+  <div id="picker" class="picker" hidden>
+    <div class="picker-panel">
+      <div class="picker-head">
+        <span id="pickerTitle" class="picker-title">Pick a channel</span>
+        <button id="pickerClose" class="picker-close" title="Close">✕</button>
+      </div>
+      <div class="search-wrap">
+        <div class="search-box">
+          <svg class="search-icon" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+            <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+          </svg>
+          <input id="pickerSearch" type="text" placeholder="Search live channels…" autocomplete="off">
+          <button id="pickerSearchClear" class="search-clear" hidden>✕</button>
         </div>
-        <div class="sidebar-footer category-footer">
-          <button id="healthToggle" class="health-toggle" role="switch" aria-checked="false"
-                  title="Probe every stream from the server and hide ones that are offline, blocked or geo-restricted">
-            <span class="health-switch"><span class="health-knob"></span></span>
-            <span class="health-toggle-label">Working only</span>
-          </button>
-          <span id="healthStatus" class="health-status" hidden></span>
-        </div>
-      </aside>
-
-      <!-- Main player area -->
-      <main class="main">
-        <div class="main-inner">
-
-          <!-- Carousel (shown when no channel selected) -->
-          <div id="carousel" class="carousel">
-            <div class="carousel-glow"></div>
-            <div id="carouselContent" class="carousel-content">
-              <div class="carousel-loading">
-                <div class="carousel-loading-emoji">📺</div>
-                <p>Loading channels…</p>
-              </div>
-            </div>
-            <button id="carouselPrev" class="carousel-arrow carousel-arrow-left" aria-label="Previous channel" hidden>
-              <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></svg>
-            </button>
-            <button id="carouselNext" class="carousel-arrow carousel-arrow-right" aria-label="Next channel" hidden>
-              <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg>
-            </button>
-            <div id="carouselDots" class="carousel-dots"></div>
-          </div>
-
-          <!-- Player (shown when a channel is selected) -->
-          <div id="playerSection" hidden>
-            <div id="videoContainer" class="video-container">
-              <div id="loadingOverlay" class="overlay" hidden>
-                <div class="spinner"></div>
-                <p class="overlay-muted">Connecting to stream…</p>
-              </div>
-              <div id="errorOverlay" class="overlay overlay-error" hidden>
-                <div class="overlay-emoji">📡</div>
-                <p class="error-title">Stream unavailable</p>
-                <p class="error-sub">This channel may be offline or geo-restricted</p>
-                <button id="retryBtn" class="primary-btn">↺ Retry</button>
-              </div>
-              <video id="video" controls playsinline></video>
-              <div class="video-overlay touch-visible-target">
-                <span id="qualityBadge" class="quality-badge" hidden></span>
-                <button id="fsBtn" class="overlay-btn" title="Fullscreen (F)">
-                  <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
-                    <path d="M8 3H5a2 2 0 00-2 2v3m18 0V5a2 2 0 00-2-2h-3m0 18h3a2 2 0 002-2v-3M3 16v3a2 2 0 002 2h3"/>
-                  </svg>
-                </button>
-              </div>
-            </div>
-
-            <!-- Stream options: server picker + quality selector -->
-            <div id="streamOptions" class="stream-options" hidden>
-              <div id="serverRow" class="server-row" hidden>
-                <span class="opt-label">Server</span>
-                <div id="serverButtons" class="server-buttons"></div>
-              </div>
-              <div id="qualityWrap" class="quality-wrap" hidden>
-                <label class="opt-label" for="qualitySelect">Quality</label>
-                <select id="qualitySelect"></select>
-              </div>
-            </div>
-
-            <!-- Now Playing bar -->
-            <div class="now-playing">
-              <img id="npLogo" class="np-logo" alt="" hidden>
-              <div id="npLogoFallback" class="np-logo-fallback">📡</div>
-              <div class="np-meta">
-                <p id="npName" class="np-name"></p>
-                <p id="npGroup" class="np-group"></p>
-              </div>
-              <div class="np-actions">
-                <div id="viewerPill" class="viewer-pill" hidden>
-                  <span class="viewer-emoji">👥</span>
-                  <span id="viewerCount" class="viewer-count"></span>
-                  <span class="viewer-watching">watching</span>
-                </div>
-                <button id="copyBtn" class="copy-btn" title="Copy stream URL to use in your own player">
-                  <svg class="copy-icon" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
-                    <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/>
-                  </svg>
-                  <svg class="copied-icon" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24" hidden>
-                    <polyline points="20 6 9 17 4 12"/>
-                  </svg>
-                  <span class="copy-label">Copy URL</span>
-                </button>
-                <div class="live-tag">
-                  <span class="live-dot"></span>
-                  <span class="live-text">Live</span>
-                </div>
-              </div>
-            </div>
-
-            <button id="moreChannels" class="more-channels">More Channels</button>
-          </div>
-
-        </div>
-      </main>
-
-      <!-- Right sidebar: browse by country (the original list + search + sync) -->
-      <aside id="sidebar" class="sidebar country-sidebar">
-        <div class="search-wrap">
-          <div class="search-box">
-            <svg class="search-icon" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
-              <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
-            </svg>
-            <input id="search" type="text" placeholder="Search channels…" autocomplete="off">
-            <button id="searchClear" class="search-clear" hidden>✕</button>
-          </div>
-        </div>
-        <div id="channelList" class="channel-list">
-          <div id="listLoading" class="list-loading">
-            <div class="spinner-sm"></div>
-            <span>Loading playlist…</span>
-          </div>
-          <div id="emptyState" class="empty-state" hidden>
-            <span class="empty-emoji">😕</span>
-            <span>No channels found</span>
-            <button id="emptyClear" class="link-btn">Clear search</button>
-          </div>
-        </div>
-        <div class="sidebar-footer">
-          <span id="channelCount"></span>
-          <button id="syncBtn" class="sync-btn" title="Re-download the channel list from the source">⟳ Sync</button>
-        </div>
-      </aside>
+      </div>
+      <div id="pickerList" class="channel-list picker-list"></div>
+      <div class="picker-foot"><span id="pickerCount"></span></div>
     </div>
   </div>
 

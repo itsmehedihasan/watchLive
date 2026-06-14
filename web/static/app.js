@@ -1,5 +1,9 @@
-/* LiveTV front-end — vanilla JS port of the original React app.
-   State lives in module scope; render functions re-paint the affected DOM. */
+/* LiveTV — multi-view video wall.
+   Up to four independent player cells share a global volume and a single
+   "audio cell" (only one cell is audible at a time). Channels are assigned per
+   cell from a picker of working/live channels, or by browsing the floating
+   category / country drawers. State lives in module scope; render functions
+   re-paint the affected DOM. */
 (function () {
   'use strict';
 
@@ -58,61 +62,54 @@
     VU:'Vanuatu',VE:'Venezuela',VN:'Vietnam',VG:'British Virgin Islands',
     VI:'US Virgin Islands',WF:'Wallis and Futuna',EH:'Western Sahara',YE:'Yemen',
     ZM:'Zambia',ZW:'Zimbabwe',XK:'Kosovo',
-    // common 3-letter / non-standard codes seen in iptv-org playlists
     UAE:'UAE',EUR:'Europe',INT:'International',
   };
 
   function countryLabel(g) {
     if (!g) return g;
     var up = g.trim().toUpperCase();
-    if (COUNTRY_NAMES[up]) return COUNTRY_NAMES[up];
-    // Also check the original casing key (e.g. "United Kingdom" passes through)
-    return g;
+    return COUNTRY_NAMES[up] || g;
   }
 
   // ── State ────────────────────────────────────────────────────────────────
   var channels = [];            // fetched from /api/channels (gzipped, ETag-cached)
   var channelsLoading = true;
   var sourceRefreshing = false; // server is fetching the catalog from the API
-  var selected = null;          // currently playing channel or null
-  var serverIdx = 0;            // index into selected.servers
-  var failedServers = {};       // server indexes that hit fatal errors this selection
-  var search = '';
-  var sidebarOpen = true;       // desktop sidebar visibility
-  var mobileChannelsOpen = false;
-  var topChannelIds = [];       // channel ids ranked by tune-ins (carousel order)
-  var channelViewers = null;    // viewers on the selected channel
-  var hls = null;               // active Hls.js instance
-  var playToken = 0;            // invalidates async player work on channel switch
-  var copiedTimer = null;
+  var search = '';              // country-drawer search
+  var topChannelIds = [];       // channel ids ranked by tune-ins
+
+  var MAX_CELLS = 4;
+  var cells = [];               // one entry per grid cell (see makeCell)
+  var audioCell = -1;           // index of the cell whose audio is unmuted
+  var globalMuted = false;
+  var volume = 1;               // 0..1, applied to every cell's <video>
+  var pickerTarget = -1;        // cell index the picker is currently filling
 
   // ── DOM ──────────────────────────────────────────────────────────────────
   var $ = function (id) { return document.getElementById(id); };
   var els = {
-    sidebar: $('sidebar'), sidebarToggle: $('sidebarToggle'), homeBtn: $('homeBtn'),
-    activeBadge: $('activeBadge'), totalViewers: $('totalViewers'),
+    grid: $('grid'),
+    muteBtn: $('muteBtn'), volume: $('volume'),
+    gridAdd: $('gridAdd'), gridRemove: $('gridRemove'), audioButtons: $('audioButtons'),
+    shareBtn: $('shareBtn'), signInBtn: $('signInBtn'),
+    scrim: $('scrim'),
+    leftDrawerToggle: $('leftDrawerToggle'), rightDrawerToggle: $('rightDrawerToggle'),
+    categorySidebar: $('categorySidebar'), sidebar: $('sidebar'),
     search: $('search'), searchClear: $('searchClear'),
     channelList: $('channelList'), listLoading: $('listLoading'),
     emptyState: $('emptyState'), emptyClear: $('emptyClear'),
     channelCount: $('channelCount'), syncBtn: $('syncBtn'),
-    carousel: $('carousel'), carouselContent: $('carouselContent'),
-    carouselPrev: $('carouselPrev'), carouselNext: $('carouselNext'), carouselDots: $('carouselDots'),
-    playerSection: $('playerSection'), videoContainer: $('videoContainer'), video: $('video'),
-    loadingOverlay: $('loadingOverlay'), errorOverlay: $('errorOverlay'), retryBtn: $('retryBtn'),
-    qualityBadge: $('qualityBadge'), fsBtn: $('fsBtn'),
-    streamOptions: $('streamOptions'), serverRow: $('serverRow'), serverButtons: $('serverButtons'),
-    qualityWrap: $('qualityWrap'), qualitySelect: $('qualitySelect'),
-    npLogo: $('npLogo'), npLogoFallback: $('npLogoFallback'),
-    npName: $('npName'), npGroup: $('npGroup'),
-    viewerPill: $('viewerPill'), viewerCount: $('viewerCount'),
-    copyBtn: $('copyBtn'), moreChannels: $('moreChannels'),
-    categorySidebar: $('categorySidebar'), categoryList: $('categoryList'), catLoading: $('catLoading'),
+    categoryList: $('categoryList'), catLoading: $('catLoading'),
     healthToggle: $('healthToggle'), healthStatus: $('healthStatus'),
     healthOverlay: $('healthOverlay'), healthOverlayProgress: $('healthOverlayProgress'),
     healthOverlayFill: $('healthOverlayFill'),
+    picker: $('picker'), pickerTitle: $('pickerTitle'), pickerClose: $('pickerClose'),
+    pickerSearch: $('pickerSearch'), pickerSearchClear: $('pickerSearchClear'),
+    pickerList: $('pickerList'), pickerCount: $('pickerCount'),
   };
 
   function proxyUrl(url) { return '/api/proxy?url=' + encodeURIComponent(url); }
+  function formatViewers(n) { return n >= 1000 ? (n / 1000).toFixed(1) + 'K' : String(n); }
 
   // ── Dead-channel marks ───────────────────────────────────────────────────
   // A channel is marked dead when playback exhausted every server. Keyed by
@@ -123,58 +120,573 @@
   function deadKey(ch) { return ch.name.toLowerCase(); }
   function isDead(ch) { return !!deadMarks[deadKey(ch)]; }
 
+  // ── Favourites ───────────────────────────────────────────────────────────
+  // User-pinned channels, shown in a "Favourites" section at the top of the
+  // category sidebar. Keyed by name (IDs shift on re-sync) and persisted per
+  // browser, like dead marks. Favourites ignore the "Working only" filter.
+  var favMarks = {};
+  try { favMarks = JSON.parse(localStorage.getItem('livetv_fav')) || {}; } catch (e) { /* fresh start */ }
+  function favKey(ch) { return ch.name.toLowerCase(); }
+  function isFav(ch) { return !!favMarks[favKey(ch)]; }
+  function setFav(ch, on) {
+    var k = favKey(ch);
+    if (on === !!favMarks[k]) return;
+    if (on) favMarks[k] = Date.now(); else delete favMarks[k];
+    try { localStorage.setItem('livetv_fav', JSON.stringify(favMarks)); } catch (e) { /* quota */ }
+  }
+  // After a pin toggle: rebuild the category sidebar (Favourites membership
+  // changed) and fix the pin icons in the other lists in place (no scroll jump).
+  function onFavChanged() {
+    renderCategorySidebar();
+    Array.prototype.slice.call(document.querySelectorAll('.pin-btn')).forEach(function (pin) {
+      var on = !!favMarks[pin.dataset.favkey];
+      pin.classList.toggle('faved', on);
+      pin.title = on ? 'Remove from Favourites' : 'Add to Favourites';
+    });
+  }
+
   function setDead(ch, dead) {
     var key = deadKey(ch);
     if (dead === !!deadMarks[key]) return;
     if (dead) deadMarks[key] = Date.now();
     else delete deadMarks[key];
-    try { localStorage.setItem('livetv_dead', JSON.stringify(deadMarks)); } catch (e) { /* quota — marks stay in memory */ }
-    // Update the existing sidebar buttons in place (channel can appear in both
-    // the country and category lists).
+    try { localStorage.setItem('livetv_dead', JSON.stringify(deadMarks)); } catch (e) { /* quota */ }
     Array.prototype.slice.call(document.querySelectorAll('.channel-item')).forEach(function (btn) {
       if (btn.dataset.id === ch.id) btn.classList.toggle('dead', dead);
     });
   }
 
   // ── Server-side health filter ("Working only") ──────────────────────────
-  // When on, the server probes every stream and we hide the ones it can't
-  // reach (offline / blocked / geo-restricted). `health[id]` is true=alive,
-  // false=dead; absent means not yet probed. During a probe pass we hide only
-  // confirmed-dead channels (alive + not-yet-checked stay visible), so the list
-  // shrinks as dead ones drop out and ends up showing only working channels.
-  // Default ON ("only active shown"); persisted so a user who turns it off stays
-  // off. localStorage value '0' = off, anything else (incl. absent) = on.
+  // When on, the server probes every stream and we hide ones it can't reach.
+  // The per-cell picker always lists working channels only. Default ON.
   var healthOn = localStorage.getItem('livetv_health_on') !== '0';
   var health = {};
   var healthProbing = false;
   var healthDone = 0, healthTotal = 0;
   var healthPoll = null;
-  var healthOverlayDismissed = false; // user hid the loader but probe continues
+  var healthOverlayDismissed = false;
+  var channelsEtag = null; // content hash of the current list; gates the health cache
 
   function passesHealth(ch) {
     if (!healthOn) return true;
     return health[ch.id] !== false;
   }
-
   function countAlive() {
     var n = 0;
     for (var id in health) { if (health[id]) n++; }
     return n;
   }
 
-  function formatViewers(n) { return n >= 1000 ? (n / 1000).toFixed(1) + 'K' : String(n); }
+  // ── Active-channel highlighting ──────────────────────────────────────────
+  // Channels currently shown in any cell are highlighted in the browse lists.
+  function activeIds() {
+    var ids = {};
+    cells.forEach(function (c) { if (c.channel) ids[c.channel.id] = true; });
+    return ids;
+  }
+  function isActive(ch) {
+    for (var i = 0; i < cells.length; i++) {
+      if (cells[i].channel && cells[i].channel.id === ch.id) return true;
+    }
+    return false;
+  }
 
-  // ── Channel list (sidebar) ───────────────────────────────────────────────
-  function filteredChannels() {
-    var base = channels;
-    if (search) {
-      var q = search.toLowerCase();
-      base = channels.filter(function (ch) {
+  // ── Cell model ───────────────────────────────────────────────────────────
+  // Each cell owns its own <video> + Hls.js instance so re-laying-out the grid
+  // (a pure CSS change) never restarts playback.
+  function makeCell(idx) {
+    var cell = {
+      idx: idx,
+      channel: null,
+      serverIdx: 0,
+      failedServers: {},
+      hls: null,
+      token: 0,
+      root: null,
+      video: null,
+    };
+
+    var root = document.createElement('section');
+    root.className = 'cell';
+    root.dataset.idx = String(idx);
+
+    // Playing stage
+    var stage = document.createElement('div');
+    stage.className = 'cell-stage';
+
+    var video = document.createElement('video');
+    video.playsInline = true;
+    video.muted = true; // every cell starts muted; the audio cell is unmuted on assign
+    stage.appendChild(video);
+
+    var loading = document.createElement('div');
+    loading.className = 'cell-overlay cell-loading';
+    loading.innerHTML = '<div class="spinner"></div><p class="overlay-muted">Connecting…</p>';
+    loading.hidden = true;
+    stage.appendChild(loading);
+
+    var error = document.createElement('div');
+    error.className = 'cell-overlay cell-error';
+    error.hidden = true;
+    var errEmoji = document.createElement('div'); errEmoji.className = 'overlay-emoji'; errEmoji.textContent = '📡';
+    var errTitle = document.createElement('p'); errTitle.className = 'error-title'; errTitle.textContent = 'Stream unavailable';
+    var errBtn = document.createElement('button'); errBtn.className = 'primary-btn'; errBtn.textContent = '↺ Retry';
+    errBtn.addEventListener('click', function () { retryCell(cell); });
+    error.appendChild(errEmoji); error.appendChild(errTitle); error.appendChild(errBtn);
+    stage.appendChild(error);
+
+    // Mic (audio source) — top-left, always visible while filled
+    var mic = document.createElement('button');
+    mic.className = 'cell-mic';
+    mic.title = 'Use this cell’s audio';
+    mic.innerHTML =
+      '<svg class="ico-on" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">' +
+        '<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/></svg>' +
+      '<svg class="ico-off" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" hidden>' +
+        '<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="22" y1="9" x2="16" y2="15"/><line x1="16" y1="9" x2="22" y2="15"/></svg>';
+    mic.addEventListener('click', function () { setAudioCell(cell.idx); });
+    stage.appendChild(mic);
+
+    // Channel name label
+    var label = document.createElement('div');
+    label.className = 'cell-label';
+    stage.appendChild(label);
+
+    // Hover controls — bottom center
+    var controls = document.createElement('div');
+    controls.className = 'cell-controls';
+    var expand = document.createElement('button');
+    expand.className = 'cell-ctl';
+    expand.title = 'Expand (fullscreen)';
+    expand.innerHTML = '<svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M8 3H5a2 2 0 00-2 2v3m18 0V5a2 2 0 00-2-2h-3m0 18h3a2 2 0 002-2v-3M3 16v3a2 2 0 002 2h3"/></svg>';
+    expand.addEventListener('click', function () { toggleCellFullscreen(cell); });
+    var close = document.createElement('button');
+    close.className = 'cell-ctl';
+    close.title = 'Close this screen';
+    close.innerHTML = '<svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
+    close.addEventListener('click', function () { clearCell(cell); });
+    controls.appendChild(expand);
+    controls.appendChild(close);
+    stage.appendChild(controls);
+
+    root.appendChild(stage);
+
+    // Empty stage
+    var empty = document.createElement('div');
+    empty.className = 'cell-empty';
+    var pick = document.createElement('button');
+    pick.className = 'cell-pick';
+    pick.innerHTML =
+      '<svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">' +
+        '<rect x="2" y="6" width="14" height="12" rx="2"/><path d="M16 10l6-3v10l-6-3"/><line x1="9" y1="9" x2="9" y2="15"/><line x1="6" y1="12" x2="12" y2="12"/></svg>' +
+      '<span class="cell-pick-label"></span>';
+    pick.addEventListener('click', function () { openPicker(cell.idx); });
+    empty.appendChild(pick);
+    root.appendChild(empty);
+
+    cell.root = root;
+    cell.video = video;
+    cell.els = { stage: stage, empty: empty, loading: loading, error: error, mic: mic, label: label, pickLabel: pick.querySelector('.cell-pick-label') };
+    return cell;
+  }
+
+  function setCellState(cell, state) {
+    cell.els.loading.hidden = state !== 'loading';
+    cell.els.error.hidden = state !== 'error';
+  }
+
+  // ── Per-cell playback ────────────────────────────────────────────────────
+  function currentServer(cell) {
+    var ch = cell.channel;
+    if (!ch || !ch.servers || ch.servers.length === 0) return null;
+    return ch.servers[Math.min(cell.serverIdx, ch.servers.length - 1)];
+  }
+
+  function destroyCellPlayer(cell) {
+    cell.token++;
+    if (cell.hls) { cell.hls.destroy(); cell.hls = null; }
+    cell.video.removeAttribute('src');
+    cell.video.onloadedmetadata = null;
+    cell.video.onerror = null;
+    try { cell.video.load(); } catch (e) { /* ignore */ }
+  }
+
+  function failover(cell) {
+    if (!cell.channel) return;
+    cell.failedServers[cell.serverIdx] = true;
+    var servers = cell.channel.servers || [];
+    for (var i = 0; i < servers.length; i++) {
+      if (!cell.failedServers[i]) {
+        cell.serverIdx = i;
+        startCellPlayback(cell);
+        return;
+      }
+    }
+    setDead(cell.channel, true);
+    setCellState(cell, 'error');
+  }
+
+  function retryCell(cell) {
+    if (!cell.channel) return;
+    cell.failedServers = {};
+    cell.serverIdx = 0;
+    startCellPlayback(cell);
+  }
+
+  function startCellPlayback(cell) {
+    var server = currentServer(cell);
+    if (!server) { setCellState(cell, 'error'); return; }
+    destroyCellPlayer(cell);
+    var token = cell.token;
+    var video = cell.video;
+    setCellState(cell, 'loading');
+    var netRecoveries = 0, mediaRecoveries = 0;
+
+    if (window.Hls && Hls.isSupported()) {
+      cell.hls = new Hls({
+        enableWorker: true,
+        lowLatencyMode: false,
+        capLevelToPlayerSize: false,
+        startLevel: -1,
+        startFragPrefetch: true,
+        maxMaxBufferLength: 60,
+        backBufferLength: 0,
+        abrEwmaDefaultEstimate: 5000000,
+      });
+      var h = cell.hls;
+      h.loadSource(proxyUrl(server.url));
+      h.attachMedia(video);
+
+      h.once(Hls.Events.MANIFEST_PARSED, function () {
+        if (token !== cell.token) return;
+        setCellState(cell, 'playing');
+        if (cell.channel) setDead(cell.channel, false);
+        playCell(cell);
+      });
+      h.on(Hls.Events.ERROR, function (_, data) {
+        if (!data.fatal || token !== cell.token) return;
+        if (data.type === Hls.ErrorTypes.NETWORK_ERROR && netRecoveries < 1) {
+          netRecoveries++; h.startLoad();
+        } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR && mediaRecoveries < 1) {
+          mediaRecoveries++; h.recoverMediaError();
+        } else {
+          failover(cell);
+        }
+      });
+    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      video.src = proxyUrl(server.url);
+      video.onloadedmetadata = function () {
+        if (token !== cell.token) return;
+        setCellState(cell, 'playing');
+        if (cell.channel) setDead(cell.channel, false);
+        playCell(cell);
+      };
+      video.onerror = function () { if (token === cell.token) failover(cell); };
+    } else {
+      setCellState(cell, 'error');
+    }
+  }
+
+  // Start playback honoring autoplay policy: an unmuted play() may be blocked
+  // unless it follows a user gesture — fall back to muted so video keeps going.
+  function playCell(cell) {
+    var p = cell.video.play();
+    if (p && p.catch) {
+      p.catch(function () {
+        if (!cell.video.muted) { cell.video.muted = true; applyAudio(); }
+        cell.video.play().catch(function () {});
+      });
+    }
+  }
+
+  function toggleCellFullscreen(cell) {
+    if (!document.fullscreenElement) cell.els.stage.requestFullscreen().catch(function () {});
+    else document.exitFullscreen();
+  }
+
+  // ── Channel assignment ───────────────────────────────────────────────────
+  function assignChannel(cellIdx, ch) {
+    var cell = cells[cellIdx];
+    if (!cell) return;
+    cell.channel = ch;
+    cell.serverIdx = 0;
+    cell.failedServers = {};
+    cell.root.classList.add('filled');
+    cell.els.label.textContent = ch.name;
+    // First channel placed becomes the audio source automatically.
+    if (audioCell === -1) audioCell = cellIdx;
+    startCellPlayback(cell);
+    applyAudio();
+    renderAudioButtons();
+    refreshHighlights();
+    beat();
+  }
+
+  function clearCell(cell) {
+    destroyCellPlayer(cell);
+    cell.channel = null;
+    cell.root.classList.remove('filled');
+    cell.els.label.textContent = '';
+    setCellState(cell, 'idle');
+    if (audioCell === cell.idx) {
+      // Hand the audio crown to the next filled cell, if any.
+      audioCell = -1;
+      for (var i = 0; i < cells.length; i++) {
+        if (cells[i].channel) { audioCell = i; break; }
+      }
+    }
+    applyAudio();
+    renderAudioButtons();
+    refreshHighlights();
+    beat();
+  }
+
+  // ── Audio / volume ───────────────────────────────────────────────────────
+  function setAudioCell(idx) {
+    var cell = cells[idx];
+    if (!cell || !cell.channel) return;
+    audioCell = idx;
+    applyAudio();
+    renderAudioButtons();
+    beat();
+  }
+
+  function applyAudio() {
+    cells.forEach(function (c, i) {
+      var isAudio = i === audioCell && !globalMuted;
+      c.video.muted = !isAudio;
+      c.video.volume = volume;
+      var on = c.els.mic.querySelector('.ico-on');
+      var off = c.els.mic.querySelector('.ico-off');
+      if (on && off) { on.hidden = !isAudio; off.hidden = isAudio; }
+      c.els.mic.classList.toggle('active', isAudio);
+    });
+    els.muteBtn.querySelector('.ico-vol').hidden = globalMuted;
+    els.muteBtn.querySelector('.ico-muted').hidden = !globalMuted;
+    els.muteBtn.setAttribute('aria-pressed', globalMuted ? 'true' : 'false');
+  }
+
+  function renderAudioButtons() {
+    els.audioButtons.innerHTML = '';
+    for (var i = 0; i < cells.length; i++) {
+      (function (i) {
+        var btn = document.createElement('button');
+        var cell = cells[i];
+        btn.className = 'rail-num' +
+          (i === audioCell ? ' active' : '') +
+          (cell.channel ? '' : ' empty');
+        btn.textContent = String(i + 1);
+        btn.title = cell.channel ? ('Audio from screen ' + (i + 1) + ' — ' + cell.channel.name)
+                                 : ('Screen ' + (i + 1) + ' is empty');
+        btn.addEventListener('click', function () {
+          if (cell.channel) setAudioCell(i);
+          else openPicker(i);
+        });
+        els.audioButtons.appendChild(btn);
+      })(i);
+    }
+  }
+
+  els.muteBtn.addEventListener('click', function () {
+    globalMuted = !globalMuted;
+    persistAudio();
+    applyAudio();
+  });
+  els.volume.addEventListener('input', function () {
+    volume = Math.max(0, Math.min(1, parseInt(els.volume.value, 10) / 100));
+    if (volume > 0 && globalMuted) globalMuted = false; // dragging up un-mutes
+    persistAudio();
+    applyAudio();
+  });
+
+  function persistAudio() {
+    try {
+      localStorage.setItem('livetv_volume', String(Math.round(volume * 100)));
+      localStorage.setItem('livetv_muted', globalMuted ? '1' : '0');
+    } catch (e) { /* quota */ }
+  }
+
+  // ── Grid sizing ──────────────────────────────────────────────────────────
+  function renderGridControls() {
+    els.gridAdd.disabled = cells.length >= MAX_CELLS;
+    els.gridRemove.disabled = cells.length <= 1;
+    els.grid.dataset.count = String(cells.length);
+  }
+
+  function addCell() {
+    if (cells.length >= MAX_CELLS) return;
+    var cell = makeCell(cells.length);
+    cells.push(cell);
+    els.grid.appendChild(cell.root);
+    setCellState(cell, 'idle');
+    updatePickLabels();
+    renderGridControls();
+    renderAudioButtons();
+    applyAudio();
+    persistGrid();
+  }
+
+  function removeCell() {
+    if (cells.length <= 1) return;
+    var cell = cells.pop();
+    destroyCellPlayer(cell);
+    if (cell.root.parentNode) cell.root.parentNode.removeChild(cell.root);
+    if (audioCell >= cells.length) {
+      audioCell = -1;
+      for (var i = 0; i < cells.length; i++) { if (cells[i].channel) { audioCell = i; break; } }
+    }
+    updatePickLabels();
+    renderGridControls();
+    renderAudioButtons();
+    applyAudio();
+    refreshHighlights();
+    persistGrid();
+    beat();
+  }
+
+  function updatePickLabels() {
+    cells.forEach(function (c, i) {
+      c.els.pickLabel.textContent = (i === 0 && cells.length === 1) ? 'Pick your first channel' : ('Set Cell ' + (i + 1));
+    });
+  }
+
+  function persistGrid() {
+    try { localStorage.setItem('livetv_grid', String(cells.length)); } catch (e) { /* quota */ }
+  }
+
+  els.gridAdd.addEventListener('click', addCell);
+  els.gridRemove.addEventListener('click', removeCell);
+
+  // ── Channel picker (per cell) ────────────────────────────────────────────
+  var pickerSearch = '';
+
+  function openPicker(cellIdx) {
+    pickerTarget = cellIdx;
+    els.pickerTitle.textContent = (cellIdx === 0 && cells.length === 1)
+      ? 'Pick your first channel' : ('Pick a channel for Cell ' + (cellIdx + 1));
+    els.picker.hidden = false;
+    els.scrim.hidden = false;
+    renderPicker();
+    setTimeout(function () { els.pickerSearch.focus(); }, 0);
+  }
+  function closePicker() {
+    els.picker.hidden = true;
+    pickerTarget = -1;
+    maybeHideScrim();
+  }
+
+  // Live/working channels only, optionally narrowed by the picker search box.
+  function pickerChannels() {
+    var base = channels.filter(passesHealth);
+    if (pickerSearch) {
+      var q = pickerSearch.toLowerCase();
+      base = base.filter(function (ch) {
         return ch.name.toLowerCase().indexOf(q) !== -1 || ch.group.toLowerCase().indexOf(q) !== -1;
       });
     }
-    if (healthOn) base = base.filter(passesHealth);
     return base;
+  }
+
+  function renderPicker() {
+    var matches = pickerChannels();
+    els.pickerList.innerHTML = '';
+    var frag = document.createDocumentFragment();
+    matches.slice(0, RENDER_CAP).forEach(function (ch) {
+      frag.appendChild(makeChannelButton(ch, function () {
+        var target = pickerTarget;
+        closePicker();
+        assignChannel(target, ch);
+      }));
+    });
+    els.pickerList.appendChild(frag);
+    els.pickerList.scrollTop = 0;
+    var n = matches.length;
+    els.pickerCount.textContent = channelsLoading ? 'Loading…'
+      : n === 0 ? (sourceRefreshing ? 'Fetching channels…' : (healthOn ? 'No working channels found yet — health check may still be running' : 'No channels found'))
+      : n > RENDER_CAP ? ('Showing first ' + RENDER_CAP + ' of ' + n + ' — search to narrow')
+      : (n + ' live channel' + (n === 1 ? '' : 's'));
+  }
+
+  els.pickerClose.addEventListener('click', closePicker);
+  var pickerDebounce = null;
+  els.pickerSearch.addEventListener('input', function () {
+    els.pickerSearchClear.hidden = !els.pickerSearch.value;
+    if (pickerDebounce) clearTimeout(pickerDebounce);
+    pickerDebounce = setTimeout(function () { pickerSearch = els.pickerSearch.value; renderPicker(); }, 150);
+  });
+  els.pickerSearchClear.addEventListener('click', function () {
+    els.pickerSearch.value = ''; pickerSearch = ''; els.pickerSearchClear.hidden = true; renderPicker(); els.pickerSearch.focus();
+  });
+
+  // ── Browse drawers (floating sidebars) ───────────────────────────────────
+  function targetCellForBrowse() {
+    for (var i = 0; i < cells.length; i++) { if (!cells[i].channel) return i; }
+    return audioCell >= 0 ? audioCell : 0;
+  }
+
+  function openDrawer(which) {
+    var drawer = which === 'left' ? els.categorySidebar : els.sidebar;
+    var other = which === 'left' ? els.sidebar : els.categorySidebar;
+    other.classList.remove('open');
+    drawer.hidden = false; // first open: leave display:flex from here on (slides via .open)
+    els.scrim.hidden = false;
+    // next frame so the slide-in transition runs from the off-screen transform
+    requestAnimationFrame(function () { drawer.classList.add('open'); });
+  }
+  function closeDrawers() {
+    // Drop only the .open class so the drawer slides back out; it stays in the
+    // DOM (translated off-screen) so the close animates too.
+    els.categorySidebar.classList.remove('open');
+    els.sidebar.classList.remove('open');
+    maybeHideScrim();
+  }
+  function maybeHideScrim() {
+    var anyOpen = els.categorySidebar.classList.contains('open') ||
+                  els.sidebar.classList.contains('open') || !els.picker.hidden;
+    els.scrim.hidden = !anyOpen;
+  }
+
+  els.leftDrawerToggle.addEventListener('click', function () { openDrawer('left'); });
+  els.rightDrawerToggle.addEventListener('click', function () { openDrawer('right'); });
+  els.scrim.addEventListener('click', function () { closeDrawers(); closePicker(); });
+  Array.prototype.slice.call(document.querySelectorAll('[data-close-drawer]')).forEach(function (b) {
+    b.addEventListener('click', closeDrawers);
+  });
+
+  // Selecting a channel from a browse drawer drops it into the next empty cell
+  // (or the audio cell) and closes the drawer.
+  function browseSelect(ch) {
+    var idx = targetCellForBrowse();
+    closeDrawers();
+    assignChannel(idx, ch);
+  }
+
+  // ── Browse list rendering (shared by both drawers) ───────────────────────
+  function makeChannelButton(ch, onClick) {
+    var btn = document.createElement('button');
+    btn.className = 'channel-item' + (isActive(ch) ? ' selected' : '') + (isDead(ch) ? ' dead' : '');
+    btn.dataset.id = ch.id;
+    btn.appendChild(logoOrFallback(ch, 'channel-logo', 'channel-logo-fallback'));
+    var name = document.createElement('span');
+    name.className = 'channel-name';
+    name.textContent = ch.name;
+    btn.appendChild(name);
+    // Pin toggle (a span, not a button — a <button> can't nest in a <button>).
+    var pin = document.createElement('span');
+    pin.className = 'pin-btn' + (isFav(ch) ? ' faved' : '');
+    pin.dataset.favkey = favKey(ch);
+    pin.setAttribute('role', 'button');
+    pin.title = isFav(ch) ? 'Remove from Favourites' : 'Add to Favourites';
+    pin.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round">' +
+      '<path d="M9 4h6l-1 5 3 3v2h-4v5l-1 1-1-1v-5H6v-2l3-3z"/></svg>';
+    pin.addEventListener('click', function (e) {
+      e.stopPropagation();
+      setFav(ch, !isFav(ch));
+      onFavChanged();
+    });
+    btn.appendChild(pin);
+    btn.addEventListener('click', function () { onClick(ch); });
+    return btn;
   }
 
   function logoOrFallback(ch, imgClass, fbClass) {
@@ -191,43 +703,27 @@
     return img;
   }
 
-  // Cap how many channel buttons exist in the DOM at once during search —
-  // with 10k+ channels, rendering them all would stall every keystroke.
   var RENDER_CAP = 500;
-
-  // Country/group sections the user has expanded (group name → true).
   var expandedGroups = {};
-  // The search string the country list was last painted for, so a re-render
-  // triggered by something other than typing (health updates) preserves scroll.
   var lastRenderedSearch = null;
 
-  function makeChannelButton(ch) {
-    var btn = document.createElement('button');
-    btn.className = 'channel-item' + (selected && selected.id === ch.id ? ' selected' : '') + (isDead(ch) ? ' dead' : '');
-    btn.dataset.id = ch.id;
-    btn.appendChild(logoOrFallback(ch, 'channel-logo', 'channel-logo-fallback'));
-    var name = document.createElement('span');
-    name.className = 'channel-name';
-    name.textContent = ch.name;
-    btn.appendChild(name);
-    if (selected && selected.id === ch.id) {
-      var dot = document.createElement('span');
-      dot.className = 'channel-live-dot';
-      btn.appendChild(dot);
+  function filteredChannels() {
+    var base = channels;
+    if (search) {
+      var q = search.toLowerCase();
+      base = channels.filter(function (ch) {
+        return ch.name.toLowerCase().indexOf(q) !== -1 || ch.group.toLowerCase().indexOf(q) !== -1;
+      });
     }
-    btn.addEventListener('click', function () { selectChannel(ch); });
-    return btn;
+    if (healthOn) base = base.filter(passesHealth);
+    return base;
   }
 
   function renderChannelList() {
     var matches = filteredChannels();
-    var keepScroll = els.channelList.scrollTop; // survive accordion re-renders
-
-    // Remove previous dynamic nodes, keep the loading/empty-state nodes.
+    var keepScroll = els.channelList.scrollTop;
     Array.prototype.slice.call(els.channelList.querySelectorAll('.channel-item, .group-section')).forEach(function (n) { n.remove(); });
 
-    // While the server is still fetching the catalog and we have nothing yet,
-    // show the loading spinner rather than a misleading "no channels" message.
     var awaitingFirstList = sourceRefreshing && channels.length === 0;
     els.listLoading.hidden = !(channelsLoading || awaitingFirstList);
     els.emptyState.hidden = channelsLoading || awaitingFirstList || matches.length !== 0;
@@ -235,11 +731,8 @@
     var frag = document.createDocumentFragment();
 
     if (search) {
-      // Searching: flat capped result list across all groups.
-      matches.slice(0, RENDER_CAP).forEach(function (ch) { frag.appendChild(makeChannelButton(ch)); });
+      matches.slice(0, RENDER_CAP).forEach(function (ch) { frag.appendChild(makeChannelButton(ch, browseSelect)); });
       els.channelList.appendChild(frag);
-      // A new query starts at the top; a re-render of the same query (e.g. a
-      // health-probe update) keeps the user's scroll position.
       els.channelList.scrollTop = (search === lastRenderedSearch) ? keepScroll : 0;
       lastRenderedSearch = search;
       els.channelCount.textContent = channelsLoading ? ''
@@ -249,8 +742,6 @@
       return;
     }
 
-    // Browsing: collapsible sections per group (country). Only expanded
-    // sections render their channel buttons, which keeps the DOM small.
     var byGroup = {};
     var groupNames = [];
     matches.forEach(function (ch) {
@@ -258,38 +749,20 @@
       if (!byGroup[g]) { byGroup[g] = []; groupNames.push(g); }
       byGroup[g].push(ch);
     });
-    groupNames.sort(function (a, b) {
-      a = a.toLowerCase(); b = b.toLowerCase();
-      return a < b ? -1 : a > b ? 1 : 0;
-    });
+    groupNames.sort(function (a, b) { a = a.toLowerCase(); b = b.toLowerCase(); return a < b ? -1 : a > b ? 1 : 0; });
 
     groupNames.forEach(function (g) {
       var section = document.createElement('div');
       section.className = 'group-section';
-
       var head = document.createElement('button');
       head.className = 'group-header' + (expandedGroups[g] ? ' open' : '');
-      var caret = document.createElement('span');
-      caret.className = 'group-caret';
-      caret.textContent = '▸';
-      var title = document.createElement('span');
-      title.className = 'group-title';
-      title.textContent = countryLabel(g);
-      var count = document.createElement('span');
-      count.className = 'group-count';
-      count.textContent = String(byGroup[g].length);
-      head.appendChild(caret);
-      head.appendChild(title);
-      head.appendChild(count);
-      head.addEventListener('click', function () {
-        expandedGroups[g] = !expandedGroups[g];
-        renderChannelList();
-      });
+      var caret = document.createElement('span'); caret.className = 'group-caret'; caret.textContent = '▸';
+      var title = document.createElement('span'); title.className = 'group-title'; title.textContent = countryLabel(g);
+      var count = document.createElement('span'); count.className = 'group-count'; count.textContent = String(byGroup[g].length);
+      head.appendChild(caret); head.appendChild(title); head.appendChild(count);
+      head.addEventListener('click', function () { expandedGroups[g] = !expandedGroups[g]; renderChannelList(); });
       section.appendChild(head);
-
-      if (expandedGroups[g]) {
-        byGroup[g].forEach(function (ch) { section.appendChild(makeChannelButton(ch)); });
-      }
+      if (expandedGroups[g]) byGroup[g].forEach(function (ch) { section.appendChild(makeChannelButton(ch, browseSelect)); });
       frag.appendChild(section);
     });
 
@@ -301,12 +774,38 @@
       : shown + (healthOn ? ' working' : ' channels') + ' · ' + groupNames.length + ' countries';
   }
 
-  // ── Category sidebar (left) ─────────────────────────────────────────────────
-  // An accordion grouped by ch.type. Independent of the country sidebar:
-  // expanding a category lists its channel names directly (no country nesting),
-  // capped like search so a huge bucket can't stall the page.
   var CATEGORY_ORDER = ['News', 'Sports', 'Movies', 'Music', 'Kids', 'Religious', 'Entertainment'];
-  var expandedCats = {};        // category name → true when open
+  var expandedCats = {};
+  var favOpen = true; // Favourites section starts expanded
+
+  // Builds the always-present "Favourites" section for the top of the category
+  // sidebar. Pinned channels bypass the health filter (the user chose them).
+  function buildFavSection() {
+    var favList = channels.filter(isFav);
+    var section = document.createElement('div');
+    section.className = 'group-section fav-section';
+
+    var head = document.createElement('button');
+    head.className = 'group-header' + (favOpen ? ' open' : '');
+    var caret = document.createElement('span'); caret.className = 'group-caret'; caret.textContent = '▸';
+    var title = document.createElement('span'); title.className = 'group-title'; title.textContent = '★ Favourites';
+    var count = document.createElement('span'); count.className = 'group-count'; count.textContent = String(favList.length);
+    head.appendChild(caret); head.appendChild(title); head.appendChild(count);
+    head.addEventListener('click', function () { favOpen = !favOpen; renderCategorySidebar(); });
+    section.appendChild(head);
+
+    if (favOpen) {
+      if (favList.length === 0) {
+        var hint = document.createElement('div');
+        hint.className = 'group-more';
+        hint.textContent = 'No favourites yet — tap the pin on any channel to add it here.';
+        section.appendChild(hint);
+      } else {
+        favList.slice(0, RENDER_CAP).forEach(function (ch) { section.appendChild(makeChannelButton(ch, browseSelect)); });
+      }
+    }
+    return section;
+  }
 
   function renderCategorySidebar() {
     var keepScroll = els.categoryList.scrollTop;
@@ -323,35 +822,22 @@
     });
 
     var frag = document.createDocumentFragment();
+    frag.appendChild(buildFavSection()); // always first
     CATEGORY_ORDER.forEach(function (cat) {
       var list = byCat[cat];
-      if (!list || list.length === 0) return; // hide empty categories
-
+      if (!list || list.length === 0) return;
       var section = document.createElement('div');
       section.className = 'group-section';
-
       var head = document.createElement('button');
       head.className = 'group-header' + (expandedCats[cat] ? ' open' : '');
-      var caret = document.createElement('span');
-      caret.className = 'group-caret';
-      caret.textContent = '▸';
-      var title = document.createElement('span');
-      title.className = 'group-title';
-      title.textContent = cat;
-      var count = document.createElement('span');
-      count.className = 'group-count';
-      count.textContent = String(list.length);
-      head.appendChild(caret);
-      head.appendChild(title);
-      head.appendChild(count);
-      head.addEventListener('click', function () {
-        expandedCats[cat] = !expandedCats[cat];
-        renderCategorySidebar();
-      });
+      var caret = document.createElement('span'); caret.className = 'group-caret'; caret.textContent = '▸';
+      var title = document.createElement('span'); title.className = 'group-title'; title.textContent = cat;
+      var count = document.createElement('span'); count.className = 'group-count'; count.textContent = String(list.length);
+      head.appendChild(caret); head.appendChild(title); head.appendChild(count);
+      head.addEventListener('click', function () { expandedCats[cat] = !expandedCats[cat]; renderCategorySidebar(); });
       section.appendChild(head);
-
       if (expandedCats[cat]) {
-        list.slice(0, RENDER_CAP).forEach(function (ch) { section.appendChild(makeChannelButton(ch)); });
+        list.slice(0, RENDER_CAP).forEach(function (ch) { section.appendChild(makeChannelButton(ch, browseSelect)); });
         if (list.length > RENDER_CAP) {
           var more = document.createElement('div');
           more.className = 'group-more';
@@ -366,409 +852,15 @@
     els.categoryList.scrollTop = keepScroll;
   }
 
-  // Update which sidebar button is highlighted without rebuilding the list —
-  // a rebuild would reset the user's scroll position.
-  function updateListSelection() {
+  // Re-highlight active channels in the browse lists without rebuilding them.
+  function refreshHighlights() {
+    var ids = activeIds();
     Array.prototype.slice.call(document.querySelectorAll('.channel-item')).forEach(function (btn) {
-      var isSel = !!selected && btn.dataset.id === selected.id;
-      btn.classList.toggle('selected', isSel);
-      var dot = btn.querySelector('.channel-live-dot');
-      if (isSel && !dot) {
-        dot = document.createElement('span');
-        dot.className = 'channel-live-dot';
-        btn.appendChild(dot);
-      } else if (!isSel && dot) {
-        dot.remove();
-      }
+      btn.classList.toggle('selected', ids[btn.dataset.id] === true);
     });
   }
 
-  function renderLayout() {
-    // Desktop: hide sidebar when collapsed. Mobile: hide unless no channel
-    // selected or "More Channels" was tapped.
-    els.sidebar.classList.toggle('collapsed', !sidebarOpen);
-    els.sidebar.classList.toggle('mobile-hidden', !!selected && !mobileChannelsOpen);
-    // The category sidebar mirrors the country one on mobile (both hidden once
-    // a channel plays, revealed together by "More Channels").
-    els.categorySidebar.classList.toggle('mobile-hidden', !!selected && !mobileChannelsOpen);
-    els.carousel.hidden = !!selected;
-    els.playerSection.hidden = !selected;
-    els.activeBadge.hidden = !!selected || els.totalViewers.textContent === '';
-  }
-
-  // ── Carousel ─────────────────────────────────────────────────────────────
-  var carouselIdx = 0;
-  var carouselDir = 'right';
-  var carouselTimer = null;
-
-  function carouselChannels() {
-    var byId = {};
-    channels.forEach(function (ch) { byId[ch.id] = ch; });
-    var top = topChannelIds.map(function (id) { return byId[id]; }).filter(Boolean);
-    if (top.length < 5) {
-      var inTop = {};
-      top.forEach(function (ch) { inTop[ch.id] = true; });
-      for (var i = 0; i < channels.length && top.length < 5; i++) {
-        if (!inTop[channels[i].id]) top.push(channels[i]);
-      }
-    }
-    return top;
-  }
-
-  function renderCarousel() {
-    var list = carouselChannels();
-    var total = list.length;
-    els.carouselPrev.hidden = els.carouselNext.hidden = total === 0;
-
-    if (total === 0) return; // keep the loading placeholder
-
-    var featured = list[carouselIdx % total];
-    var content = els.carouselContent;
-    content.innerHTML = '';
-    content.className = 'carousel-content ' + (carouselDir === 'right' ? 'slide-from-right' : 'slide-from-left');
-
-    content.appendChild(logoOrFallback(featured, 'carousel-logo', 'carousel-logo-fallback'));
-
-    var meta = document.createElement('div');
-    var name = document.createElement('p');
-    name.className = 'carousel-name';
-    name.textContent = featured.name;
-    var group = document.createElement('p');
-    group.className = 'carousel-group';
-    group.textContent = countryLabel(featured.group);
-    meta.appendChild(name);
-    meta.appendChild(group);
-    content.appendChild(meta);
-
-    var watch = document.createElement('button');
-    watch.className = 'watch-btn';
-    watch.innerHTML = '<span class="watch-dot"></span>Watch Live';
-    watch.addEventListener('click', function () { selectChannel(featured); });
-    content.appendChild(watch);
-
-    // Dots (max 10)
-    var dotCount = Math.min(total, 10);
-    els.carouselDots.innerHTML = '';
-    els.carouselDots.hidden = total <= 1;
-    for (var i = 0; i < dotCount; i++) {
-      (function (i) {
-        var dot = document.createElement('button');
-        dot.className = 'carousel-dot' + (i === carouselIdx % dotCount ? ' active' : '');
-        dot.addEventListener('click', function () {
-          carouselDir = i > carouselIdx ? 'right' : 'left';
-          carouselIdx = i;
-          renderCarousel();
-          resetCarouselTimer();
-        });
-        els.carouselDots.appendChild(dot);
-      })(i);
-    }
-  }
-
-  function advanceCarousel(dir) {
-    var total = carouselChannels().length;
-    if (total === 0) return;
-    carouselDir = dir === 1 ? 'right' : 'left';
-    carouselIdx = (carouselIdx + dir + total) % total;
-    renderCarousel();
-  }
-
-  function resetCarouselTimer() {
-    if (carouselTimer) clearInterval(carouselTimer);
-    carouselTimer = setInterval(function () {
-      if (!selected) advanceCarousel(1);
-    }, 4000);
-  }
-
-  els.carouselPrev.addEventListener('click', function () { advanceCarousel(-1); resetCarouselTimer(); });
-  els.carouselNext.addEventListener('click', function () { advanceCarousel(1); resetCarouselTimer(); });
-
-  // ── Player ───────────────────────────────────────────────────────────────
-  function setPlayerState(state) {
-    els.loadingOverlay.hidden = state !== 'loading';
-    els.errorOverlay.hidden = state !== 'error';
-  }
-
-  function setQuality(text) {
-    els.qualityBadge.textContent = text || '';
-    els.qualityBadge.hidden = !text;
-  }
-
-  function destroyPlayer() {
-    playToken++;
-    if (hls) { hls.destroy(); hls = null; }
-    els.video.removeAttribute('src');
-    els.video.onloadedmetadata = null;
-    els.video.onerror = null;
-  }
-
-  function currentServer() {
-    if (!selected || !selected.servers || selected.servers.length === 0) return null;
-    return selected.servers[Math.min(serverIdx, selected.servers.length - 1)];
-  }
-
-  // Try the next server that hasn't failed yet; show the error screen when
-  // every server for this channel has been exhausted.
-  function failover() {
-    if (!selected) return;
-    failedServers[serverIdx] = true;
-    renderServerRow();
-    for (var i = 0; i < selected.servers.length; i++) {
-      if (!failedServers[i]) {
-        serverIdx = i;
-        renderServerRow();
-        startPlayback();
-        return;
-      }
-    }
-    setDead(selected, true);
-    setPlayerState('error');
-  }
-
-  function populateQualityOptions(h) {
-    var sel = els.qualitySelect;
-    sel.innerHTML = '';
-    var auto = document.createElement('option');
-    auto.value = '-1';
-    auto.textContent = 'Auto';
-    sel.appendChild(auto);
-    // hls.js orders levels ascending by bitrate; show highest first.
-    for (var i = h.levels.length - 1; i >= 0; i--) {
-      var level = h.levels[i];
-      var opt = document.createElement('option');
-      opt.value = String(i);
-      opt.textContent = level.height ? level.height + 'p' : Math.round(level.bitrate / 1000) + 'k';
-      sel.appendChild(opt);
-    }
-    sel.value = '-1';
-    els.qualityWrap.hidden = h.levels.length < 2;
-    renderStreamOptionsBar();
-  }
-
-  els.qualitySelect.addEventListener('change', function () {
-    if (!hls) return;
-    // -1 = Auto (adaptive); any other index pins that level.
-    hls.currentLevel = parseInt(els.qualitySelect.value, 10);
-  });
-
-  function startPlayback() {
-    var server = currentServer();
-    if (!server) { setPlayerState('error'); return; }
-    destroyPlayer();
-    var token = playToken;
-    var video = els.video;
-    setPlayerState('loading');
-    setQuality('');
-    els.qualityWrap.hidden = true;
-    renderStreamOptionsBar();
-    // One recovery attempt per error type, then move on to the next server —
-    // retrying a dead stream forever would never surface the failover.
-    var netRecoveries = 0;
-    var mediaRecoveries = 0;
-
-    if (window.Hls && Hls.isSupported()) {
-      hls = new Hls({
-        enableWorker: true,                 // off main thread — accurate bandwidth measurement
-        lowLatencyMode: false,              // standard HLS streams, not LL-HLS
-        capLevelToPlayerSize: false,        // never cap quality to player element size
-        startLevel: -1,                     // ABR picks start, then we lock to highest after manifest
-        startFragPrefetch: true,            // begin loading first fragment during manifest parse
-        maxMaxBufferLength: 60,             // larger buffer → smoother ABR decisions
-        backBufferLength: 0,                // live TV — no back buffer needed
-        abrEwmaDefaultEstimate: 5000000,    // assume 5 Mbps upfront so ABR starts high
-      });
-      var h = hls;
-      h.loadSource(proxyUrl(server.url));
-      h.attachMedia(video);
-
-      var updateQualityBadge = function (levelIndex) {
-        var level = h.levels[levelIndex];
-        if (!level) return;
-        if (level.height) setQuality(level.height + 'p');
-        else if (level.bitrate) setQuality(Math.round(level.bitrate / 1000) + 'k');
-      };
-
-      h.once(Hls.Events.MANIFEST_PARSED, function () {
-        if (token !== playToken) return;
-        populateQualityOptions(h);
-        setPlayerState('playing');
-        if (selected) setDead(selected, false); // it played — not dead after all
-        video.play().catch(function () {});
-      });
-
-      h.on(Hls.Events.LEVEL_SWITCHED, function (_, data) {
-        if (token === playToken) updateQualityBadge(data.level);
-      });
-
-      h.on(Hls.Events.ERROR, function (_, data) {
-        if (!data.fatal || token !== playToken) return;
-        if (data.type === Hls.ErrorTypes.NETWORK_ERROR && netRecoveries < 1) {
-          netRecoveries++;
-          h.startLoad();
-        } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR && mediaRecoveries < 1) {
-          mediaRecoveries++;
-          h.recoverMediaError();
-        } else {
-          failover();
-        }
-      });
-    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-      video.src = proxyUrl(server.url);
-      video.onloadedmetadata = function () {
-        if (token !== playToken) return;
-        setPlayerState('playing');
-        if (selected) setDead(selected, false);
-        video.play().catch(function () {});
-      };
-      video.onerror = function () { if (token === playToken) failover(); };
-    } else {
-      setPlayerState('error');
-    }
-  }
-
-  els.retryBtn.addEventListener('click', function () {
-    if (!selected) return;
-    // Fresh start: forget which servers failed and retry from the first.
-    failedServers = {};
-    serverIdx = 0;
-    renderServerRow();
-    startPlayback();
-  });
-
-  function toggleFullscreen() {
-    if (!document.fullscreenElement) els.videoContainer.requestFullscreen().catch(function () {});
-    else document.exitFullscreen();
-  }
-  els.fsBtn.addEventListener('click', toggleFullscreen);
-
-  // ── Now Playing bar ──────────────────────────────────────────────────────
-  function renderNowPlaying() {
-    if (!selected) return;
-    els.npName.textContent = selected.name;
-    els.npGroup.textContent = countryLabel(selected.group);
-
-    els.npLogo.hidden = true;
-    els.npLogoFallback.hidden = false;
-    if (selected.logo) {
-      els.npLogo.onerror = function () { els.npLogo.hidden = true; els.npLogoFallback.hidden = false; };
-      els.npLogo.onload = function () { els.npLogo.hidden = false; els.npLogoFallback.hidden = true; };
-      els.npLogo.src = selected.logo;
-    }
-
-    setCopied(false);
-    renderViewerPill();
-  }
-
-  // The options bar collapses entirely when neither picker is relevant
-  // (single-server channel playing a single-resolution stream).
-  function renderStreamOptionsBar() {
-    els.streamOptions.hidden = els.serverRow.hidden && els.qualityWrap.hidden;
-  }
-
-  function renderServerRow() {
-    var servers = selected && selected.servers ? selected.servers : [];
-    els.serverRow.hidden = servers.length < 2;
-    els.serverButtons.innerHTML = '';
-    if (servers.length >= 2) {
-      servers.forEach(function (server, i) {
-        var btn = document.createElement('button');
-        btn.className = 'server-btn' + (i === serverIdx ? ' active' : '') + (failedServers[i] ? ' failed' : '');
-        btn.textContent = String(i + 1);
-        if (server.label) {
-          var lbl = document.createElement('span');
-          lbl.className = 'server-label';
-          lbl.textContent = server.label;
-          btn.appendChild(lbl);
-        }
-        btn.title = server.url;
-        btn.addEventListener('click', function () {
-          // A manual pick is a fresh vote of confidence — clear failed marks
-          // so auto-failover can walk the full list again from here.
-          failedServers = {};
-          serverIdx = i;
-          renderServerRow();
-          startPlayback();
-        });
-        els.serverButtons.appendChild(btn);
-      });
-    }
-    renderStreamOptionsBar();
-  }
-
-  function renderViewerPill() {
-    if (channelViewers == null) { els.viewerPill.hidden = true; return; }
-    els.viewerPill.hidden = false;
-    els.viewerCount.textContent = formatViewers(channelViewers);
-  }
-
-  function setCopied(on) {
-    els.copyBtn.classList.toggle('copied', on);
-    els.copyBtn.querySelector('.copy-icon').hidden = on;
-    els.copyBtn.querySelector('.copied-icon').hidden = !on;
-    els.copyBtn.querySelector('.copy-label').textContent = on ? 'Copied!' : 'Copy URL';
-  }
-
-  els.copyBtn.addEventListener('click', function () {
-    var server = currentServer();
-    if (!server) return;
-    var url = server.url;
-    var done = function () {
-      setCopied(true);
-      if (copiedTimer) clearTimeout(copiedTimer);
-      copiedTimer = setTimeout(function () { setCopied(false); }, 2000);
-    };
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(url).then(done).catch(function () { legacyCopy(url); done(); });
-    } else {
-      legacyCopy(url);
-      done();
-    }
-  });
-
-  function legacyCopy(text) {
-    // fallback for older Android WebViews
-    var ta = document.createElement('textarea');
-    ta.value = text;
-    ta.style.position = 'fixed';
-    ta.style.opacity = '0';
-    document.body.appendChild(ta);
-    ta.focus();
-    ta.select();
-    try { document.execCommand('copy'); } catch (e) { /* nothing else to try */ }
-    document.body.removeChild(ta);
-  }
-
-  // ── Selection ────────────────────────────────────────────────────────────
-  function selectChannel(ch) {
-    selected = ch;
-    serverIdx = 0;
-    failedServers = {};
-    mobileChannelsOpen = false;
-    channelViewers = null; // reset immediately on channel switch
-    renderLayout();
-    updateListSelection();
-    renderNowPlaying();
-    renderServerRow();
-    startPlayback();
-    beat(); // immediate heartbeat to get fresh counts
-  }
-
-  function goHome() {
-    selected = null;
-    mobileChannelsOpen = false;
-    destroyPlayer();
-    setPlayerState('idle');
-    renderLayout();
-    updateListSelection();
-    renderCarousel();
-    beat();
-  }
-
-  els.homeBtn.addEventListener('click', goHome);
-  els.sidebarToggle.addEventListener('click', function () { sidebarOpen = !sidebarOpen; renderLayout(); });
-  els.moreChannels.addEventListener('click', function () { mobileChannelsOpen = !mobileChannelsOpen; renderLayout(); });
-
-  // ── Search ───────────────────────────────────────────────────────────────
+  // ── Search (country drawer) ──────────────────────────────────────────────
   function setSearch(value) {
     search = value;
     els.search.value = value;
@@ -786,47 +878,47 @@
   // ── Keyboard shortcuts ───────────────────────────────────────────────────
   window.addEventListener('keydown', function (e) {
     var inInput = document.activeElement && document.activeElement.tagName === 'INPUT';
-    if (e.key === '/' && !inInput) {
-      e.preventDefault();
-      els.search.focus();
-    }
-    if (e.key === 'Escape' && document.activeElement === els.search) {
-      setSearch('');
-      els.search.blur();
-    }
-    if ((e.key === 'f' || e.key === 'F') && !inInput && selected) {
-      toggleFullscreen();
-    }
+    if (e.key === 'Escape') { closeDrawers(); closePicker(); }
+    if (e.key === '/' && !inInput) { e.preventDefault(); openDrawer('right'); setTimeout(function () { els.search.focus(); }, 0); }
   });
 
-  // ── Heartbeat ────────────────────────────────────────────────────────────
+  // ── Share ────────────────────────────────────────────────────────────────
+  els.shareBtn.addEventListener('click', function () {
+    var url = location.href;
+    if (navigator.share) { navigator.share({ title: 'LiveTV', url: url }).catch(function () {}); return; }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(url).then(function () {
+        els.shareBtn.classList.add('copied');
+        setTimeout(function () { els.shareBtn.classList.remove('copied'); }, 1500);
+      }).catch(function () {});
+    }
+  });
+  els.signInBtn.addEventListener('click', function () { /* auth not wired yet */ });
+
+  // ── Heartbeat (reports the audio cell's channel) ─────────────────────────
   var sessionId = sessionStorage.getItem('livetv_sid');
   if (!sessionId) {
     sessionId = Math.random().toString(36).slice(2) + Date.now().toString(36);
     sessionStorage.setItem('livetv_sid', sessionId);
   }
 
+  function watchedChannelId() {
+    if (audioCell >= 0 && cells[audioCell] && cells[audioCell].channel) return cells[audioCell].channel.id;
+    for (var i = 0; i < cells.length; i++) { if (cells[i].channel) return cells[i].channel.id; }
+    return null;
+  }
+
   function beat() {
-    var channelId = selected ? selected.id : null;
     fetch('/api/viewers', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sessionId: sessionId, channelId: channelId }),
+      body: JSON.stringify({ sessionId: sessionId, channelId: watchedChannelId() }),
     })
       .then(function (r) { return r.json(); })
       .then(function (d) {
-        els.totalViewers.textContent = String(d.total);
-        els.activeBadge.hidden = !!selected;
-        if (d.channelCount != null && selected && selected.id === channelId) {
-          channelViewers = d.channelCount;
-          renderViewerPill();
-        }
         if (d.top && d.top.length > 0) {
           var ids = d.top.map(function (x) { return x.id; });
-          if (ids.join(',') !== topChannelIds.join(',')) {
-            topChannelIds = ids;
-            if (!selected) renderCarousel();
-          }
+          if (ids.join(',') !== topChannelIds.join(',')) topChannelIds = ids;
         }
       })
       .catch(function () {});
@@ -836,6 +928,7 @@
   function renderHealthLists() {
     renderCategorySidebar();
     renderChannelList();
+    if (!els.picker.hidden) renderPicker();
   }
 
   function updateHealthStatus() {
@@ -843,20 +936,13 @@
     if (!healthOn) { el.hidden = true; el.textContent = ''; }
     else {
       el.hidden = false;
-      if (healthProbing) {
-        el.textContent = 'Checking ' + healthDone + ' / ' + healthTotal + ' · ' + countAlive() + ' live';
-      } else if (healthTotal) {
-        el.textContent = countAlive() + ' working of ' + healthTotal;
-      } else {
-        el.textContent = 'Starting…';
-      }
+      if (healthProbing) el.textContent = 'Checking ' + healthDone + ' / ' + healthTotal + ' · ' + countAlive() + ' live';
+      else if (healthTotal) el.textContent = countAlive() + ' working of ' + healthTotal;
+      else el.textContent = 'Starting…';
     }
     updateHealthOverlay();
   }
 
-  // The full-screen loader is up only while a pass is actively probing; it
-  // comes down the moment the server reports the pass finished (or the filter
-  // is switched off).
   function updateHealthOverlay() {
     var show = healthOn && healthProbing && !healthOverlayDismissed;
     els.healthOverlay.hidden = !show;
@@ -872,9 +958,7 @@
     if (!snap) return;
     healthDone = snap.done || 0;
     healthTotal = snap.total || 0;
-    if (snap.status) {
-      for (var id in snap.status) { health[id] = snap.status[id]; }
-    }
+    if (snap.status) { for (var id in snap.status) { health[id] = snap.status[id]; } }
     healthProbing = !!snap.running;
     if (!snap.running) stopHealthPolling();
     if (healthOn) renderHealthLists();
@@ -882,40 +966,51 @@
   }
 
   function pollHealth() {
-    fetch('/api/health')
-      .then(function (r) { return r.json(); })
-      .then(applyHealthSnapshot)
-      .catch(function () {});
+    fetch('/api/health').then(function (r) { return r.json(); }).then(applyHealthSnapshot).catch(function () {});
   }
-
-  function startHealthProbe() {
+  function startHealthProbe(force) {
     healthProbing = true;
-    healthOverlayDismissed = false; // a fresh pass shows the loader again
+    healthOverlayDismissed = false;
     updateHealthStatus();
-    fetch('/api/health', { method: 'POST' })
-      .then(function (r) { return r.json(); })
-      .then(applyHealthSnapshot)
-      .catch(function () {});
+    fetch('/api/health' + (force ? '?force=1' : ''), { method: 'POST' })
+      .then(function (r) { return r.json(); }).then(applyHealthSnapshot).catch(function () {});
     if (!healthPoll) healthPoll = setInterval(pollHealth, 1500);
   }
 
+  // On page load, reuse a cached pass instead of re-probing: ask the server what
+  // it already has and only probe when there's no finished pass for the current
+  // catalog (etag mismatch). The server persists passes to disk, so this stays a
+  // cache hit across restarts until the catalog changes or the user re-toggles.
+  function ensureHealth() {
+    fetch('/api/health')
+      .then(function (r) { return r.json(); })
+      .then(function (snap) {
+        var hit = snap && snap.finished && !snap.running &&
+                  snap.etag && snap.etag === channelsEtag &&
+                  snap.status && Object.keys(snap.status).length > 0;
+        if (hit) {
+          applyHealthSnapshot(snap); // restore verdicts — no probe, no overlay
+        } else {
+          startHealthProbe(false);   // nothing usable for this list → probe
+        }
+      })
+      .catch(function () { startHealthProbe(false); });
+  }
   function stopHealthPolling() {
     if (healthPoll) { clearInterval(healthPoll); healthPoll = null; }
     healthProbing = false;
   }
 
-  $('healthOverlayHide').addEventListener('click', function () {
-    healthOverlayDismissed = true;
-    updateHealthOverlay();
-  });
+  $('healthOverlayHide').addEventListener('click', function () { healthOverlayDismissed = true; updateHealthOverlay(); });
 
   els.healthToggle.addEventListener('click', function () {
     healthOn = !healthOn;
     try { localStorage.setItem('livetv_health_on', healthOn ? '1' : '0'); } catch (e) { /* quota */ }
     els.healthToggle.classList.toggle('on', healthOn);
     els.healthToggle.setAttribute('aria-checked', healthOn ? 'true' : 'false');
-    if (healthOn) startHealthProbe();
-    else stopHealthPolling();
+    // A deliberate off→on flip always re-checks (force), even if the cached pass
+    // is for the same catalog — that's the user's "re-probe now" gesture.
+    if (healthOn) startHealthProbe(true); else stopHealthPolling();
     renderHealthLists();
     updateHealthStatus();
   });
@@ -923,39 +1018,23 @@
   // ── Sync ─────────────────────────────────────────────────────────────────
   els.syncBtn.addEventListener('click', function () {
     var btn = els.syncBtn;
-    btn.disabled = true;
-    btn.textContent = 'Syncing…';
+    btn.disabled = true; btn.textContent = 'Syncing…';
     fetch('/api/sync', { method: 'POST' })
-      .then(function (r) {
-        if (!r.ok) throw new Error('sync failed: ' + r.status);
-        return r.json();
-      })
-      .then(function () {
-        btn.textContent = '⟳ Sync';
-        btn.disabled = false;
-        loadChannels(); // pull the refreshed list into the UI
-      })
+      .then(function (r) { if (!r.ok) throw new Error('sync failed: ' + r.status); return r.json(); })
+      .then(function () { btn.textContent = '⟳ Sync'; btn.disabled = false; loadChannels(); })
       .catch(function () {
         btn.textContent = 'Sync failed';
-        setTimeout(function () {
-          btn.textContent = '⟳ Sync';
-          btn.disabled = false;
-        }, 3000);
+        setTimeout(function () { btn.textContent = '⟳ Sync'; btn.disabled = false; }, 3000);
       });
   });
 
   // ── Source refresh (API → list.m3u) ──────────────────────────────────────
-  // The server fetches the full catalog from iptv-org in the background and
-  // serves the cached list.m3u meanwhile. Poll until the refresh lands, then
-  // pull the updated list in. Cheap: a tiny JSON status, polled only while a
-  // refresh is actually running.
   function setLoadingText(text) {
     var a = els.listLoading.querySelector('span');
     var b = els.catLoading.querySelector('span');
     if (a) a.textContent = text;
     if (b) b.textContent = text;
   }
-
   function pollSource() {
     fetch('/api/source')
       .then(function (r) { return r.json(); })
@@ -964,16 +1043,13 @@
         sourceRefreshing = !!d.refreshing;
         if (sourceRefreshing && channels.length === 0) {
           setLoadingText('Fetching channels from iptv-org…');
-          renderChannelList();
-          renderCategorySidebar();
+          renderChannelList(); renderCategorySidebar();
+          if (!els.picker.hidden) renderPicker();
         }
-        if (was && !sourceRefreshing) {
-          // The refresh just finished — pull in the freshly enriched list.
-          loadChannels();
-        }
+        if (was && !sourceRefreshing) loadChannels();
         if (sourceRefreshing) setTimeout(pollSource, 2500);
       })
-      .catch(function () { /* status endpoint missing/old build — ignore */ });
+      .catch(function () { /* old build — ignore */ });
   }
 
   // ── Init ─────────────────────────────────────────────────────────────────
@@ -981,48 +1057,56 @@
     fetch('/api/channels')
       .then(function (r) {
         if (!r.ok) throw new Error('channels fetch failed: ' + r.status);
+        channelsEtag = r.headers.get('ETag'); // gates the health cache to this list version
         return r.json();
       })
       .then(function (data) {
         channels = Array.isArray(data) ? data : [];
         channelsLoading = false;
-        // IDs are reassigned on every (re)load, so previous verdicts no longer
-        // map to the right channels — drop them and re-probe if the filter is on.
         health = {};
         healthDone = healthTotal = 0;
         stopHealthPolling();
-        // Probe the final catalog, not the stale cache: only auto-start once the
-        // background refresh has finished (or isn't running).
-        if (healthOn && !sourceRefreshing) startHealthProbe();
+        // Reuse a cached pass when possible; only probe a never-seen catalog.
+        if (healthOn && !sourceRefreshing) ensureHealth();
         renderCategorySidebar();
         renderChannelList();
-        if (!selected) renderCarousel();
+        if (!els.picker.hidden) renderPicker();
         updateHealthStatus();
       })
-      .catch(function () {
-        channelsLoading = false;
-        renderChannelList(); // falls through to the empty state
-      });
+      .catch(function () { channelsLoading = false; renderChannelList(); });
   }
 
-  // Reflect the persisted "Working only" preference before first paint.
-  els.healthToggle.classList.toggle('on', healthOn);
-  els.healthToggle.setAttribute('aria-checked', healthOn ? 'true' : 'false');
-
-  renderLayout();
-  renderCategorySidebar();
-  renderChannelList();
-  renderCarousel();
-  resetCarouselTimer();
-  updateHealthStatus();
-  loadChannels();
-  pollSource();
-  beat();
-  setInterval(beat, 30000);
-
-  if ('serviceWorker' in navigator) {
-    navigator.serviceWorker.register('/static/sw.js').catch(function (err) {
-      console.warn('SW registration failed:', err);
-    });
+  function restoreAudioPrefs() {
+    var v = parseInt(localStorage.getItem('livetv_volume'), 10);
+    if (!isNaN(v)) volume = Math.max(0, Math.min(1, v / 100));
+    globalMuted = localStorage.getItem('livetv_muted') === '1';
+    els.volume.value = String(Math.round(volume * 100));
   }
+
+  function init() {
+    restoreAudioPrefs();
+
+    // Start with the persisted grid size (default 1).
+    var saved = parseInt(localStorage.getItem('livetv_grid'), 10);
+    var count = (!isNaN(saved) && saved >= 1 && saved <= MAX_CELLS) ? saved : 1;
+    for (var i = 0; i < count; i++) addCell();
+    updatePickLabels();
+
+    els.healthToggle.classList.toggle('on', healthOn);
+    els.healthToggle.setAttribute('aria-checked', healthOn ? 'true' : 'false');
+
+    renderCategorySidebar();
+    renderChannelList();
+    updateHealthStatus();
+    loadChannels();
+    pollSource();
+    beat();
+    setInterval(beat, 30000);
+
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('/static/sw.js').catch(function (err) { console.warn('SW registration failed:', err); });
+    }
+  }
+
+  init();
 })();

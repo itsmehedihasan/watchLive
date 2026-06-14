@@ -3,6 +3,7 @@ package health
 import (
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -74,7 +75,7 @@ func TestProberVerdicts(t *testing.T) {
 	}
 
 	p := New()
-	p.Start(targets, "etag-1")
+	p.Start(targets, "etag-1", false)
 	snap := waitFinished(t, p)
 
 	if snap.Total != len(targets) {
@@ -108,23 +109,68 @@ func TestProberReusesUntilEtagChanges(t *testing.T) {
 	targets := []Target{{ID: "a", URLs: []string{srv.URL + "/a.m3u8"}}}
 
 	p := New()
-	p.Start(targets, "v1")
+	p.Start(targets, "v1", false)
 	waitFinished(t, p)
 	if hits != 1 {
 		t.Fatalf("after first pass: hits = %d, want 1", hits)
 	}
 
 	// Same etag while fresh → reuse, no new fetch.
-	p.Start(targets, "v1")
+	p.Start(targets, "v1", false)
 	waitFinished(t, p)
 	if hits != 1 {
 		t.Errorf("same-etag Start re-probed: hits = %d, want 1", hits)
 	}
 
-	// Changed etag (playlist re-synced) → re-probe.
-	p.Start(targets, "v2")
+	// force=true re-probes even the same, fresh etag (the toggle off→on path).
+	p.Start(targets, "v1", true)
 	waitFinished(t, p)
 	if hits != 2 {
-		t.Errorf("changed-etag Start did not re-probe: hits = %d, want 2", hits)
+		t.Errorf("forced Start did not re-probe: hits = %d, want 2", hits)
+	}
+
+	// Changed etag (playlist re-synced) → re-probe.
+	p.Start(targets, "v2", false)
+	waitFinished(t, p)
+	if hits != 3 {
+		t.Errorf("changed-etag Start did not re-probe: hits = %d, want 3", hits)
+	}
+}
+
+// A finished pass is written to disk and a fresh Prober that loads it reports a
+// finished pass (and reuses it for the same etag) without probing again.
+func TestProberPersistsAndReloads(t *testing.T) {
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+		w.Write([]byte("#EXTM3U"))
+	}))
+	defer srv.Close()
+
+	targets := []Target{{ID: "a", URLs: []string{srv.URL + "/a.m3u8"}}}
+	cachePath := filepath.Join(t.TempDir(), "health.json")
+
+	// First process: probe once and persist.
+	p1 := New()
+	p1.LoadCache(cachePath) // nothing on disk yet
+	p1.Start(targets, "v1", false)
+	waitFinished(t, p1)
+	if hits != 1 {
+		t.Fatalf("first pass: hits = %d, want 1", hits)
+	}
+
+	// Second process: load the saved pass — finished, no probe.
+	p2 := New()
+	p2.LoadCache(cachePath)
+	snap := p2.Snapshot()
+	if !snap.Finished || snap.Etag != "v1" || !snap.Status["a"] {
+		t.Fatalf("loaded snapshot = %+v, want finished v1 with a=true", snap)
+	}
+	// Same etag → reuse the loaded verdicts, still no new fetch.
+	p2.Start(targets, "v1", false)
+	waitFinished(t, p2)
+	if hits != 1 {
+		t.Errorf("reload re-probed: hits = %d, want 1", hits)
 	}
 }

@@ -49,7 +49,7 @@ var staticFS embed.FS
 // app shows channels immediately on first run — even with no network. A real
 // list.m3u (written by the background refresh, or user-provided) always wins.
 //
-//go:embed seed.m3u
+//go:embed .\seed.m3u
 var seedPlaylist []byte
 
 // channelStore holds the parsed playlist and reloads it when the source file
@@ -310,6 +310,11 @@ func main() {
 	store := viewers.NewStore()
 	proxyHandler := proxy.New(*cacheMB << 20)
 	prober := health.New()
+	// Persist health verdicts next to the playlist and load any prior pass, so a
+	// restart (or a reopened browser) reuses results instead of re-probing every
+	// stream. The cache is keyed by the list's content etag, so a changed catalog
+	// re-probes automatically; the "Working only" toggle forces a re-probe too.
+	prober.LoadCache(filepath.Join(filepath.Dir(path), "health.json"))
 
 	indexTmpl := template.Must(template.ParseFS(templateFS, "web/templates/index.html"))
 	staticSub, err := fs.Sub(staticFS, "web/static")
@@ -384,9 +389,12 @@ func main() {
 	// only" toggle in the UI drives this: it kicks off a pass and polls until
 	// done, hiding channels the server couldn't reach.
 	mux.HandleFunc("POST /api/health", func(w http.ResponseWriter, r *http.Request) {
+		// force=1 (the "Working only" toggle) re-probes even a fresh, unchanged
+		// list; a plain POST reuses a running/fresh pass for the same etag.
+		force := r.URL.Query().Get("force") == "1"
 		targets, etag := channels.healthTargets()
-		snap := prober.Start(targets, etag)
-		log.Printf("health: probe requested (%d channels, running=%v done=%d)", snap.Total, snap.Running, snap.Done)
+		snap := prober.Start(targets, etag, force)
+		log.Printf("health: probe requested (force=%v, %d channels, running=%v done=%d)", force, snap.Total, snap.Running, snap.Done)
 		writeJSON(w, r, snap)
 	})
 	mux.HandleFunc("GET /api/health", func(w http.ResponseWriter, r *http.Request) {
