@@ -73,6 +73,7 @@
   // ── State ────────────────────────────────────────────────────────────────
   var channels = [];            // fetched from /api/channels (gzipped, ETag-cached)
   var channelsLoading = true;
+  var sourceRefreshing = false; // server is fetching the catalog from the API
   var selected = null;          // currently playing channel or null
   var serverIdx = 0;            // index into selected.servers
   var failedServers = {};       // server indexes that hit fatal errors this selection
@@ -141,7 +142,9 @@
   // false=dead; absent means not yet probed. During a probe pass we hide only
   // confirmed-dead channels (alive + not-yet-checked stay visible), so the list
   // shrinks as dead ones drop out and ends up showing only working channels.
-  var healthOn = false;
+  // Default ON ("only active shown"); persisted so a user who turns it off stays
+  // off. localStorage value '0' = off, anything else (incl. absent) = on.
+  var healthOn = localStorage.getItem('livetv_health_on') !== '0';
   var health = {};
   var healthProbing = false;
   var healthDone = 0, healthTotal = 0;
@@ -223,8 +226,11 @@
     // Remove previous dynamic nodes, keep the loading/empty-state nodes.
     Array.prototype.slice.call(els.channelList.querySelectorAll('.channel-item, .group-section')).forEach(function (n) { n.remove(); });
 
-    els.listLoading.hidden = !channelsLoading;
-    els.emptyState.hidden = channelsLoading || matches.length !== 0;
+    // While the server is still fetching the catalog and we have nothing yet,
+    // show the loading spinner rather than a misleading "no channels" message.
+    var awaitingFirstList = sourceRefreshing && channels.length === 0;
+    els.listLoading.hidden = !(channelsLoading || awaitingFirstList);
+    els.emptyState.hidden = channelsLoading || awaitingFirstList || matches.length !== 0;
 
     var frag = document.createDocumentFragment();
 
@@ -305,8 +311,9 @@
   function renderCategorySidebar() {
     var keepScroll = els.categoryList.scrollTop;
     Array.prototype.slice.call(els.categoryList.querySelectorAll('.channel-item, .group-section')).forEach(function (n) { n.remove(); });
-    els.catLoading.hidden = !channelsLoading;
-    if (channelsLoading) return;
+    var awaitingFirstList = sourceRefreshing && channels.length === 0;
+    els.catLoading.hidden = !(channelsLoading || awaitingFirstList);
+    if (channelsLoading || awaitingFirstList) return;
 
     var byCat = {};
     channels.forEach(function (ch) {
@@ -904,6 +911,7 @@
 
   els.healthToggle.addEventListener('click', function () {
     healthOn = !healthOn;
+    try { localStorage.setItem('livetv_health_on', healthOn ? '1' : '0'); } catch (e) { /* quota */ }
     els.healthToggle.classList.toggle('on', healthOn);
     els.healthToggle.setAttribute('aria-checked', healthOn ? 'true' : 'false');
     if (healthOn) startHealthProbe();
@@ -936,6 +944,38 @@
       });
   });
 
+  // ── Source refresh (API → list.m3u) ──────────────────────────────────────
+  // The server fetches the full catalog from iptv-org in the background and
+  // serves the cached list.m3u meanwhile. Poll until the refresh lands, then
+  // pull the updated list in. Cheap: a tiny JSON status, polled only while a
+  // refresh is actually running.
+  function setLoadingText(text) {
+    var a = els.listLoading.querySelector('span');
+    var b = els.catLoading.querySelector('span');
+    if (a) a.textContent = text;
+    if (b) b.textContent = text;
+  }
+
+  function pollSource() {
+    fetch('/api/source')
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        var was = sourceRefreshing;
+        sourceRefreshing = !!d.refreshing;
+        if (sourceRefreshing && channels.length === 0) {
+          setLoadingText('Fetching channels from iptv-org…');
+          renderChannelList();
+          renderCategorySidebar();
+        }
+        if (was && !sourceRefreshing) {
+          // The refresh just finished — pull in the freshly enriched list.
+          loadChannels();
+        }
+        if (sourceRefreshing) setTimeout(pollSource, 2500);
+      })
+      .catch(function () { /* status endpoint missing/old build — ignore */ });
+  }
+
   // ── Init ─────────────────────────────────────────────────────────────────
   function loadChannels() {
     fetch('/api/channels')
@@ -951,7 +991,9 @@
         health = {};
         healthDone = healthTotal = 0;
         stopHealthPolling();
-        if (healthOn) startHealthProbe();
+        // Probe the final catalog, not the stale cache: only auto-start once the
+        // background refresh has finished (or isn't running).
+        if (healthOn && !sourceRefreshing) startHealthProbe();
         renderCategorySidebar();
         renderChannelList();
         if (!selected) renderCarousel();
@@ -963,12 +1005,18 @@
       });
   }
 
+  // Reflect the persisted "Working only" preference before first paint.
+  els.healthToggle.classList.toggle('on', healthOn);
+  els.healthToggle.setAttribute('aria-checked', healthOn ? 'true' : 'false');
+
   renderLayout();
   renderCategorySidebar();
   renderChannelList();
   renderCarousel();
   resetCarouselTimer();
+  updateHealthStatus();
   loadChannels();
+  pollSource();
   beat();
   setInterval(beat, 30000);
 

@@ -68,6 +68,53 @@ func TestInjectReplacesExisting(t *testing.T) {
 	}
 }
 
+func TestEnrich(t *testing.T) {
+	db := DB{
+		"1TV.ge":   {Category: News, Country: "GE"},
+		"ESPN.us":  {Category: Sports, Country: "US"},
+		"NoCtry.xx": {Category: Movies, Country: ""}, // resolvable id but no country
+	}
+	in := []byte("#EXTM3U\n" +
+		// category from group-title (General→Entertainment), country from DB
+		`#EXTINF:-1 tvg-id="1TV.ge@SD" tvg-logo="l.png" group-title="General",1TV` + "\n" +
+		"https://a/s.m3u8\n" +
+		// feed suffix stripped; multi-category group-title; country from DB
+		`#EXTINF:-1 tvg-id="ESPN.us" group-title="Sports;General",ESPN` + "\n" +
+		"https://b/s.m3u8\n" +
+		// no tvg-id → country falls back to Other, category from group-title
+		`#EXTINF:-1 group-title="News",Mystery` + "\n" +
+		"https://c/s.m3u8\n" +
+		// resolvable but empty country → Other
+		`#EXTINF:-1 tvg-id="NoCtry.xx" group-title="Movies",NC` + "\n" +
+		"https://d/s.m3u8\n")
+
+	out, n := db.Enrich(in)
+	if n != 4 {
+		t.Fatalf("processed = %d, want 4", n)
+	}
+	got := string(out)
+
+	// 1TV: country GE, category Entertainment (from "General"), tvg-id/logo kept
+	if !contains(got, `group-title="GE"`) || !contains(got, `tvg-genre="Entertainment"`) {
+		t.Errorf("1TV not enriched as GE/Entertainment:\n%s", got)
+	}
+	if !contains(got, `tvg-id="1TV.ge@SD"`) || !contains(got, `tvg-logo="l.png"`) {
+		t.Errorf("1TV lost tvg-id/tvg-logo:\n%s", got)
+	}
+	// ESPN: country US, category Sports (first specific slug)
+	if !contains(got, `group-title="US"`) || !contains(got, `tvg-genre="Sports"`) {
+		t.Errorf("ESPN not enriched as US/Sports:\n%s", got)
+	}
+	// Mystery: no id → Other, category News from group-title
+	if !contains(got, `group-title="Other"`) || !contains(got, `tvg-genre="News"`) {
+		t.Errorf("Mystery not grouped Other/News:\n%s", got)
+	}
+	// the original category-valued group-titles must not survive
+	if contains(got, `group-title="General"`) || contains(got, `group-title="Sports;General"`) {
+		t.Errorf("original group-title not rewritten:\n%s", got)
+	}
+}
+
 func contains(s, sub string) bool {
 	for i := 0; i+len(sub) <= len(s); i++ {
 		if s[i:i+len(sub)] == sub {

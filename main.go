@@ -54,6 +54,13 @@ type channelStore struct {
 	etag     string
 	path     string
 	modTime  time.Time
+	// refreshing reports whether a source refresh (API fetch) is in flight, so
+	// the UI can show an "updating" state and re-fetch when it lands.
+	refreshing bool
+
+	// refreshMu serializes source refreshes (startup + manual Sync) so two
+	// fetches never race on the playlist file.
+	refreshMu sync.Mutex
 }
 
 func newChannelStore(path string) *channelStore {
@@ -152,10 +159,92 @@ func (cs *channelStore) healthTargets() ([]health.Target, string) {
 	return targets, cs.etag
 }
 
+func (cs *channelStore) setRefreshing(v bool) {
+	cs.mu.Lock()
+	cs.refreshing = v
+	cs.mu.Unlock()
+}
+
+func (cs *channelStore) isRefreshing() bool {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	return cs.refreshing
+}
+
+// refresh downloads the upstream playlist, resolves each channel's country and
+// category from the iptv-org database, writes the result to the playlist file
+// (which thereby doubles as the offline fallback), and reloads. The previous
+// file is backed up once to <path>.bak so a user-curated list is recoverable.
+// Returns the channel count after reload.
+func (cs *channelStore) refresh(sourceURL string) (int, error) {
+	cs.refreshMu.Lock()
+	defer cs.refreshMu.Unlock()
+	cs.setRefreshing(true)
+	defer cs.setRefreshing(false)
+
+	enriched, n, err := fetchAndEnrich(sourceURL)
+	if err != nil {
+		return 0, err
+	}
+
+	// One-time backup of any pre-existing playlist before we start overwriting
+	// it with the API catalog.
+	if bak := cs.path + ".bak"; fileExists(cs.path) && !fileExists(bak) {
+		if data, err := os.ReadFile(cs.path); err == nil {
+			os.WriteFile(bak, data, 0o644)
+		}
+	}
+
+	tmp := cs.path + ".tmp"
+	if err := os.WriteFile(tmp, enriched, 0o644); err != nil {
+		return 0, fmt.Errorf("write: %w", err)
+	}
+	if err := os.Rename(tmp, cs.path); err != nil {
+		os.Remove(tmp)
+		return 0, fmt.Errorf("replace: %w", err)
+	}
+	log.Printf("source: enriched %d entries from %s", n, sourceURL)
+	return cs.reload(), nil
+}
+
+// fetchAndEnrich downloads the source playlist and rewrites it with resolved
+// country (group-title) and category (tvg-genre) per channel. Network-only:
+// both the playlist and the iptv-org database must be reachable.
+func fetchAndEnrich(sourceURL string) ([]byte, int, error) {
+	client := &http.Client{Timeout: 3 * time.Minute}
+	resp, err := client.Get(sourceURL)
+	if err != nil {
+		return nil, 0, fmt.Errorf("download: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, 0, fmt.Errorf("upstream returned %d", resp.StatusCode)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+	if err != nil {
+		return nil, 0, fmt.Errorf("read: %w", err)
+	}
+	if !strings.HasPrefix(strings.TrimSpace(string(data[:min(len(data), 64)])), "#EXTM3U") {
+		return nil, 0, fmt.Errorf("response is not an M3U playlist")
+	}
+	db, err := genre.LoadDB()
+	if err != nil {
+		return nil, 0, fmt.Errorf("category database: %w", err)
+	}
+	enriched, n := db.Enrich(data)
+	return enriched, n, nil
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
 func main() {
 	addr := flag.String("addr", ":3000", "listen address")
-	playlistPath := flag.String("playlist", "", "path to M3U playlist (default: list.m3u next to the binary)")
-	syncURL := flag.String("sync-url", "https://iptv-org.github.io/iptv/index.country.m3u", "upstream playlist downloaded by POST /api/sync")
+	playlistPath := flag.String("playlist", "", "path to M3U playlist cache (default: list.m3u next to the binary)")
+	sourceURL := flag.String("source-url", "https://iptv-org.github.io/iptv/index.m3u", "upstream playlist fetched at startup and by Sync; list.m3u is the offline fallback")
+	noRefresh := flag.Bool("no-refresh", false, "skip the startup fetch from -source-url and use the local list.m3u as-is")
 	cacheMB := flag.Int64("cache-mb", 200, "segment cache size in MB")
 	flag.Parse()
 
@@ -178,6 +267,22 @@ func main() {
 
 	channels := newChannelStore(path)
 	log.Printf("playlist: %d channels loaded from %s", channels.count(), path)
+
+	// Channels come from the API; the local list.m3u is just the offline cache.
+	// Serve whatever is on disk immediately, then refresh from -source-url in the
+	// background so the first paint isn't blocked on the network. Mark refreshing
+	// up front so the very first /api/source poll already reports it.
+	if !*noRefresh {
+		channels.setRefreshing(true)
+		go func() {
+			n, err := channels.refresh(*sourceURL)
+			if err != nil {
+				log.Printf("source: refresh failed, using local fallback (%d channels): %v", channels.count(), err)
+				return
+			}
+			log.Printf("source: refreshed to %d channels from %s", n, *sourceURL)
+		}()
+	}
 
 	store := viewers.NewStore()
 	proxyHandler := proxy.New(*cacheMB << 20)
@@ -224,77 +329,24 @@ func main() {
 		w.Write(raw)
 	})
 
-	// syncMu serializes syncs; a double-click must not race two downloads.
-	var syncMu sync.Mutex
+	// Sync re-fetches the full catalog from the API (resolving country and
+	// category) and overwrites the local cache. refresh() serializes itself, so
+	// a double-click can't race two downloads.
 	mux.HandleFunc("POST /api/sync", func(w http.ResponseWriter, r *http.Request) {
-		syncMu.Lock()
-		defer syncMu.Unlock()
-
-		client := &http.Client{Timeout: 2 * time.Minute}
-		resp, err := client.Get(*syncURL)
+		n, err := channels.refresh(*sourceURL)
 		if err != nil {
-			http.Error(w, "sync: download failed: "+err.Error(), http.StatusBadGateway)
+			http.Error(w, "sync: "+err.Error(), http.StatusBadGateway)
 			return
 		}
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			http.Error(w, fmt.Sprintf("sync: upstream returned %d", resp.StatusCode), http.StatusBadGateway)
-			return
-		}
-		data, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
-		if err != nil {
-			http.Error(w, "sync: read failed: "+err.Error(), http.StatusBadGateway)
-			return
-		}
-		if !strings.HasPrefix(strings.TrimSpace(string(data[:min(len(data), 64)])), "#EXTM3U") {
-			http.Error(w, "sync: response is not an M3U playlist", http.StatusBadGateway)
-			return
-		}
-
-		// Merge, never overwrite: keep every existing entry and append only the
-		// upstream entries whose stream URL we don't already have. This is what
-		// lets a local list larger than upstream survive a sync untouched.
-		existing, err := os.ReadFile(path)
-		if err != nil && !errors.Is(err, os.ErrNotExist) {
-			http.Error(w, "sync: read existing failed: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-		merged, added := mergeNewEntries(existing, data)
-
-		// Stamp tvg-genre on every entry (existing + new) from iptv-org's
-		// category database so the UI can group by category. Best-effort: if
-		// the database is unreachable, fall through with the un-enriched merge.
-		stamped := 0
-		if gm, err := genre.Load(); err != nil {
-			log.Printf("sync: genre enrich skipped: %v", err)
-		} else {
-			merged, stamped = gm.Inject(merged)
-		}
-
-		if added == 0 && stamped == 0 {
-			// Nothing new and nothing to enrich — leave the file as is.
-			n := channels.count()
-			log.Printf("sync: %d KB from %s → no changes (kept %d)", len(data)/1024, *syncURL, n)
-			w.Header().Set("Content-Type", "application/json; charset=utf-8")
-			fmt.Fprintf(w, `{"channels":%d,"added":0}`, n)
-			return
-		}
-
-		// Atomic replace: never leave a half-written playlist on disk.
-		tmp := path + ".tmp"
-		if err := os.WriteFile(tmp, merged, 0o644); err != nil {
-			http.Error(w, "sync: write failed: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-		if err := os.Rename(tmp, path); err != nil {
-			os.Remove(tmp)
-			http.Error(w, "sync: replace failed: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-		n := channels.reload()
-		log.Printf("sync: %d KB from %s → +%d new entries, %d genre-tagged (%d channels)", len(data)/1024, *syncURL, added, stamped, n)
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		fmt.Fprintf(w, `{"channels":%d,"added":%d,"tagged":%d}`, n, added, stamped)
+		fmt.Fprintf(w, `{"channels":%d}`, n)
+	})
+
+	// Lightweight status the UI polls so it can show an "updating" state and
+	// re-fetch /api/channels once the background refresh lands.
+	mux.HandleFunc("GET /api/source", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		fmt.Fprintf(w, `{"refreshing":%v,"channels":%d}`, channels.isRefreshing(), channels.count())
 	})
 
 	mux.HandleFunc("POST /api/reload", func(w http.ResponseWriter, r *http.Request) {
