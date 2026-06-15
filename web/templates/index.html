@@ -46,6 +46,19 @@
         <div id="audioButtons" class="rail-grid"></div>
       </section>
 
+      <!-- Record source picker (one button per cell) -->
+      <section class="rail-section">
+        <div class="rail-label">Record</div>
+        <button id="recordBtn" class="rail-icon-btn rec-btn" title="Record the screen with audio" hidden disabled>
+          <span class="rec-dot"></span>
+        </button>
+        <span id="recordTime" class="rec-time" hidden>0:00</span>
+        <div id="recordSavedRow" class="rec-saved-row" hidden>
+          <a id="recordSaved" class="rec-saved" href="#" download>⤓ Save</a>
+          <button id="recordSavedClose" class="rec-saved-close" title="Dismiss">✕</button>
+        </div>
+      </section>
+
       <!-- Volume (global) — pinned to the bottom of the rail -->
       <section class="rail-section rail-volume">
         <div class="rail-label">Volume</div>

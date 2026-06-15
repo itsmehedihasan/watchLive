@@ -31,10 +31,12 @@ import (
 	"syscall"
 	"time"
 
+	"watchlive/internal/ffmpeg"
 	"watchlive/internal/genre"
 	"watchlive/internal/health"
 	"watchlive/internal/playlist"
 	"watchlive/internal/proxy"
+	"watchlive/internal/recorder"
 	"watchlive/internal/viewers"
 )
 
@@ -268,6 +270,7 @@ func main() {
 	sourceURL := flag.String("source-url", "https://iptv-org.github.io/iptv/index.m3u", "upstream playlist fetched at startup and by Sync; list.m3u is the offline fallback")
 	noRefresh := flag.Bool("no-refresh", false, "skip the startup fetch from -source-url and use the local list.m3u as-is")
 	cacheMB := flag.Int64("cache-mb", 200, "segment cache size in MB")
+	recDir := flag.String("rec-dir", "recordings", "directory for saved screen recordings")
 	open := flag.Bool("open", true, "open the web UI in the default browser once the server is listening")
 	flag.Parse()
 
@@ -309,6 +312,16 @@ func main() {
 
 	store := viewers.NewStore()
 	proxyHandler := proxy.New(*cacheMB << 20)
+
+	// Screen recording: resolve an ffmpeg (embedded copy, else PATH) and wire a
+	// recorder that transcodes to 720p H.264/AAC MP4. Absent ffmpeg → recording
+	// is simply disabled and the UI hides the button.
+	rec := recorder.New(ffmpeg.Resolve(), *recDir)
+	if rec.Available() {
+		log.Printf("recording: enabled, saving to %s", rec.Dir())
+	} else {
+		log.Printf("recording: disabled (ffmpeg not found)")
+	}
 	prober := health.New()
 	// Persist health verdicts next to the playlist and load any prior pass, so a
 	// restart (or a reopened browser) reuses results instead of re-probing every
@@ -374,7 +387,56 @@ func main() {
 	// re-fetch /api/channels once the background refresh lands.
 	mux.HandleFunc("GET /api/source", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		fmt.Fprintf(w, `{"refreshing":%v,"channels":%d}`, channels.isRefreshing(), channels.count())
+		fmt.Fprintf(w, `{"refreshing":%v,"channels":%d,"recordingAvailable":%v}`,
+			channels.isRefreshing(), channels.count(), rec.Available())
+	})
+
+	// ── Screen recording (server-side, ffmpeg → 720p H.264/AAC MP4) ──────────
+	mux.HandleFunc("POST /api/record/start", func(w http.ResponseWriter, r *http.Request) {
+		if !rec.Available() {
+			http.Error(w, "recording unavailable: ffmpeg not found", http.StatusServiceUnavailable)
+			return
+		}
+		var body struct{ URL, Name string }
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		id, file, err := rec.Start(body.URL, body.Name, time.Now())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		log.Printf("recording: started %s → %s", id, file)
+		writeJSON(w, r, map[string]string{"id": id, "file": file})
+	})
+	mux.HandleFunc("POST /api/record/stop", func(w http.ResponseWriter, r *http.Request) {
+		var body struct{ ID string }
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		file, err := rec.Stop(body.ID)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		log.Printf("recording: stopped %s → %s", body.ID, file)
+		writeJSON(w, r, map[string]string{"id": body.ID, "file": file})
+	})
+	mux.HandleFunc("GET /api/record", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, r, rec.Status(time.Now()))
+	})
+	// Serve a saved recording for download. Base-name only so the path can't
+	// escape the recordings directory.
+	mux.HandleFunc("GET /api/record/file", func(w http.ResponseWriter, r *http.Request) {
+		name := filepath.Base(r.URL.Query().Get("name"))
+		if name == "" || name == "." || name == ".." || strings.ContainsAny(name, `/\`) {
+			http.Error(w, "bad name", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Disposition", `attachment; filename="`+name+`"`)
+		http.ServeFile(w, r, filepath.Join(rec.Dir(), name))
 	})
 
 	mux.HandleFunc("POST /api/reload", func(w http.ResponseWriter, r *http.Request) {
@@ -453,6 +515,7 @@ func main() {
 
 	<-ctx.Done()
 	log.Println("shutting down…")
+	rec.StopAll() // finalize any in-progress recordings into playable files
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {

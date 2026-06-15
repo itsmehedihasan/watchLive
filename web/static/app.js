@@ -81,6 +81,12 @@
   const MAX_CELLS = 4;
   const cells = [];               // one entry per grid cell (see makeCell)
   let audioCell = -1;           // index of the cell whose audio is unmuted
+  // Server-side recording: one at a time, bound to the audio cell at start.
+  let recordingAvailable = false; // ffmpeg present on the server
+  let recId = null;               // active recording id, or null
+  let recCellIdx = -1;            // cell being recorded
+  let recStartMs = 0;
+  let recTimer = null;
   let globalMuted = false;
   let volume = 1;               // 0..1, applied to every cell's <video>
   let pickerTarget = -1;        // cell index the picker is currently filling
@@ -91,6 +97,8 @@
     grid: $('grid'),
     muteBtn: $('muteBtn'), volume: $('volume'), volUp: $('volUp'), volDown: $('volDown'),
     gridAdd: $('gridAdd'), gridRemove: $('gridRemove'), audioButtons: $('audioButtons'),
+    recordBtn: $('recordBtn'), recordTime: $('recordTime'),
+    recordSaved: $('recordSaved'), recordSavedRow: $('recordSavedRow'), recordSavedClose: $('recordSavedClose'),
     scrim: $('scrim'),
     leftDrawerToggle: $('leftDrawerToggle'), rightDrawerToggle: $('rightDrawerToggle'),
     categorySidebar: $('categorySidebar'), sidebar: $('sidebar'),
@@ -640,6 +648,7 @@
   function assignChannel(cellIdx, ch) {
     const cell = cells[cellIdx];
     if (!cell) return;
+    if (recId && cellIdx === recCellIdx) stopRecording(); // channel changing under the recording
     cell.channel = ch;
     cell.serverIdx = 0;
     cell.failedServers = {};
@@ -656,6 +665,7 @@
 
   function clearCell(cell) {
     if (openSettingsCell === cell) closeCellSettings();
+    if (recId && cell.idx === recCellIdx) stopRecording();
     destroyCellPlayer(cell);
     cell.channel = null;
     cell.root.classList.remove('filled');
@@ -697,6 +707,84 @@
     els.muteBtn.querySelector('.ico-vol').hidden = globalMuted;
     els.muteBtn.querySelector('.ico-muted').hidden = !globalMuted;
     els.muteBtn.setAttribute('aria-pressed', globalMuted ? 'true' : 'false');
+    // Recording is bound to the audio cell — if the crown moved away, stop it.
+    if (recId && audioCell !== recCellIdx) stopRecording();
+    updateRecordButton();
+  }
+
+  // ── Server-side recording (records the audio cell) ────────────────────────
+  function updateRecordButton() {
+    const btn = els.recordBtn;
+    if (!recordingAvailable) { btn.hidden = true; return; }
+    btn.hidden = false;
+    const canStart = audioCell >= 0 && cells[audioCell] && cells[audioCell].channel;
+    btn.disabled = !(recId || canStart);
+    btn.title = recId ? 'Stop recording' : 'Record the screen with audio';
+  }
+
+  function updateRecordTime() {
+    const s = Math.max(0, Math.floor((Date.now() - recStartMs) / 1000));
+    els.recordTime.textContent = Math.floor(s / 60) + ':' + ('0' + (s % 60)).slice(-2);
+  }
+
+  function toggleRecording() {
+    if (recId) stopRecording();
+    else startRecording();
+  }
+
+  function startRecording() {
+    if (recId || audioCell < 0) return;
+    const cell = cells[audioCell];
+    if (!cell || !cell.channel) return;
+    const server = currentServer(cell);
+    if (!server) return;
+    recCellIdx = cell.idx;
+    els.recordBtn.disabled = true;
+    fetch('/api/record/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: server.url, name: cell.channel.name }),
+    })
+      .then(function (r) { if (!r.ok) throw new Error('start failed'); return r.json(); })
+      .then(function (d) {
+        recId = d.id;
+        recStartMs = Date.now();
+        els.recordBtn.classList.add('recording');
+        els.recordSavedRow.hidden = true;
+        els.recordTime.hidden = false;
+        updateRecordTime();
+        recTimer = setInterval(updateRecordTime, 1000);
+        updateRecordButton();
+      })
+      .catch(function () {
+        recCellIdx = -1;
+        updateRecordButton();
+      });
+  }
+
+  function stopRecording() {
+    if (!recId) return;
+    const id = recId;
+    recId = null;
+    recCellIdx = -1;
+    if (recTimer) { clearInterval(recTimer); recTimer = null; }
+    els.recordBtn.classList.remove('recording');
+    els.recordTime.hidden = true;
+    els.recordBtn.disabled = true;
+    fetch('/api/record/stop', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: id }),
+    })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (d && d.file) {
+          els.recordSaved.href = '/api/record/file?name=' + encodeURIComponent(d.file);
+          els.recordSavedRow.hidden = false;
+        }
+      })
+      .catch(function () {})
+      .then(function () { updateRecordButton(); });
   }
 
   function renderAudioButtons() {
@@ -744,6 +832,8 @@
   els.volume.addEventListener('input', function () {
     setVolume(parseInt(els.volume.value, 10) / 100);
   });
+  els.recordBtn.addEventListener('click', toggleRecording);
+  els.recordSavedClose.addEventListener('click', function () { els.recordSavedRow.hidden = true; });
   els.volUp.addEventListener('click', function () { setVolume(volume + 0.1); });
   els.volDown.addEventListener('click', function () { setVolume(volume - 0.1); });
 
@@ -778,6 +868,7 @@
     if (cells.length <= 1) return;
     const cell = cells.pop();
     if (openSettingsCell === cell) closeCellSettings();
+    if (recId && cell.idx === recCellIdx) stopRecording();
     destroyCellPlayer(cell);
     if (cell.root.parentNode) cell.root.parentNode.removeChild(cell.root);
     if (audioCell >= cells.length) {
@@ -1276,6 +1367,7 @@
     fetch('/api/source')
       .then(function (r) { return r.json(); })
       .then(function (d) {
+        if (d.recordingAvailable != null) { recordingAvailable = !!d.recordingAvailable; updateRecordButton(); }
         const was = sourceRefreshing;
         sourceRefreshing = !!d.refreshing;
         if (sourceRefreshing && channels.length === 0) {

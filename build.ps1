@@ -7,6 +7,29 @@ $root = $PSScriptRoot
 $dist = Join-Path $root 'dist'
 $zip  = Join-Path $root 'dist\watchlive-windows-amd64.zip'
 
+# Fetch ffmpeg.exe into the embed folder so `go build` bakes it into the binary
+# (single self-contained .exe with recording). Gitignored — not committed.
+$ffmpegDir = Join-Path $root 'internal\ffmpeg\bin'
+$ffmpegExe = Join-Path $ffmpegDir 'ffmpeg.exe'
+New-Item -ItemType Directory -Path $ffmpegDir -Force | Out-Null
+if (-not (Test-Path $ffmpegExe)) {
+  Write-Host 'Fetching ffmpeg.exe (embedded for recording)...'
+  $tmpZip = Join-Path $env:TEMP 'watchlive-ffmpeg.zip'
+  $tmpDir = Join-Path $env:TEMP 'watchlive-ffmpeg'
+  # gyan.dev "essentials" build — a static ffmpeg.exe, no install needed.
+  $url = 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip'
+  Invoke-WebRequest -Uri $url -OutFile $tmpZip
+  if (Test-Path $tmpDir) { Remove-Item -Recurse -Force $tmpDir }
+  Expand-Archive -Path $tmpZip -DestinationPath $tmpDir -Force
+  $found = Get-ChildItem -Path $tmpDir -Recurse -Filter 'ffmpeg.exe' | Select-Object -First 1
+  if (-not $found) { throw 'ffmpeg.exe not found in downloaded archive' }
+  Copy-Item $found.FullName $ffmpegExe -Force
+  Remove-Item -Recurse -Force $tmpDir; Remove-Item -Force $tmpZip
+  Write-Host "ffmpeg.exe ready ($([math]::Round((Get-Item $ffmpegExe).Length / 1MB)) MB)"
+} else {
+  Write-Host 'ffmpeg.exe already present, skipping download.'
+}
+
 # Fresh dist/ each time so stale files don't end up in the zip.
 if (Test-Path $dist) { Remove-Item -Recurse -Force $dist }
 New-Item -ItemType Directory -Path $dist | Out-Null
