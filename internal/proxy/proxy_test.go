@@ -62,17 +62,20 @@ func TestRewritePlaylist(t *testing.T) {
 }
 
 func TestProxySegmentCachingAndSingleflight(t *testing.T) {
+	// Uses an fMP4 (.m4s) segment: the buffered/single-flight path. Raw .ts URLs
+	// are handled separately by serveTS (see TestProxyRawTSStreaming) and do not
+	// single-flight, so they are deliberately not exercised here.
 	var upstreamHits int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&upstreamHits, 1)
 		time.Sleep(50 * time.Millisecond) // widen the race window for concurrent requests
-		w.Header().Set("Content-Type", "video/MP2T")
+		w.Header().Set("Content-Type", "video/mp4")
 		fmt.Fprint(w, "SEGMENTDATA")
 	}))
 	defer upstream.Close()
 
 	h := New(10 << 20)
-	segURL := upstream.URL + "/seg001.ts"
+	segURL := upstream.URL + "/seg001.m4s"
 
 	// 8 concurrent requests for the same segment → exactly one upstream fetch.
 	var wg sync.WaitGroup
@@ -133,6 +136,89 @@ func TestProxyPlaylistRewriteEndToEnd(t *testing.T) {
 	}
 	if ct := rec.Header().Get("Content-Type"); ct != "application/vnd.apple.mpegurl" {
 		t.Errorf("content type %q", ct)
+	}
+}
+
+func TestProxyDASHManifestNotRewritten(t *testing.T) {
+	const manifest = `<?xml version="1.0"?>
+<MPD><Period><AdaptationSet><Representation><BaseURL>video/</BaseURL>
+<SegmentTemplate media="seg-$Number$.m4s" initialization="init.mp4"/>
+</Representation></AdaptationSet></Period></MPD>`
+	mux := http.NewServeMux()
+	mux.HandleFunc("/live/manifest.mpd", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/dash+xml")
+		fmt.Fprint(w, manifest)
+	})
+	upstream := httptest.NewServer(mux)
+	defer upstream.Close()
+
+	h := New(10 << 20)
+	req := httptest.NewRequest(http.MethodGet, "/api/proxy?url="+url.QueryEscape(upstream.URL+"/live/manifest.mpd"), nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d", rec.Code)
+	}
+	// Manifest must be passed through byte-for-byte (Shaka's request filter
+	// handles proxy routing, not server-side rewriting).
+	if rec.Body.String() != manifest {
+		t.Errorf("DASH manifest was modified:\n%s", rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/dash+xml" {
+		t.Errorf("content type %q, want application/dash+xml", ct)
+	}
+	if !strings.Contains(rec.Header().Get("Cache-Control"), "no-cache") {
+		t.Errorf("DASH manifest must not be browser-cached: %q", rec.Header().Get("Cache-Control"))
+	}
+}
+
+func TestProxyRawTSStreaming(t *testing.T) {
+	// Continuous live stream: no Content-Length (chunked) → streamed through.
+	live := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "video/MP2T")
+		fl, _ := w.(http.Flusher)
+		for i := 0; i < 3; i++ {
+			fmt.Fprint(w, "CHUNK")
+			if fl != nil {
+				fl.Flush() // forces chunked transfer-encoding (no Content-Length)
+			}
+		}
+	}))
+	defer live.Close()
+
+	h := New(10 << 20)
+	req := httptest.NewRequest(http.MethodGet, "/api/proxy?url="+url.QueryEscape(live.URL+"/channel.ts"), nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK || rec.Body.String() != "CHUNKCHUNKCHUNK" {
+		t.Fatalf("bad stream response: %d %q", rec.Code, rec.Body.String())
+	}
+	if x := rec.Header().Get("X-Cache"); x != "STREAM" {
+		t.Errorf("expected X-Cache STREAM, got %q", x)
+	}
+
+	// Finite .ts (Content-Length set) is buffered and cached instead.
+	var hits int32
+	finite := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.Header().Set("Content-Type", "video/MP2T")
+		fmt.Fprint(w, "SEGDATA") // small body → Content-Length set, no flush
+	}))
+	defer finite.Close()
+
+	segURL := finite.URL + "/seg.ts"
+	for i := 0; i < 2; i++ {
+		r := httptest.NewRequest(http.MethodGet, "/api/proxy?url="+url.QueryEscape(segURL), nil)
+		rc := httptest.NewRecorder()
+		h.ServeHTTP(rc, r)
+		if rc.Body.String() != "SEGDATA" {
+			t.Fatalf("finite .ts body %q", rc.Body.String())
+		}
+	}
+	if got := atomic.LoadInt32(&hits); got != 1 {
+		t.Errorf("finite .ts not cached: %d upstream hits, want 1", got)
 	}
 }
 

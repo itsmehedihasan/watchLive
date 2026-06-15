@@ -8,7 +8,7 @@
   'use strict';
 
   // ── Country code → full name ─────────────────────────────────────────────
-  var COUNTRY_NAMES = {
+  const COUNTRY_NAMES = {
     AF:'Afghanistan',AX:'Åland Islands',AL:'Albania',DZ:'Algeria',AS:'American Samoa',
     AD:'Andorra',AO:'Angola',AI:'Anguilla',AQ:'Antarctica',AG:'Antigua and Barbuda',
     AR:'Argentina',AM:'Armenia',AW:'Aruba',AU:'Australia',AT:'Austria',
@@ -67,31 +67,30 @@
 
   function countryLabel(g) {
     if (!g) return g;
-    var up = g.trim().toUpperCase();
+    const up = g.trim().toUpperCase();
     return COUNTRY_NAMES[up] || g;
   }
 
   // ── State ────────────────────────────────────────────────────────────────
-  var channels = [];            // fetched from /api/channels (gzipped, ETag-cached)
-  var channelsLoading = true;
-  var sourceRefreshing = false; // server is fetching the catalog from the API
-  var search = '';              // country-drawer search
-  var topChannelIds = [];       // channel ids ranked by tune-ins
+  let channels = [];            // fetched from /api/channels (gzipped, ETag-cached)
+  let channelsLoading = true;
+  let sourceRefreshing = false; // server is fetching the catalog from the API
+  let search = '';              // country-drawer search
+  let topChannelIds = [];       // channel ids ranked by tune-ins
 
-  var MAX_CELLS = 4;
-  var cells = [];               // one entry per grid cell (see makeCell)
-  var audioCell = -1;           // index of the cell whose audio is unmuted
-  var globalMuted = false;
-  var volume = 1;               // 0..1, applied to every cell's <video>
-  var pickerTarget = -1;        // cell index the picker is currently filling
+  const MAX_CELLS = 4;
+  const cells = [];               // one entry per grid cell (see makeCell)
+  let audioCell = -1;           // index of the cell whose audio is unmuted
+  let globalMuted = false;
+  let volume = 1;               // 0..1, applied to every cell's <video>
+  let pickerTarget = -1;        // cell index the picker is currently filling
 
   // ── DOM ──────────────────────────────────────────────────────────────────
-  var $ = function (id) { return document.getElementById(id); };
-  var els = {
+  const $ = function (id) { return document.getElementById(id); };
+  const els = {
     grid: $('grid'),
-    muteBtn: $('muteBtn'), volume: $('volume'),
+    muteBtn: $('muteBtn'), volume: $('volume'), volUp: $('volUp'), volDown: $('volDown'),
     gridAdd: $('gridAdd'), gridRemove: $('gridRemove'), audioButtons: $('audioButtons'),
-    shareBtn: $('shareBtn'), signInBtn: $('signInBtn'),
     scrim: $('scrim'),
     leftDrawerToggle: $('leftDrawerToggle'), rightDrawerToggle: $('rightDrawerToggle'),
     categorySidebar: $('categorySidebar'), sidebar: $('sidebar'),
@@ -109,12 +108,22 @@
   };
 
   function proxyUrl(url) { return '/api/proxy?url=' + encodeURIComponent(url); }
+  // Pick a playback engine from the stream URL. The browser can only decode a
+  // fixed set of formats; we route .mpd → Shaka (DASH), raw .ts → mpegts.js,
+  // everything else → Hls.js / native HLS.
+  function streamKind(url) {
+    const u = String(url).split('#')[0];
+    if (/\.mpd(\?|$)/i.test(u)) return 'dash';
+    if (/\.m3u8(\?|$)/i.test(u)) return 'hls';
+    if (/\.ts(\?|$)/i.test(u)) return 'ts';
+    return 'hls';
+  }
   function formatViewers(n) { return n >= 1000 ? (n / 1000).toFixed(1) + 'K' : String(n); }
 
   // ── Dead-channel marks ───────────────────────────────────────────────────
   // A channel is marked dead when playback exhausted every server. Keyed by
   // name (IDs shift when the playlist is re-synced); persisted per browser.
-  var deadMarks = {};
+  let deadMarks = {};
   try { deadMarks = JSON.parse(localStorage.getItem('livetv_dead')) || {}; } catch (e) { /* fresh start */ }
 
   function deadKey(ch) { return ch.name.toLowerCase(); }
@@ -124,12 +133,12 @@
   // User-pinned channels, shown in a "Favourites" section at the top of the
   // category sidebar. Keyed by name (IDs shift on re-sync) and persisted per
   // browser, like dead marks. Favourites ignore the "Working only" filter.
-  var favMarks = {};
+  let favMarks = {};
   try { favMarks = JSON.parse(localStorage.getItem('livetv_fav')) || {}; } catch (e) { /* fresh start */ }
   function favKey(ch) { return ch.name.toLowerCase(); }
   function isFav(ch) { return !!favMarks[favKey(ch)]; }
   function setFav(ch, on) {
-    var k = favKey(ch);
+    const k = favKey(ch);
     if (on === !!favMarks[k]) return;
     if (on) favMarks[k] = Date.now(); else delete favMarks[k];
     try { localStorage.setItem('livetv_fav', JSON.stringify(favMarks)); } catch (e) { /* quota */ }
@@ -139,14 +148,14 @@
   function onFavChanged() {
     renderCategorySidebar();
     Array.prototype.slice.call(document.querySelectorAll('.pin-btn')).forEach(function (pin) {
-      var on = !!favMarks[pin.dataset.favkey];
+      const on = !!favMarks[pin.dataset.favkey];
       pin.classList.toggle('faved', on);
       pin.title = on ? 'Remove from Favourites' : 'Add to Favourites';
     });
   }
 
   function setDead(ch, dead) {
-    var key = deadKey(ch);
+    const key = deadKey(ch);
     if (dead === !!deadMarks[key]) return;
     if (dead) deadMarks[key] = Date.now();
     else delete deadMarks[key];
@@ -159,33 +168,33 @@
   // ── Server-side health filter ("Working only") ──────────────────────────
   // When on, the server probes every stream and we hide ones it can't reach.
   // The per-cell picker always lists working channels only. Default ON.
-  var healthOn = localStorage.getItem('livetv_health_on') !== '0';
-  var health = {};
-  var healthProbing = false;
-  var healthDone = 0, healthTotal = 0;
-  var healthPoll = null;
-  var healthOverlayDismissed = false;
-  var channelsEtag = null; // content hash of the current list; gates the health cache
+  let healthOn = localStorage.getItem('livetv_health_on') !== '0';
+  let health = {};
+  let healthProbing = false;
+  let healthDone = 0, healthTotal = 0;
+  let healthPoll = null;
+  let healthOverlayDismissed = false;
+  let channelsEtag = null; // content hash of the current list; gates the health cache
 
   function passesHealth(ch) {
     if (!healthOn) return true;
     return health[ch.id] !== false;
   }
   function countAlive() {
-    var n = 0;
-    for (var id in health) { if (health[id]) n++; }
+    let n = 0;
+    for (const id in health) { if (health[id]) n++; }
     return n;
   }
 
   // ── Active-channel highlighting ──────────────────────────────────────────
   // Channels currently shown in any cell are highlighted in the browse lists.
   function activeIds() {
-    var ids = {};
+    const ids = {};
     cells.forEach(function (c) { if (c.channel) ids[c.channel.id] = true; });
     return ids;
   }
   function isActive(ch) {
-    for (var i = 0; i < cells.length; i++) {
+    for (let i = 0; i < cells.length; i++) {
       if (cells[i].channel && cells[i].channel.id === ch.id) return true;
     }
     return false;
@@ -195,48 +204,50 @@
   // Each cell owns its own <video> + Hls.js instance so re-laying-out the grid
   // (a pure CSS change) never restarts playback.
   function makeCell(idx) {
-    var cell = {
+    const cell = {
       idx: idx,
       channel: null,
       serverIdx: 0,
       failedServers: {},
       hls: null,
+      shaka: null,
+      mpegts: null,
       token: 0,
       root: null,
       video: null,
     };
 
-    var root = document.createElement('section');
+    const root = document.createElement('section');
     root.className = 'cell';
     root.dataset.idx = String(idx);
 
     // Playing stage
-    var stage = document.createElement('div');
+    const stage = document.createElement('div');
     stage.className = 'cell-stage';
 
-    var video = document.createElement('video');
+    const video = document.createElement('video');
     video.playsInline = true;
     video.muted = true; // every cell starts muted; the audio cell is unmuted on assign
     stage.appendChild(video);
 
-    var loading = document.createElement('div');
+    const loading = document.createElement('div');
     loading.className = 'cell-overlay cell-loading';
     loading.innerHTML = '<div class="spinner"></div><p class="overlay-muted">Connecting…</p>';
     loading.hidden = true;
     stage.appendChild(loading);
 
-    var error = document.createElement('div');
+    const error = document.createElement('div');
     error.className = 'cell-overlay cell-error';
     error.hidden = true;
-    var errEmoji = document.createElement('div'); errEmoji.className = 'overlay-emoji'; errEmoji.textContent = '📡';
-    var errTitle = document.createElement('p'); errTitle.className = 'error-title'; errTitle.textContent = 'Stream unavailable';
-    var errBtn = document.createElement('button'); errBtn.className = 'primary-btn'; errBtn.textContent = '↺ Retry';
+    const errEmoji = document.createElement('div'); errEmoji.className = 'overlay-emoji'; errEmoji.textContent = '📡';
+    const errTitle = document.createElement('p'); errTitle.className = 'error-title'; errTitle.textContent = 'Stream unavailable';
+    const errBtn = document.createElement('button'); errBtn.className = 'primary-btn'; errBtn.textContent = '↺ Retry';
     errBtn.addEventListener('click', function () { retryCell(cell); });
     error.appendChild(errEmoji); error.appendChild(errTitle); error.appendChild(errBtn);
     stage.appendChild(error);
 
     // Mic (audio source) — top-left, always visible while filled
-    var mic = document.createElement('button');
+    const mic = document.createElement('button');
     mic.className = 'cell-mic';
     mic.title = 'Use this cell’s audio';
     mic.innerHTML =
@@ -248,19 +259,19 @@
     stage.appendChild(mic);
 
     // Channel name label
-    var label = document.createElement('div');
+    const label = document.createElement('div');
     label.className = 'cell-label';
     stage.appendChild(label);
 
     // Hover controls — bottom center
-    var controls = document.createElement('div');
+    const controls = document.createElement('div');
     controls.className = 'cell-controls';
-    var expand = document.createElement('button');
+    const expand = document.createElement('button');
     expand.className = 'cell-ctl';
     expand.title = 'Expand (fullscreen)';
     expand.innerHTML = '<svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M8 3H5a2 2 0 00-2 2v3m18 0V5a2 2 0 00-2-2h-3m0 18h3a2 2 0 002-2v-3M3 16v3a2 2 0 002 2h3"/></svg>';
     expand.addEventListener('click', function () { toggleCellFullscreen(cell); });
-    var close = document.createElement('button');
+    const close = document.createElement('button');
     close.className = 'cell-ctl';
     close.title = 'Close this screen';
     close.innerHTML = '<svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
@@ -272,9 +283,9 @@
     root.appendChild(stage);
 
     // Empty stage
-    var empty = document.createElement('div');
+    const empty = document.createElement('div');
     empty.className = 'cell-empty';
-    var pick = document.createElement('button');
+    const pick = document.createElement('button');
     pick.className = 'cell-pick';
     pick.innerHTML =
       '<svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">' +
@@ -297,7 +308,7 @@
 
   // ── Per-cell playback ────────────────────────────────────────────────────
   function currentServer(cell) {
-    var ch = cell.channel;
+    const ch = cell.channel;
     if (!ch || !ch.servers || ch.servers.length === 0) return null;
     return ch.servers[Math.min(cell.serverIdx, ch.servers.length - 1)];
   }
@@ -305,6 +316,10 @@
   function destroyCellPlayer(cell) {
     cell.token++;
     if (cell.hls) { cell.hls.destroy(); cell.hls = null; }
+    // Shaka's destroy() is async; fire-and-forget — the token bump already
+    // invalidates any in-flight load callbacks for this cell.
+    if (cell.shaka) { try { cell.shaka.destroy(); } catch (e) { /* ignore */ } cell.shaka = null; }
+    if (cell.mpegts) { try { cell.mpegts.destroy(); } catch (e) { /* ignore */ } cell.mpegts = null; }
     cell.video.removeAttribute('src');
     cell.video.onloadedmetadata = null;
     cell.video.onerror = null;
@@ -314,8 +329,8 @@
   function failover(cell) {
     if (!cell.channel) return;
     cell.failedServers[cell.serverIdx] = true;
-    var servers = cell.channel.servers || [];
-    for (var i = 0; i < servers.length; i++) {
+    const servers = cell.channel.servers || [];
+    for (let i = 0; i < servers.length; i++) {
       if (!cell.failedServers[i]) {
         cell.serverIdx = i;
         startCellPlayback(cell);
@@ -334,13 +349,31 @@
   }
 
   function startCellPlayback(cell) {
-    var server = currentServer(cell);
+    const server = currentServer(cell);
     if (!server) { setCellState(cell, 'error'); return; }
     destroyCellPlayer(cell);
-    var token = cell.token;
-    var video = cell.video;
+    const token = cell.token;
     setCellState(cell, 'loading');
-    var netRecoveries = 0, mediaRecoveries = 0;
+
+    switch (streamKind(server.url)) {
+      case 'dash': playDash(cell, server, token); break;
+      case 'ts':   playTs(cell, server, token); break;
+      default:     playHls(cell, server, token); break;
+    }
+  }
+
+  // Shared success handler: only acts if this cell hasn't been re-tasked since.
+  function onCellPlaying(cell, token) {
+    if (token !== cell.token) return;
+    setCellState(cell, 'playing');
+    if (cell.channel) setDead(cell.channel, false);
+    playCell(cell);
+  }
+
+  // ── HLS (.m3u8) — Hls.js with native-HLS fallback ──
+  function playHls(cell, server, token) {
+    const video = cell.video;
+    let netRecoveries = 0, mediaRecoveries = 0;
 
     if (window.Hls && Hls.isSupported()) {
       cell.hls = new Hls({
@@ -353,16 +386,11 @@
         backBufferLength: 0,
         abrEwmaDefaultEstimate: 5000000,
       });
-      var h = cell.hls;
+      const h = cell.hls;
       h.loadSource(proxyUrl(server.url));
       h.attachMedia(video);
 
-      h.once(Hls.Events.MANIFEST_PARSED, function () {
-        if (token !== cell.token) return;
-        setCellState(cell, 'playing');
-        if (cell.channel) setDead(cell.channel, false);
-        playCell(cell);
-      });
+      h.once(Hls.Events.MANIFEST_PARSED, function () { onCellPlaying(cell, token); });
       h.on(Hls.Events.ERROR, function (_, data) {
         if (!data.fatal || token !== cell.token) return;
         if (data.type === Hls.ErrorTypes.NETWORK_ERROR && netRecoveries < 1) {
@@ -375,22 +403,50 @@
       });
     } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
       video.src = proxyUrl(server.url);
-      video.onloadedmetadata = function () {
-        if (token !== cell.token) return;
-        setCellState(cell, 'playing');
-        if (cell.channel) setDead(cell.channel, false);
-        playCell(cell);
-      };
+      video.onloadedmetadata = function () { onCellPlaying(cell, token); };
       video.onerror = function () { if (token === cell.token) failover(cell); };
     } else {
       setCellState(cell, 'error');
     }
   }
 
+  // ── DASH (.mpd) — Shaka Player. Load the ORIGINAL url so relative segment
+  // URIs resolve correctly, then route every request through our proxy via a
+  // request filter (handles CORS + header-spoofing uniformly). ──
+  function playDash(cell, server, token) {
+    if (!(window.shaka && shaka.Player.isBrowserSupported())) { failover(cell); return; }
+    const player = new shaka.Player();
+    cell.shaka = player;
+    player.attach(cell.video).then(function () {
+      if (token !== cell.token) return;
+      player.getNetworkingEngine().registerRequestFilter(function (_, req) {
+        req.uris = req.uris.map(function (u) { return proxyUrl(u); });
+      });
+      player.addEventListener('error', function () { if (token === cell.token) failover(cell); });
+      return player.load(server.url);
+    }).then(function () {
+      onCellPlaying(cell, token);
+    }).catch(function () {
+      if (token === cell.token) failover(cell);
+    });
+  }
+
+  // ── Raw MPEG-TS (continuous .ts) — mpegts.js drives MSE itself. ──
+  function playTs(cell, server, token) {
+    if (!(window.mpegts && mpegts.isSupported())) { failover(cell); return; }
+    const video = cell.video;
+    const player = mpegts.createPlayer({ type: 'mpegts', isLive: true, url: proxyUrl(server.url) });
+    cell.mpegts = player;
+    player.attachMediaElement(video);
+    player.on(mpegts.Events.ERROR, function () { if (token === cell.token) failover(cell); });
+    video.onloadedmetadata = function () { onCellPlaying(cell, token); };
+    player.load();
+  }
+
   // Start playback honoring autoplay policy: an unmuted play() may be blocked
   // unless it follows a user gesture — fall back to muted so video keeps going.
   function playCell(cell) {
-    var p = cell.video.play();
+    const p = cell.video.play();
     if (p && p.catch) {
       p.catch(function () {
         if (!cell.video.muted) { cell.video.muted = true; applyAudio(); }
@@ -406,7 +462,7 @@
 
   // ── Channel assignment ───────────────────────────────────────────────────
   function assignChannel(cellIdx, ch) {
-    var cell = cells[cellIdx];
+    const cell = cells[cellIdx];
     if (!cell) return;
     cell.channel = ch;
     cell.serverIdx = 0;
@@ -431,7 +487,7 @@
     if (audioCell === cell.idx) {
       // Hand the audio crown to the next filled cell, if any.
       audioCell = -1;
-      for (var i = 0; i < cells.length; i++) {
+      for (let i = 0; i < cells.length; i++) {
         if (cells[i].channel) { audioCell = i; break; }
       }
     }
@@ -443,7 +499,7 @@
 
   // ── Audio / volume ───────────────────────────────────────────────────────
   function setAudioCell(idx) {
-    var cell = cells[idx];
+    const cell = cells[idx];
     if (!cell || !cell.channel) return;
     audioCell = idx;
     applyAudio();
@@ -453,11 +509,11 @@
 
   function applyAudio() {
     cells.forEach(function (c, i) {
-      var isAudio = i === audioCell && !globalMuted;
+      const isAudio = i === audioCell && !globalMuted;
       c.video.muted = !isAudio;
       c.video.volume = volume;
-      var on = c.els.mic.querySelector('.ico-on');
-      var off = c.els.mic.querySelector('.ico-off');
+      const on = c.els.mic.querySelector('.ico-on');
+      const off = c.els.mic.querySelector('.ico-off');
       if (on && off) { on.hidden = !isAudio; off.hidden = isAudio; }
       c.els.mic.classList.toggle('active', isAudio);
     });
@@ -468,10 +524,10 @@
 
   function renderAudioButtons() {
     els.audioButtons.innerHTML = '';
-    for (var i = 0; i < cells.length; i++) {
+    for (let i = 0; i < cells.length; i++) {
       (function (i) {
-        var btn = document.createElement('button');
-        var cell = cells[i];
+        const btn = document.createElement('button');
+        const cell = cells[i];
         btn.className = 'rail-num' +
           (i === audioCell ? ' active' : '') +
           (cell.channel ? '' : ' empty');
@@ -492,12 +548,27 @@
     persistAudio();
     applyAudio();
   });
-  els.volume.addEventListener('input', function () {
-    volume = Math.max(0, Math.min(1, parseInt(els.volume.value, 10) / 100));
-    if (volume > 0 && globalMuted) globalMuted = false; // dragging up un-mutes
+  // Paint the slider's filled (bottom → thumb) portion to match the level.
+  function applyVolumeFill() {
+    els.volume.style.setProperty('--vol-fill', Math.round(volume * 100) + '%');
+  }
+
+  // Single entry point for every volume change (slider, +/- buttons, load):
+  // clamp, sync the slider + fill, un-mute when raised above zero, persist, apply.
+  function setVolume(v) {
+    volume = Math.max(0, Math.min(1, v));
+    els.volume.value = String(Math.round(volume * 100));
+    if (volume > 0 && globalMuted) globalMuted = false;
+    applyVolumeFill();
     persistAudio();
     applyAudio();
+  }
+
+  els.volume.addEventListener('input', function () {
+    setVolume(parseInt(els.volume.value, 10) / 100);
   });
+  els.volUp.addEventListener('click', function () { setVolume(volume + 0.1); });
+  els.volDown.addEventListener('click', function () { setVolume(volume - 0.1); });
 
   function persistAudio() {
     try {
@@ -515,7 +586,7 @@
 
   function addCell() {
     if (cells.length >= MAX_CELLS) return;
-    var cell = makeCell(cells.length);
+    const cell = makeCell(cells.length);
     cells.push(cell);
     els.grid.appendChild(cell.root);
     setCellState(cell, 'idle');
@@ -528,12 +599,12 @@
 
   function removeCell() {
     if (cells.length <= 1) return;
-    var cell = cells.pop();
+    const cell = cells.pop();
     destroyCellPlayer(cell);
     if (cell.root.parentNode) cell.root.parentNode.removeChild(cell.root);
     if (audioCell >= cells.length) {
       audioCell = -1;
-      for (var i = 0; i < cells.length; i++) { if (cells[i].channel) { audioCell = i; break; } }
+      for (let i = 0; i < cells.length; i++) { if (cells[i].channel) { audioCell = i; break; } }
     }
     updatePickLabels();
     renderGridControls();
@@ -558,7 +629,7 @@
   els.gridRemove.addEventListener('click', removeCell);
 
   // ── Channel picker (per cell) ────────────────────────────────────────────
-  var pickerSearch = '';
+  let pickerSearch = '';
 
   function openPicker(cellIdx) {
     pickerTarget = cellIdx;
@@ -577,9 +648,9 @@
 
   // Live/working channels only, optionally narrowed by the picker search box.
   function pickerChannels() {
-    var base = channels.filter(passesHealth);
+    let base = channels.filter(passesHealth);
     if (pickerSearch) {
-      var q = pickerSearch.toLowerCase();
+      const q = pickerSearch.toLowerCase();
       base = base.filter(function (ch) {
         return ch.name.toLowerCase().indexOf(q) !== -1 || ch.group.toLowerCase().indexOf(q) !== -1;
       });
@@ -588,19 +659,19 @@
   }
 
   function renderPicker() {
-    var matches = pickerChannels();
+    const matches = pickerChannels();
     els.pickerList.innerHTML = '';
-    var frag = document.createDocumentFragment();
+    const frag = document.createDocumentFragment();
     matches.slice(0, RENDER_CAP).forEach(function (ch) {
       frag.appendChild(makeChannelButton(ch, function () {
-        var target = pickerTarget;
+        const target = pickerTarget;
         closePicker();
         assignChannel(target, ch);
       }));
     });
     els.pickerList.appendChild(frag);
     els.pickerList.scrollTop = 0;
-    var n = matches.length;
+    const n = matches.length;
     els.pickerCount.textContent = channelsLoading ? 'Loading…'
       : n === 0 ? (sourceRefreshing ? 'Fetching channels…' : (healthOn ? 'No working channels found yet — health check may still be running' : 'No channels found'))
       : n > RENDER_CAP ? ('Showing first ' + RENDER_CAP + ' of ' + n + ' — search to narrow')
@@ -608,7 +679,7 @@
   }
 
   els.pickerClose.addEventListener('click', closePicker);
-  var pickerDebounce = null;
+  let pickerDebounce = null;
   els.pickerSearch.addEventListener('input', function () {
     els.pickerSearchClear.hidden = !els.pickerSearch.value;
     if (pickerDebounce) clearTimeout(pickerDebounce);
@@ -620,13 +691,13 @@
 
   // ── Browse drawers (floating sidebars) ───────────────────────────────────
   function targetCellForBrowse() {
-    for (var i = 0; i < cells.length; i++) { if (!cells[i].channel) return i; }
+    for (let i = 0; i < cells.length; i++) { if (!cells[i].channel) return i; }
     return audioCell >= 0 ? audioCell : 0;
   }
 
   function openDrawer(which) {
-    var drawer = which === 'left' ? els.categorySidebar : els.sidebar;
-    var other = which === 'left' ? els.sidebar : els.categorySidebar;
+    const drawer = which === 'left' ? els.categorySidebar : els.sidebar;
+    const other = which === 'left' ? els.sidebar : els.categorySidebar;
     other.classList.remove('open');
     drawer.hidden = false; // first open: leave display:flex from here on (slides via .open)
     els.scrim.hidden = false;
@@ -641,7 +712,7 @@
     maybeHideScrim();
   }
   function maybeHideScrim() {
-    var anyOpen = els.categorySidebar.classList.contains('open') ||
+    const anyOpen = els.categorySidebar.classList.contains('open') ||
                   els.sidebar.classList.contains('open') || !els.picker.hidden;
     els.scrim.hidden = !anyOpen;
   }
@@ -654,25 +725,25 @@
   });
 
   // Selecting a channel from a browse drawer drops it into the next empty cell
-  // (or the audio cell) and closes the drawer.
+  // (or the audio cell). The drawer stays open so several channels can be
+  // picked in a row; it only closes via the close button or a click outside.
   function browseSelect(ch) {
-    var idx = targetCellForBrowse();
-    closeDrawers();
+    const idx = targetCellForBrowse();
     assignChannel(idx, ch);
   }
 
   // ── Browse list rendering (shared by both drawers) ───────────────────────
   function makeChannelButton(ch, onClick) {
-    var btn = document.createElement('button');
+    const btn = document.createElement('button');
     btn.className = 'channel-item' + (isActive(ch) ? ' selected' : '') + (isDead(ch) ? ' dead' : '');
     btn.dataset.id = ch.id;
     btn.appendChild(logoOrFallback(ch, 'channel-logo', 'channel-logo-fallback'));
-    var name = document.createElement('span');
+    const name = document.createElement('span');
     name.className = 'channel-name';
     name.textContent = ch.name;
     btn.appendChild(name);
     // Pin toggle (a span, not a button — a <button> can't nest in a <button>).
-    var pin = document.createElement('span');
+    const pin = document.createElement('span');
     pin.className = 'pin-btn' + (isFav(ch) ? ' faved' : '');
     pin.dataset.favkey = favKey(ch);
     pin.setAttribute('role', 'button');
@@ -690,11 +761,11 @@
   }
 
   function logoOrFallback(ch, imgClass, fbClass) {
-    var fallback = document.createElement('div');
+    const fallback = document.createElement('div');
     fallback.className = fbClass;
     fallback.textContent = ch.name.slice(0, 2).toUpperCase();
     if (!ch.logo) return fallback;
-    var img = document.createElement('img');
+    const img = document.createElement('img');
     img.className = imgClass;
     img.src = ch.logo;
     img.alt = ch.name;
@@ -703,14 +774,14 @@
     return img;
   }
 
-  var RENDER_CAP = 500;
-  var expandedGroups = {};
-  var lastRenderedSearch = null;
+  const RENDER_CAP = 500;
+  const expandedGroups = {};
+  let lastRenderedSearch = null;
 
   function filteredChannels() {
-    var base = channels;
+    let base = channels;
     if (search) {
-      var q = search.toLowerCase();
+      const q = search.toLowerCase();
       base = channels.filter(function (ch) {
         return ch.name.toLowerCase().indexOf(q) !== -1 || ch.group.toLowerCase().indexOf(q) !== -1;
       });
@@ -720,15 +791,15 @@
   }
 
   function renderChannelList() {
-    var matches = filteredChannels();
-    var keepScroll = els.channelList.scrollTop;
+    const matches = filteredChannels();
+    const keepScroll = els.channelList.scrollTop;
     Array.prototype.slice.call(els.channelList.querySelectorAll('.channel-item, .group-section')).forEach(function (n) { n.remove(); });
 
-    var awaitingFirstList = sourceRefreshing && channels.length === 0;
+    const awaitingFirstList = sourceRefreshing && channels.length === 0;
     els.listLoading.hidden = !(channelsLoading || awaitingFirstList);
     els.emptyState.hidden = channelsLoading || awaitingFirstList || matches.length !== 0;
 
-    var frag = document.createDocumentFragment();
+    const frag = document.createDocumentFragment();
 
     if (search) {
       matches.slice(0, RENDER_CAP).forEach(function (ch) { frag.appendChild(makeChannelButton(ch, browseSelect)); });
@@ -742,23 +813,23 @@
       return;
     }
 
-    var byGroup = {};
-    var groupNames = [];
+    const byGroup = {};
+    const groupNames = [];
     matches.forEach(function (ch) {
-      var g = ch.group || 'Other';
+      const g = ch.group || 'Other';
       if (!byGroup[g]) { byGroup[g] = []; groupNames.push(g); }
       byGroup[g].push(ch);
     });
     groupNames.sort(function (a, b) { a = a.toLowerCase(); b = b.toLowerCase(); return a < b ? -1 : a > b ? 1 : 0; });
 
     groupNames.forEach(function (g) {
-      var section = document.createElement('div');
+      const section = document.createElement('div');
       section.className = 'group-section';
-      var head = document.createElement('button');
+      const head = document.createElement('button');
       head.className = 'group-header' + (expandedGroups[g] ? ' open' : '');
-      var caret = document.createElement('span'); caret.className = 'group-caret'; caret.textContent = '▸';
-      var title = document.createElement('span'); title.className = 'group-title'; title.textContent = countryLabel(g);
-      var count = document.createElement('span'); count.className = 'group-count'; count.textContent = String(byGroup[g].length);
+      const caret = document.createElement('span'); caret.className = 'group-caret'; caret.textContent = '▸';
+      const title = document.createElement('span'); title.className = 'group-title'; title.textContent = countryLabel(g);
+      const count = document.createElement('span'); count.className = 'group-count'; count.textContent = String(byGroup[g].length);
       head.appendChild(caret); head.appendChild(title); head.appendChild(count);
       head.addEventListener('click', function () { expandedGroups[g] = !expandedGroups[g]; renderChannelList(); });
       section.appendChild(head);
@@ -769,34 +840,34 @@
     els.channelList.appendChild(frag);
     els.channelList.scrollTop = keepScroll;
     lastRenderedSearch = '';
-    var shown = healthOn ? matches.length : channels.length;
+    const shown = healthOn ? matches.length : channels.length;
     els.channelCount.textContent = channelsLoading ? ''
       : shown + (healthOn ? ' working' : ' channels') + ' · ' + groupNames.length + ' countries';
   }
 
-  var CATEGORY_ORDER = ['News', 'Sports', 'Movies', 'Music', 'Kids', 'Religious', 'Entertainment'];
-  var expandedCats = {};
-  var favOpen = true; // Favourites section starts expanded
+  const CATEGORY_ORDER = ['News', 'Sports', 'Movies', 'Music', 'Kids', 'Religious', 'Entertainment'];
+  const expandedCats = {};
+  let favOpen = true; // Favourites section starts expanded
 
   // Builds the always-present "Favourites" section for the top of the category
   // sidebar. Pinned channels bypass the health filter (the user chose them).
   function buildFavSection() {
-    var favList = channels.filter(isFav);
-    var section = document.createElement('div');
+    const favList = channels.filter(isFav);
+    const section = document.createElement('div');
     section.className = 'group-section fav-section';
 
-    var head = document.createElement('button');
+    const head = document.createElement('button');
     head.className = 'group-header' + (favOpen ? ' open' : '');
-    var caret = document.createElement('span'); caret.className = 'group-caret'; caret.textContent = '▸';
-    var title = document.createElement('span'); title.className = 'group-title'; title.textContent = '★ Favourites';
-    var count = document.createElement('span'); count.className = 'group-count'; count.textContent = String(favList.length);
+    const caret = document.createElement('span'); caret.className = 'group-caret'; caret.textContent = '▸';
+    const title = document.createElement('span'); title.className = 'group-title'; title.textContent = '★ Favourites';
+    const count = document.createElement('span'); count.className = 'group-count'; count.textContent = String(favList.length);
     head.appendChild(caret); head.appendChild(title); head.appendChild(count);
     head.addEventListener('click', function () { favOpen = !favOpen; renderCategorySidebar(); });
     section.appendChild(head);
 
     if (favOpen) {
       if (favList.length === 0) {
-        var hint = document.createElement('div');
+        const hint = document.createElement('div');
         hint.className = 'group-more';
         hint.textContent = 'No favourites yet — tap the pin on any channel to add it here.';
         section.appendChild(hint);
@@ -808,38 +879,38 @@
   }
 
   function renderCategorySidebar() {
-    var keepScroll = els.categoryList.scrollTop;
+    const keepScroll = els.categoryList.scrollTop;
     Array.prototype.slice.call(els.categoryList.querySelectorAll('.channel-item, .group-section')).forEach(function (n) { n.remove(); });
-    var awaitingFirstList = sourceRefreshing && channels.length === 0;
+    const awaitingFirstList = sourceRefreshing && channels.length === 0;
     els.catLoading.hidden = !(channelsLoading || awaitingFirstList);
     if (channelsLoading || awaitingFirstList) return;
 
-    var byCat = {};
+    const byCat = {};
     channels.forEach(function (ch) {
       if (!passesHealth(ch)) return;
-      var t = ch.type || 'Entertainment';
+      const t = ch.type || 'Entertainment';
       (byCat[t] || (byCat[t] = [])).push(ch);
     });
 
-    var frag = document.createDocumentFragment();
+    const frag = document.createDocumentFragment();
     frag.appendChild(buildFavSection()); // always first
     CATEGORY_ORDER.forEach(function (cat) {
-      var list = byCat[cat];
+      const list = byCat[cat];
       if (!list || list.length === 0) return;
-      var section = document.createElement('div');
+      const section = document.createElement('div');
       section.className = 'group-section';
-      var head = document.createElement('button');
+      const head = document.createElement('button');
       head.className = 'group-header' + (expandedCats[cat] ? ' open' : '');
-      var caret = document.createElement('span'); caret.className = 'group-caret'; caret.textContent = '▸';
-      var title = document.createElement('span'); title.className = 'group-title'; title.textContent = cat;
-      var count = document.createElement('span'); count.className = 'group-count'; count.textContent = String(list.length);
+      const caret = document.createElement('span'); caret.className = 'group-caret'; caret.textContent = '▸';
+      const title = document.createElement('span'); title.className = 'group-title'; title.textContent = cat;
+      const count = document.createElement('span'); count.className = 'group-count'; count.textContent = String(list.length);
       head.appendChild(caret); head.appendChild(title); head.appendChild(count);
       head.addEventListener('click', function () { expandedCats[cat] = !expandedCats[cat]; renderCategorySidebar(); });
       section.appendChild(head);
       if (expandedCats[cat]) {
         list.slice(0, RENDER_CAP).forEach(function (ch) { section.appendChild(makeChannelButton(ch, browseSelect)); });
         if (list.length > RENDER_CAP) {
-          var more = document.createElement('div');
+          const more = document.createElement('div');
           more.className = 'group-more';
           more.textContent = 'Showing first ' + RENDER_CAP + ' of ' + list.length + ' — search on the right to narrow';
           section.appendChild(more);
@@ -854,7 +925,7 @@
 
   // Re-highlight active channels in the browse lists without rebuilding them.
   function refreshHighlights() {
-    var ids = activeIds();
+    const ids = activeIds();
     Array.prototype.slice.call(document.querySelectorAll('.channel-item')).forEach(function (btn) {
       btn.classList.toggle('selected', ids[btn.dataset.id] === true);
     });
@@ -867,7 +938,7 @@
     els.searchClear.hidden = !value;
     renderChannelList();
   }
-  var searchDebounce = null;
+  let searchDebounce = null;
   els.search.addEventListener('input', function () {
     if (searchDebounce) clearTimeout(searchDebounce);
     searchDebounce = setTimeout(function () { setSearch(els.search.value); }, 150);
@@ -877,26 +948,14 @@
 
   // ── Keyboard shortcuts ───────────────────────────────────────────────────
   window.addEventListener('keydown', function (e) {
-    var inInput = document.activeElement && document.activeElement.tagName === 'INPUT';
+    const inInput = document.activeElement && document.activeElement.tagName === 'INPUT';
     if (e.key === 'Escape') { closeDrawers(); closePicker(); }
     if (e.key === '/' && !inInput) { e.preventDefault(); openDrawer('right'); setTimeout(function () { els.search.focus(); }, 0); }
   });
 
-  // ── Share ────────────────────────────────────────────────────────────────
-  els.shareBtn.addEventListener('click', function () {
-    var url = location.href;
-    if (navigator.share) { navigator.share({ title: 'LiveTV', url: url }).catch(function () {}); return; }
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(url).then(function () {
-        els.shareBtn.classList.add('copied');
-        setTimeout(function () { els.shareBtn.classList.remove('copied'); }, 1500);
-      }).catch(function () {});
-    }
-  });
-  els.signInBtn.addEventListener('click', function () { /* auth not wired yet */ });
 
   // ── Heartbeat (reports the audio cell's channel) ─────────────────────────
-  var sessionId = sessionStorage.getItem('livetv_sid');
+  let sessionId = sessionStorage.getItem('livetv_sid');
   if (!sessionId) {
     sessionId = Math.random().toString(36).slice(2) + Date.now().toString(36);
     sessionStorage.setItem('livetv_sid', sessionId);
@@ -904,7 +963,7 @@
 
   function watchedChannelId() {
     if (audioCell >= 0 && cells[audioCell] && cells[audioCell].channel) return cells[audioCell].channel.id;
-    for (var i = 0; i < cells.length; i++) { if (cells[i].channel) return cells[i].channel.id; }
+    for (let i = 0; i < cells.length; i++) { if (cells[i].channel) return cells[i].channel.id; }
     return null;
   }
 
@@ -917,7 +976,7 @@
       .then(function (r) { return r.json(); })
       .then(function (d) {
         if (d.top && d.top.length > 0) {
-          var ids = d.top.map(function (x) { return x.id; });
+          const ids = d.top.map(function (x) { return x.id; });
           if (ids.join(',') !== topChannelIds.join(',')) topChannelIds = ids;
         }
       })
@@ -932,7 +991,7 @@
   }
 
   function updateHealthStatus() {
-    var el = els.healthStatus;
+    const el = els.healthStatus;
     if (!healthOn) { el.hidden = true; el.textContent = ''; }
     else {
       el.hidden = false;
@@ -944,13 +1003,13 @@
   }
 
   function updateHealthOverlay() {
-    var show = healthOn && healthProbing && !healthOverlayDismissed;
+    const show = healthOn && healthProbing && !healthOverlayDismissed;
     els.healthOverlay.hidden = !show;
     if (!show) return;
     els.healthOverlayProgress.textContent = healthTotal
       ? healthDone + ' / ' + healthTotal + ' checked · ' + countAlive() + ' live'
       : 'Starting…';
-    var pct = healthTotal ? Math.round((healthDone / healthTotal) * 100) : 0;
+    const pct = healthTotal ? Math.round((healthDone / healthTotal) * 100) : 0;
     els.healthOverlayFill.style.width = pct + '%';
   }
 
@@ -958,7 +1017,7 @@
     if (!snap) return;
     healthDone = snap.done || 0;
     healthTotal = snap.total || 0;
-    if (snap.status) { for (var id in snap.status) { health[id] = snap.status[id]; } }
+    if (snap.status) { for (const id in snap.status) { health[id] = snap.status[id]; } }
     healthProbing = !!snap.running;
     if (!snap.running) stopHealthPolling();
     if (healthOn) renderHealthLists();
@@ -985,7 +1044,7 @@
     fetch('/api/health')
       .then(function (r) { return r.json(); })
       .then(function (snap) {
-        var hit = snap && snap.finished && !snap.running &&
+        const hit = snap && snap.finished && !snap.running &&
                   snap.etag && snap.etag === channelsEtag &&
                   snap.status && Object.keys(snap.status).length > 0;
         if (hit) {
@@ -1017,7 +1076,7 @@
 
   // ── Sync ─────────────────────────────────────────────────────────────────
   els.syncBtn.addEventListener('click', function () {
-    var btn = els.syncBtn;
+    const btn = els.syncBtn;
     btn.disabled = true; btn.textContent = 'Syncing…';
     fetch('/api/sync', { method: 'POST' })
       .then(function (r) { if (!r.ok) throw new Error('sync failed: ' + r.status); return r.json(); })
@@ -1030,8 +1089,8 @@
 
   // ── Source refresh (API → list.m3u) ──────────────────────────────────────
   function setLoadingText(text) {
-    var a = els.listLoading.querySelector('span');
-    var b = els.catLoading.querySelector('span');
+    const a = els.listLoading.querySelector('span');
+    const b = els.catLoading.querySelector('span');
     if (a) a.textContent = text;
     if (b) b.textContent = text;
   }
@@ -1039,7 +1098,7 @@
     fetch('/api/source')
       .then(function (r) { return r.json(); })
       .then(function (d) {
-        var was = sourceRefreshing;
+        const was = sourceRefreshing;
         sourceRefreshing = !!d.refreshing;
         if (sourceRefreshing && channels.length === 0) {
           setLoadingText('Fetching channels from iptv-org…');
@@ -1077,19 +1136,20 @@
   }
 
   function restoreAudioPrefs() {
-    var v = parseInt(localStorage.getItem('livetv_volume'), 10);
+    const v = parseInt(localStorage.getItem('livetv_volume'), 10);
     if (!isNaN(v)) volume = Math.max(0, Math.min(1, v / 100));
     globalMuted = localStorage.getItem('livetv_muted') === '1';
     els.volume.value = String(Math.round(volume * 100));
+    applyVolumeFill();
   }
 
   function init() {
     restoreAudioPrefs();
 
     // Start with the persisted grid size (default 1).
-    var saved = parseInt(localStorage.getItem('livetv_grid'), 10);
-    var count = (!isNaN(saved) && saved >= 1 && saved <= MAX_CELLS) ? saved : 1;
-    for (var i = 0; i < count; i++) addCell();
+    const saved = parseInt(localStorage.getItem('livetv_grid'), 10);
+    const count = (!isNaN(saved) && saved >= 1 && saved <= MAX_CELLS) ? saved : 1;
+    for (let i = 0; i < count; i++) addCell();
     updatePickLabels();
 
     els.healthToggle.classList.toggle('on', healthOn);

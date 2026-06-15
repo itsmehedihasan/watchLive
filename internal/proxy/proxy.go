@@ -30,7 +30,11 @@ var browserHeaders = map[string]string{
 	"Accept-Language": "en-US,en;q=0.9",
 }
 
-var m3u8URLRe = regexp.MustCompile(`(?i)\.m3u8(\?|$)`)
+var (
+	m3u8URLRe = regexp.MustCompile(`(?i)\.m3u8(\?|$)`)
+	mpdURLRe  = regexp.MustCompile(`(?i)\.mpd(\?|$)`)
+	tsURLRe   = regexp.MustCompile(`(?i)\.ts(\?|$)`)
+)
 
 // fetchResult is the outcome of one upstream fetch, shared between
 // single-flight waiters.
@@ -49,8 +53,12 @@ type inflightCall struct {
 
 // Handler serves GET /api/proxy?url=<upstream>.
 type Handler struct {
-	client   *http.Client
-	segments *lruCache
+	client *http.Client
+	// streamClient has no overall timeout: it serves continuous live streams
+	// (raw MPEG-TS channels) that never end. The request context cancels it
+	// when the browser disconnects.
+	streamClient *http.Client
+	segments     *lruCache
 	// playlists caches *rewritten* playlist bodies; rewriting is
 	// deterministic for a given URL so caching post-rewrite is safe.
 	playlists *lruCache
@@ -65,18 +73,20 @@ func New(cacheBytes int64) *Handler {
 	if perItem > 32<<20 {
 		perItem = 32 << 20
 	}
+	transport := &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 16,
+		IdleConnTimeout:     90 * time.Second,
+	}
 	return &Handler{
 		client: &http.Client{
-			Timeout: upstreamLimit,
-			Transport: &http.Transport{
-				MaxIdleConns:        100,
-				MaxIdleConnsPerHost: 16,
-				IdleConnTimeout:     90 * time.Second,
-			},
+			Timeout:   upstreamLimit,
+			Transport: transport,
 		},
-		segments:  newLRUCache(cacheBytes, perItem),
-		playlists: newLRUCache(16<<20, maxPlaylistLen),
-		inflight:  make(map[string]*inflightCall),
+		streamClient: &http.Client{Transport: transport},
+		segments:     newLRUCache(cacheBytes, perItem),
+		playlists:    newLRUCache(16<<20, maxPlaylistLen),
+		inflight:     make(map[string]*inflightCall),
 	}
 }
 
@@ -98,8 +108,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Fast path: serve from cache.
-	if body, _, ok := h.playlists.get(target); ok {
-		writePlaylistHeaders(w.Header())
+	if body, ct, ok := h.playlists.get(target); ok {
+		writePlaylistHeaders(w.Header(), ct)
 		w.Header().Set("X-Cache", "HIT")
 		w.WriteHeader(http.StatusOK)
 		w.Write(body)
@@ -110,6 +120,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Cache", "HIT")
 		w.WriteHeader(http.StatusOK)
 		w.Write(body)
+		return
+	}
+
+	// Raw MPEG-TS URLs may be continuous live streams that never end; the
+	// buffered/single-flight path would hang on io.ReadAll. serveTS streams
+	// these straight through, and still buffers+caches finite .ts segments
+	// (the common HLS case) so repeat fetches stay cheap.
+	if tsURLRe.MatchString(target) {
+		h.serveTS(w, r, target)
 		return
 	}
 
@@ -124,7 +143,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if res.isPlaylist {
-		writePlaylistHeaders(w.Header())
+		writePlaylistHeaders(w.Header(), res.contentType)
 	} else {
 		writeSegmentHeaders(w.Header(), res.contentType)
 	}
@@ -156,12 +175,9 @@ func (h *Handler) fetchShared(target string) fetchResult {
 	return call.res
 }
 
-// fetchUpstream performs the actual upstream request and populates the caches.
-func (h *Handler) fetchUpstream(target string) fetchResult {
-	req, err := http.NewRequest(http.MethodGet, target, nil)
-	if err != nil {
-		return fetchResult{err: err}
-	}
+// applyBrowserHeaders spoofs a real browser and sets a same-origin Referer/Origin
+// so stream servers don't block the request.
+func applyBrowserHeaders(req *http.Request, target string) {
 	for k, v := range browserHeaders {
 		req.Header.Set(k, v)
 	}
@@ -170,6 +186,15 @@ func (h *Handler) fetchUpstream(target string) fetchResult {
 		req.Header.Set("Referer", origin+"/")
 		req.Header.Set("Origin", origin)
 	}
+}
+
+// fetchUpstream performs the actual upstream request and populates the caches.
+func (h *Handler) fetchUpstream(target string) fetchResult {
+	req, err := http.NewRequest(http.MethodGet, target, nil)
+	if err != nil {
+		return fetchResult{err: err}
+	}
+	applyBrowserHeaders(req, target)
 
 	resp, err := h.client.Do(req)
 	if err != nil {
@@ -184,11 +209,12 @@ func (h *Handler) fetchUpstream(target string) fetchResult {
 	}
 
 	contentType := resp.Header.Get("Content-Type")
-	isPlaylist := strings.Contains(contentType, "mpegurl") ||
+	isHLS := strings.Contains(contentType, "mpegurl") ||
 		strings.Contains(contentType, "m3u8") ||
 		m3u8URLRe.MatchString(target)
+	isDASH := strings.Contains(contentType, "dash+xml") || mpdURLRe.MatchString(target)
 
-	if isPlaylist {
+	if isHLS {
 		body, err := io.ReadAll(io.LimitReader(resp.Body, maxPlaylistLen))
 		if err != nil {
 			return fetchResult{err: err}
@@ -196,6 +222,23 @@ func (h *Handler) fetchUpstream(target string) fetchResult {
 		rewritten := []byte(RewritePlaylist(string(body), target))
 		h.playlists.set(target, rewritten, "application/vnd.apple.mpegurl", playlistTTL)
 		return fetchResult{data: rewritten, contentType: "application/vnd.apple.mpegurl", status: resp.StatusCode, isPlaylist: true}
+	}
+
+	if isDASH {
+		// DASH manifests are NOT rewritten — the Shaka client routes every
+		// segment request back through this proxy via a request filter, so the
+		// manifest's relative URLs must stay intact. Short TTL keeps the live
+		// manifest fresh.
+		body, err := io.ReadAll(io.LimitReader(resp.Body, maxPlaylistLen))
+		if err != nil {
+			return fetchResult{err: err}
+		}
+		ct := contentType
+		if ct == "" {
+			ct = "application/dash+xml"
+		}
+		h.playlists.set(target, body, ct, playlistTTL)
+		return fetchResult{data: body, contentType: ct, status: resp.StatusCode, isPlaylist: true}
 	}
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, h.segments.maxItem+1))
@@ -206,6 +249,73 @@ func (h *Handler) fetchUpstream(target string) fetchResult {
 		h.segments.set(target, body, contentType, segmentTTL)
 	}
 	return fetchResult{data: body, contentType: contentType, status: resp.StatusCode}
+}
+
+// serveTS handles .ts URLs. A finite body (Content-Length set — the typical HLS
+// segment) is buffered and cached like any other segment. A body of unknown
+// length is a continuous live MPEG-TS channel: it is streamed straight to the
+// client with periodic flushing, bypassing the cache and single-flight (those
+// assume a finite, shareable body — a live stream is neither).
+func (h *Handler) serveTS(w http.ResponseWriter, r *http.Request, target string) {
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, target, nil)
+	if err != nil {
+		http.Error(w, "Proxy fetch failed", http.StatusBadGateway)
+		return
+	}
+	applyBrowserHeaders(req, target)
+
+	resp, err := h.streamClient.Do(req)
+	if err != nil {
+		http.Error(w, "Proxy fetch failed", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		io.CopyN(io.Discard, resp.Body, 4096)
+		http.Error(w, fmt.Sprintf("Upstream returned %d", resp.StatusCode), resp.StatusCode)
+		return
+	}
+
+	contentType := resp.Header.Get("Content-Type")
+
+	// Finite segment: buffer, cache, serve — same behavior as fetchUpstream.
+	if resp.ContentLength >= 0 && resp.ContentLength <= h.segments.maxItem {
+		body, err := io.ReadAll(io.LimitReader(resp.Body, h.segments.maxItem+1))
+		if err != nil {
+			http.Error(w, "Proxy fetch failed", http.StatusBadGateway)
+			return
+		}
+		if int64(len(body)) <= h.segments.maxItem {
+			h.segments.set(target, body, contentType, segmentTTL)
+		}
+		writeSegmentHeaders(w.Header(), contentType)
+		w.Header().Set("X-Cache", "MISS")
+		w.WriteHeader(http.StatusOK)
+		w.Write(body)
+		return
+	}
+
+	// Continuous live stream: stream through, flushing as bytes arrive.
+	writeSegmentHeaders(w.Header(), contentType)
+	w.Header().Set("X-Cache", "STREAM")
+	w.WriteHeader(http.StatusOK)
+	flusher, _ := w.(http.Flusher)
+	buf := make([]byte, 64<<10)
+	for {
+		n, rerr := resp.Body.Read(buf)
+		if n > 0 {
+			if _, werr := w.Write(buf[:n]); werr != nil {
+				return
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+		if rerr != nil {
+			return
+		}
+	}
 }
 
 // RewritePlaylist rewrites every URL inside an M3U8 playlist (segment lines,
@@ -272,9 +382,12 @@ func writeCORS(h http.Header) {
 	h.Set("Access-Control-Allow-Headers", "*")
 }
 
-func writePlaylistHeaders(h http.Header) {
+func writePlaylistHeaders(h http.Header, contentType string) {
 	writeCORS(h)
-	h.Set("Content-Type", "application/vnd.apple.mpegurl")
+	if contentType == "" {
+		contentType = "application/vnd.apple.mpegurl"
+	}
+	h.Set("Content-Type", contentType)
 	h.Set("Cache-Control", "no-cache, no-store")
 }
 

@@ -1,6 +1,6 @@
 /* LiveTV service worker — app-shell cache with network-first for API routes. */
 
-var CACHE = 'livetv-shell-v1';
+var CACHE = 'livetv-shell-v2';
 
 // Static assets that form the app shell.  sw.js itself is not listed — the
 // browser always fetches it fresh from the network for update detection.
@@ -9,6 +9,8 @@ var SHELL = [
   '/static/style.css',
   '/static/app.js',
   '/static/hls.min.js',
+  '/static/shaka-player.compiled.js',
+  '/static/mpegts.js',
   '/static/icon-192.svg',
   '/static/icon-512.svg',
   '/static/manifest.json'
