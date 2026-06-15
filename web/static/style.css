@@ -261,6 +261,25 @@ input { font-family: inherit; }
   &.active { color: var(--blue-light); border-color: var(--blue-light); background: rgba(37, 99, 235, .25); }
 }
 
+/* Play / pause — top-left, beside the mic */
+.cell-play {
+  position: absolute; top: 8px; left: 44px; z-index: 20;
+  display: flex; align-items: center; justify-content: center;
+  width: 30px; height: 30px; border-radius: 8px;
+  color: #cfd6e4;
+  background: rgba(0, 0, 0, .55);
+  border: 1px solid transparent;
+  -webkit-backdrop-filter: blur(4px); backdrop-filter: blur(4px);
+  transition: all .15s;
+
+  &:hover { background: rgba(0, 0, 0, .8); color: #fff; }
+
+  /* Show the play glyph by default; swap to pause while playing. */
+  & .ico-pause { display: none; }
+  &.playing .ico-play { display: none; }
+  &.playing .ico-pause { display: block; }
+}
+
 /* Channel name label — top-right, fades with hover */
 .cell-label {
   position: absolute; top: 8px; right: 8px; z-index: 20;
@@ -293,6 +312,41 @@ input { font-family: inherit; }
 
   &:hover { background: rgba(0, 0, 0, .9); color: #fff; }
 }
+
+/* Keep the controls (incl. the gear) visible while its popover is open. */
+.cell.settings-open .cell-controls { opacity: 1; }
+
+/* ── Per-cell settings popover (quality + server) ───────────── */
+.cell-settings {
+  position: absolute; bottom: 46px; left: 50%; transform: translateX(-50%);
+  z-index: 25;
+  min-width: 150px; max-width: calc(100% - 24px);
+  max-height: calc(100% - 80px); overflow-y: auto;
+  display: flex; flex-direction: column; gap: 10px;
+  padding: 10px 11px;
+  background: rgba(10, 13, 20, .96);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 12px 30px rgba(0, 0, 0, .55);
+  -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px);
+}
+.cell-settings-section { display: flex; flex-direction: column; gap: 6px; }
+.cell-settings-label {
+  font-size: 10px; font-weight: 700; letter-spacing: .1em;
+  text-transform: uppercase; color: var(--muted);
+}
+.cell-settings-opts { display: flex; flex-wrap: wrap; gap: 5px; }
+.cell-settings-opt {
+  padding: 4px 9px; border-radius: 6px;
+  font-size: 12px; font-weight: 600; color: #cfd6e4;
+  background: var(--input-bg); border: 1px solid var(--border);
+  white-space: nowrap;
+  transition: color .15s, background .15s, border-color .15s;
+
+  &:hover { color: #fff; background: #1d2433; border-color: #2a3346; }
+  &.active { background: var(--blue); border-color: var(--blue-light); color: #fff; }
+}
+.cell-settings-empty { font-size: 12px; color: var(--muted); }
 
 /* ── Floating scrim ─────────────────────────────────────────── */
 .scrim {

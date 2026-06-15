@@ -258,6 +258,21 @@
     mic.addEventListener('click', function () { setAudioCell(cell.idx); });
     stage.appendChild(mic);
 
+    // Play / pause — top-left, beside the mic
+    const play = document.createElement('button');
+    play.className = 'cell-play';
+    play.title = 'Play / pause';
+    play.innerHTML =
+      '<svg class="ico-play" width="16" height="16" fill="currentColor" stroke="none" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>' +
+      '<svg class="ico-pause" width="16" height="16" fill="currentColor" stroke="none" viewBox="0 0 24 24"><rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/></svg>';
+    play.addEventListener('click', function () {
+      if (cell.video.paused) cell.video.play().catch(function () {});
+      else cell.video.pause();
+    });
+    video.addEventListener('play', function () { updatePlayIcon(cell); });
+    video.addEventListener('pause', function () { updatePlayIcon(cell); });
+    stage.appendChild(play);
+
     // Channel name label
     const label = document.createElement('div');
     label.className = 'cell-label';
@@ -266,6 +281,11 @@
     // Hover controls — bottom center
     const controls = document.createElement('div');
     controls.className = 'cell-controls';
+    const gear = document.createElement('button');
+    gear.className = 'cell-ctl cell-gear';
+    gear.title = 'Settings — quality & server';
+    gear.innerHTML = '<svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 11-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 11-2.83-2.83l.06-.06a1.65 1.65 0 00.33-1.82 1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 112.83-2.83l.06.06a1.65 1.65 0 001.82.33H9a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 112.83 2.83l-.06.06a1.65 1.65 0 00-.33 1.82V9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg>';
+    gear.addEventListener('click', function (e) { e.stopPropagation(); toggleCellSettings(cell); });
     const expand = document.createElement('button');
     expand.className = 'cell-ctl';
     expand.title = 'Expand (fullscreen)';
@@ -276,9 +296,17 @@
     close.title = 'Close this screen';
     close.innerHTML = '<svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
     close.addEventListener('click', function () { clearCell(cell); });
+    controls.appendChild(gear);
     controls.appendChild(expand);
     controls.appendChild(close);
     stage.appendChild(controls);
+
+    // Settings popover (quality + server) — toggled by the gear, content built lazily.
+    const settings = document.createElement('div');
+    settings.className = 'cell-settings';
+    settings.hidden = true;
+    settings.addEventListener('click', function (e) { e.stopPropagation(); });
+    stage.appendChild(settings);
 
     root.appendChild(stage);
 
@@ -297,13 +325,20 @@
 
     cell.root = root;
     cell.video = video;
-    cell.els = { stage: stage, empty: empty, loading: loading, error: error, mic: mic, label: label, pickLabel: pick.querySelector('.cell-pick-label') };
+    cell.els = { stage: stage, empty: empty, loading: loading, error: error, mic: mic, play: play, label: label, settings: settings, pickLabel: pick.querySelector('.cell-pick-label') };
     return cell;
   }
 
   function setCellState(cell, state) {
     cell.els.loading.hidden = state !== 'loading';
     cell.els.error.hidden = state !== 'error';
+  }
+
+  // Swap the play/pause glyph to match the <video>'s state. Driven by a class
+  // (CSS display) rather than the `hidden` attribute — `hidden` is an
+  // HTMLElement property and doesn't reflect onto SVG child elements.
+  function updatePlayIcon(cell) {
+    cell.els.play.classList.toggle('playing', !cell.video.paused);
   }
 
   // ── Per-cell playback ────────────────────────────────────────────────────
@@ -368,6 +403,7 @@
     setCellState(cell, 'playing');
     if (cell.channel) setDead(cell.channel, false);
     playCell(cell);
+    updatePlayIcon(cell);
   }
 
   // ── HLS (.m3u8) — Hls.js with native-HLS fallback ──
@@ -390,7 +426,8 @@
       h.loadSource(proxyUrl(server.url));
       h.attachMedia(video);
 
-      h.once(Hls.Events.MANIFEST_PARSED, function () { onCellPlaying(cell, token); });
+      h.once(Hls.Events.MANIFEST_PARSED, function () { onCellPlaying(cell, token); refreshCellSettings(cell); });
+      h.on(Hls.Events.LEVEL_SWITCHED, function () { if (token === cell.token) refreshCellSettings(cell); });
       h.on(Hls.Events.ERROR, function (_, data) {
         if (!data.fatal || token !== cell.token) return;
         if (data.type === Hls.ErrorTypes.NETWORK_ERROR && netRecoveries < 1) {
@@ -423,9 +460,12 @@
         req.uris = req.uris.map(function (u) { return proxyUrl(u); });
       });
       player.addEventListener('error', function () { if (token === cell.token) failover(cell); });
+      player.addEventListener('adaptation', function () { if (token === cell.token) refreshCellSettings(cell); });
+      player.addEventListener('variantchanged', function () { if (token === cell.token) refreshCellSettings(cell); });
       return player.load(server.url);
     }).then(function () {
       onCellPlaying(cell, token);
+      refreshCellSettings(cell);
     }).catch(function () {
       if (token === cell.token) failover(cell);
     });
@@ -460,6 +500,142 @@
     else document.exitFullscreen();
   }
 
+  // ── Per-cell settings popover (quality + server) ──────────────────────────
+  let openSettingsCell = null;
+
+  function toggleCellSettings(cell) {
+    if (openSettingsCell === cell) { closeCellSettings(); return; }
+    closeCellSettings();
+    if (!cell.channel) return;
+    renderCellSettings(cell);
+    cell.els.settings.hidden = false;
+    cell.root.classList.add('settings-open');
+    openSettingsCell = cell;
+  }
+  function closeCellSettings() {
+    if (!openSettingsCell) return;
+    openSettingsCell.els.settings.hidden = true;
+    openSettingsCell.root.classList.remove('settings-open');
+    openSettingsCell = null;
+  }
+  // Re-render the open panel when the live stream's tracks/levels change.
+  function refreshCellSettings(cell) {
+    if (openSettingsCell === cell) renderCellSettings(cell);
+  }
+
+  // Prefer the real resolution; many IPTV manifests omit RESOLUTION and carry
+  // only BANDWIDTH, so fall back to a human-readable bitrate (Mbps/kbps).
+  function levelLabel(lv) {
+    if (lv.height) return lv.height + 'p';
+    if (lv.name) return String(lv.name);
+    if (lv.bitrate) {
+      return lv.bitrate >= 1000000
+        ? (lv.bitrate / 1000000).toFixed(1) + ' Mbps'
+        : Math.round(lv.bitrate / 1000) + ' kbps';
+    }
+    return 'Auto';
+  }
+
+  // Quality options for whichever engine is driving this cell. Returns null when
+  // there's nothing to choose (single rendition, or mpegts which has no levels).
+  function cellQuality(cell) {
+    if (cell.hls && cell.hls.levels && cell.hls.levels.length > 1) {
+      const h = cell.hls;
+      const opts = [{ value: -1, label: 'Auto' }];
+      for (let i = h.levels.length - 1; i >= 0; i--) {
+        opts.push({ value: i, label: levelLabel(h.levels[i]) });
+      }
+      return {
+        opts: opts,
+        current: h.autoLevelEnabled ? -1 : h.currentLevel,
+        set: function (v) { h.currentLevel = v; },
+      };
+    }
+    if (cell.shaka) {
+      let tracks = [];
+      try { tracks = cell.shaka.getVariantTracks() || []; } catch (e) { return null; }
+      const byHeight = {};
+      tracks.forEach(function (t) {
+        if (!t.height) return;
+        if (!byHeight[t.height] || t.bandwidth > byHeight[t.height].bandwidth) byHeight[t.height] = t;
+      });
+      const heights = Object.keys(byHeight).map(Number).sort(function (a, b) { return b - a; });
+      if (heights.length < 2) return null;
+      const opts = [{ value: -1, label: 'Auto' }];
+      heights.forEach(function (hgt) { opts.push({ value: hgt, label: hgt + 'p' }); });
+      const cfg = cell.shaka.getConfiguration();
+      const active = tracks.find(function (t) { return t.active; });
+      return {
+        opts: opts,
+        current: (cfg.abr && cfg.abr.enabled) ? -1 : (active && active.height ? active.height : -1),
+        set: function (v) {
+          if (v === -1) { cell.shaka.configure({ abr: { enabled: true } }); return; }
+          cell.shaka.configure({ abr: { enabled: false } });
+          if (byHeight[v]) cell.shaka.selectVariantTrack(byHeight[v], true);
+        },
+      };
+    }
+    return null;
+  }
+
+  function renderCellSettings(cell) {
+    const panel = cell.els.settings;
+    panel.innerHTML = '';
+    const q = cellQuality(cell);
+    const servers = (cell.channel && cell.channel.servers && cell.channel.servers.length > 1)
+      ? cell.channel.servers : null;
+
+    if (q) {
+      panel.appendChild(settingsSection('Quality', q.opts.map(function (o) {
+        return settingsOpt(o.label, o.value === q.current, function () {
+          q.set(o.value);
+          renderCellSettings(cell);
+        });
+      })));
+    }
+    if (servers) {
+      panel.appendChild(settingsSection('Server', servers.map(function (s, i) {
+        return settingsOpt(s.label || ('Server ' + (i + 1)), i === cell.serverIdx, function () {
+          if (i === cell.serverIdx) return;
+          cell.serverIdx = i;
+          cell.failedServers = {};
+          startCellPlayback(cell);
+          renderCellSettings(cell);
+        });
+      })));
+    }
+    if (!q && !servers) {
+      const empty = document.createElement('div');
+      empty.className = 'cell-settings-empty';
+      empty.textContent = 'No options available';
+      panel.appendChild(empty);
+    }
+  }
+
+  function settingsSection(title, buttons) {
+    const sec = document.createElement('div');
+    sec.className = 'cell-settings-section';
+    const head = document.createElement('div');
+    head.className = 'cell-settings-label';
+    head.textContent = title;
+    sec.appendChild(head);
+    const row = document.createElement('div');
+    row.className = 'cell-settings-opts';
+    buttons.forEach(function (b) { row.appendChild(b); });
+    sec.appendChild(row);
+    return sec;
+  }
+  function settingsOpt(label, active, onClick) {
+    const b = document.createElement('button');
+    b.className = 'cell-settings-opt' + (active ? ' active' : '');
+    b.textContent = label;
+    b.addEventListener('click', function (e) { e.stopPropagation(); onClick(); });
+    return b;
+  }
+
+  // Close the popover on any click outside it (the gear/opts stop propagation).
+  document.addEventListener('click', function () { closeCellSettings(); });
+
   // ── Channel assignment ───────────────────────────────────────────────────
   function assignChannel(cellIdx, ch) {
     const cell = cells[cellIdx];
@@ -479,6 +655,7 @@
   }
 
   function clearCell(cell) {
+    if (openSettingsCell === cell) closeCellSettings();
     destroyCellPlayer(cell);
     cell.channel = null;
     cell.root.classList.remove('filled');
@@ -600,6 +777,7 @@
   function removeCell() {
     if (cells.length <= 1) return;
     const cell = cells.pop();
+    if (openSettingsCell === cell) closeCellSettings();
     destroyCellPlayer(cell);
     if (cell.root.parentNode) cell.root.parentNode.removeChild(cell.root);
     if (audioCell >= cells.length) {
