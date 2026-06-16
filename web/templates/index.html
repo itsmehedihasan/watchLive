@@ -265,6 +265,25 @@
     </div>
   </div>
 
+  <!-- ── Import duplicate-link conflict modal ───────────────────── -->
+  <div id="importConflict" class="picker import-modal" hidden>
+    <div class="picker-panel import-panel">
+      <div class="picker-head">
+        <span class="picker-title">Duplicate links found</span>
+        <button id="importConflictClose" class="picker-close" title="Close">✕</button>
+      </div>
+      <div class="import-subhead">
+        <span id="importConflictSummary" class="import-count"></span>
+        <span class="import-hint">These links are already in your library and will be skipped.</span>
+      </div>
+      <div id="importConflictList" class="import-list"></div>
+      <div class="add-actions import-actions">
+        <button type="button" id="importConflictCancel" class="add-btn add-btn-ghost">Back</button>
+        <button type="button" id="importConflictAdd" class="add-btn add-btn-primary">Add new channels</button>
+      </div>
+    </div>
+  </div>
+
   <script src="/static/hls.min.js"></script>
   <script src="/static/shaka-player.compiled.js"></script>
   <script src="/static/mpegts.js"></script>

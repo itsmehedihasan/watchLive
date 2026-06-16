@@ -298,14 +298,62 @@ type ImportEntry struct {
 	URL  string `json:"url"`
 }
 
+// ChannelRef identifies an existing channel by a link, for the import
+// duplicate report.
+type ChannelRef struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+// URLIndex maps every stream URL currently in the catalog (across all channels'
+// servers) to the channel that owns it. Used to dedupe an import by link: a
+// link already present in the library is not added again. First owner wins on
+// the (rare) chance two channels share a URL.
+func (s *Store) URLIndex() (map[string]ChannelRef, error) {
+	rows, err := s.db.Query(`SELECT id, name, servers FROM channels`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	idx := make(map[string]ChannelRef)
+	for rows.Next() {
+		var id, name, serversJS string
+		if err := rows.Scan(&id, &name, &serversJS); err != nil {
+			return nil, err
+		}
+		if serversJS == "" {
+			continue
+		}
+		var servers []playlist.Server
+		if err := json.Unmarshal([]byte(serversJS), &servers); err != nil {
+			return nil, err
+		}
+		for _, sv := range servers {
+			if sv.URL != "" {
+				if _, ok := idx[sv.URL]; !ok {
+					idx[sv.URL] = ChannelRef{ID: id, Name: name}
+				}
+			}
+		}
+	}
+	return idx, rows.Err()
+}
+
 // ImportManual bulk-inserts reviewed playlist entries as manual channels in one
 // transaction. Like AddManual they are marked working and survive re-syncs, but
 // they are NOT auto-favourited (importing a list shouldn't flood Favourites —
-// the single "+" add does favourite, since that's a deliberate one-off). Entries
-// with an empty name or a non-http(s) URL are skipped. Idempotent per name+url.
-// Returns how many were inserted (new ids; re-imports of the same name+url
-// don't double-count).
+// the single "+" add does favourite, since that's a deliberate one-off).
+//
+// Dedupe is by LINK (exact URL), not name: an entry whose URL already exists
+// anywhere in the catalog is skipped, as is a repeated URL within the batch.
+// Entries with an empty name or a non-http(s) URL are skipped too. This makes
+// save authoritative regardless of what the client sends. Returns the count
+// actually inserted.
 func (s *Store) ImportManual(entries []ImportEntry) (added int, err error) {
+	idx, err := s.URLIndex()
+	if err != nil {
+		return 0, err
+	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		return 0, err
@@ -327,17 +375,20 @@ func (s *Store) ImportManual(entries []ImportEntry) (added int, err error) {
 	defer stmt.Close()
 
 	ts := now().Unix()
-	seen := make(map[string]bool, len(entries))
+	seenURL := make(map[string]bool, len(entries))
 	for _, e := range entries {
 		name, url := strings.TrimSpace(e.Name), strings.TrimSpace(e.URL)
 		if name == "" || !(strings.HasPrefix(url, "http://") || strings.HasPrefix(url, "https://")) {
 			continue
 		}
-		id := "manual:" + manualHash(name, url)
-		if seen[id] {
-			continue
+		if _, exists := idx[url]; exists {
+			continue // link already in the library
 		}
-		seen[id] = true
+		if seenURL[url] {
+			continue // duplicate link within this batch
+		}
+		seenURL[url] = true
+		id := "manual:" + manualHash(name, url)
 		serversJS, _ := json.Marshal([]playlist.Server{{URL: url}})
 		if _, err = stmt.Exec(id, name, manualGroup, manualType, string(serversJS), ts, strings.ToLower(name)); err != nil {
 			return 0, err

@@ -496,6 +496,49 @@ func main() {
 		writeJSON(w, r, map[string]any{"entries": out})
 	})
 
+	// Cross-check reviewed entries against the catalog by LINK (exact URL). It
+	// mutates nothing — it returns the new entries plus the duplicates (with the
+	// existing channel they collide with) so the UI can report conflicts before
+	// the user commits. Save is still authoritative (it re-dedupes by URL).
+	mux.HandleFunc("POST /api/import/check", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Entries []store.ImportEntry `json:"entries"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		idx, err := st.URLIndex()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		type duplicate struct {
+			Imported     store.ImportEntry `json:"imported"`
+			ExistingID   string            `json:"existingId"`
+			ExistingName string            `json:"existingName"`
+		}
+		newOnes := []store.ImportEntry{}
+		dups := []duplicate{}
+		seen := map[string]bool{}
+		for _, e := range body.Entries {
+			name, url := strings.TrimSpace(e.Name), strings.TrimSpace(e.URL)
+			if name == "" || !isStreamURL(url) {
+				continue
+			}
+			if ref, ok := idx[url]; ok {
+				dups = append(dups, duplicate{Imported: store.ImportEntry{Name: name, URL: url}, ExistingID: ref.ID, ExistingName: ref.Name})
+				continue
+			}
+			if seen[url] {
+				continue // repeated link within the file — keep the first only
+			}
+			seen[url] = true
+			newOnes = append(newOnes, store.ImportEntry{Name: name, URL: url})
+		}
+		writeJSON(w, r, map[string]any{"new": newOnes, "duplicates": dups})
+	})
+
 	mux.HandleFunc("POST /api/import/save", func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			Entries []store.ImportEntry `json:"entries"`

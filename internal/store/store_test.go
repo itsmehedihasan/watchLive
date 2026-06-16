@@ -269,7 +269,7 @@ func TestImportManual(t *testing.T) {
 		{Name: "Beta", URL: "https://b/1"},
 		{Name: "", URL: "http://x/1"},        // skipped: no name
 		{Name: "Bad", URL: "ftp://nope"},     // skipped: not http(s)
-		{Name: "Alpha", URL: "http://a/1"},   // dup within batch: counted once
+		{Name: "Alpha 2", URL: "http://a/1"}, // dup LINK within batch (diff name): skipped
 	})
 	if err != nil {
 		t.Fatalf("ImportManual: %v", err)
@@ -294,13 +294,45 @@ func TestImportManual(t *testing.T) {
 		}
 	}
 
-	// Re-import is idempotent (same name+url → same manual id).
-	again, _ := s.ImportManual([]ImportEntry{{Name: "Alpha", URL: "http://a/1"}})
-	if again != 1 {
-		t.Errorf("re-import added = %d, want 1 (idempotent upsert)", again)
+	// Re-import of an existing LINK is skipped (dedupe by URL against the DB),
+	// even under a different name.
+	again, _ := s.ImportManual([]ImportEntry{{Name: "Alpha Renamed", URL: "http://a/1"}})
+	if again != 0 {
+		t.Errorf("re-import of existing link added = %d, want 0", again)
 	}
 	if n, _ := s.Count(); n != 2 {
 		t.Errorf("re-import should not duplicate; count = %d, want 2", n)
+	}
+
+	// A link that collides with a FEED channel's server URL is also skipped.
+	if _, _, _, err := s.UpsertCatalog([]playlist.Channel{ch("tvg:feed", "Feed Chan", "http://feed/1")}); err != nil {
+		t.Fatalf("seed feed channel: %v", err)
+	}
+	n2, _ := s.ImportManual([]ImportEntry{
+		{Name: "Dup Of Feed", URL: "http://feed/1"}, // collides with feed → skipped
+		{Name: "Brand New", URL: "http://new/1"},     // unique → added
+	})
+	if n2 != 1 {
+		t.Errorf("import vs feed link: added = %d, want 1", n2)
+	}
+}
+
+func TestURLIndex(t *testing.T) {
+	s := open(t)
+	s.UpsertCatalog([]playlist.Channel{ch("tvg:x", "Multi", "http://x/1", "http://x/2")})
+	s.AddManual("Mine", "http://m/1")
+	idx, err := s.URLIndex()
+	if err != nil {
+		t.Fatalf("URLIndex: %v", err)
+	}
+	if idx["http://x/1"].ID != "tvg:x" || idx["http://x/2"].Name != "Multi" {
+		t.Errorf("feed server URLs not indexed: %+v", idx)
+	}
+	if _, ok := idx["http://m/1"]; !ok {
+		t.Error("manual channel URL not indexed")
+	}
+	if _, ok := idx["http://absent"]; ok {
+		t.Error("unexpected URL in index")
 	}
 }
 

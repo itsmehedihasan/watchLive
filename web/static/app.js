@@ -119,6 +119,9 @@
     importBtn: $('importBtn'), importFile: $('importFile'), importModal: $('importModal'),
     importList: $('importList'), importCount: $('importCount'), importError: $('importError'),
     importClose: $('importClose'), importCancel: $('importCancel'), importSave: $('importSave'),
+    importConflict: $('importConflict'), importConflictSummary: $('importConflictSummary'),
+    importConflictList: $('importConflictList'), importConflictClose: $('importConflictClose'),
+    importConflictCancel: $('importConflictCancel'), importConflictAdd: $('importConflictAdd'),
   };
 
   function proxyUrl(url) { return '/api/proxy?url=' + encodeURIComponent(url); }
@@ -995,7 +998,7 @@
   function maybeHideScrim() {
     const anyOpen = els.categorySidebar.classList.contains('open') ||
                   els.sidebar.classList.contains('open') || !els.picker.hidden ||
-                  !els.addChannel.hidden || !els.importModal.hidden;
+                  !els.addChannel.hidden || !els.importModal.hidden || !els.importConflict.hidden;
     els.scrim.hidden = !anyOpen;
   }
 
@@ -1104,38 +1107,124 @@
   });
   els.importClose.addEventListener('click', closeImport);
   els.importCancel.addEventListener('click', closeImport);
-  els.importSave.addEventListener('click', function () {
-    const entries = [];
-    Array.prototype.slice.call(els.importList.querySelectorAll('.import-row')).forEach(function (row) {
-      const name = row.querySelector('.import-name').value.trim();
-      const url = row.querySelector('.import-url').value.trim();
-      if (name && /^https?:\/\//i.test(url)) entries.push({ name: name, url: url });
-    });
-    if (entries.length === 0) {
-      els.importError.textContent = 'Nothing to save — each channel needs a name and an http(s) link.';
-      els.importError.hidden = false;
-      return;
-    }
-    els.importSave.disabled = true;
-    els.importSave.textContent = 'Saving…';
+
+  // Show a spinner inside a button while it works; returns a restore() fn.
+  function btnLoading(btn) {
+    const text = btn.textContent;
+    btn.disabled = true;
+    btn.innerHTML = '<span class="btn-spinner"></span>';
+    return function () { btn.disabled = false; btn.textContent = text; };
+  }
+
+  // POST the final new-channel set and finish up. The caller has already put its
+  // button into the loading state and passes restore() to undo it on failure.
+  function commitImport(entries, restore) {
     fetch('/api/import/save', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ entries: entries }),
     })
       .then(function (r) { if (!r.ok) throw new Error('save failed: ' + r.status); return r.json(); })
-      .then(function () { closeImport(); loadChannels(); })
+      .then(function () { closeImportConflict(); closeImport(); loadChannels(); })
       .catch(function () {
+        restore();
         els.importError.textContent = 'Could not save the channels. Please try again.';
         els.importError.hidden = false;
-        els.importSave.disabled = false;
-        els.importSave.textContent = 'Save to library';
       });
+  }
+
+  function collectImportRows() {
+    const entries = [];
+    Array.prototype.slice.call(els.importList.querySelectorAll('.import-row')).forEach(function (row) {
+      const name = row.querySelector('.import-name').value.trim();
+      const url = row.querySelector('.import-url').value.trim();
+      if (name && /^https?:\/\//i.test(url)) entries.push({ name: name, url: url });
+    });
+    return entries;
+  }
+
+  els.importSave.addEventListener('click', function () {
+    const entries = collectImportRows();
+    els.importError.hidden = true;
+    if (entries.length === 0) {
+      els.importError.textContent = 'Nothing to save — each channel needs a name and an http(s) link.';
+      els.importError.hidden = false;
+      return;
+    }
+    // Cross-check links against the library first (button shows a loader).
+    const restore = btnLoading(els.importSave);
+    fetch('/api/import/check', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ entries: entries }),
+    })
+      .then(function (r) { if (!r.ok) throw new Error('check failed: ' + r.status); return r.json(); })
+      .then(function (d) {
+        const dups = (d && d.duplicates) || [];
+        const fresh = (d && d.new) || [];
+        if (dups.length === 0) {
+          commitImport(fresh, restore); // nothing to report — save straight away, keep the loader
+          return;
+        }
+        restore();
+        openImportConflict(dups, fresh); // report conflicts, let the user confirm
+      })
+      .catch(function () {
+        restore();
+        els.importError.textContent = 'Could not check the playlist. Please try again.';
+        els.importError.hidden = false;
+      });
+  });
+
+  // ── Import conflict (duplicate-link) report ───────────────────────────────
+  let pendingImportNew = [];
+  function openImportConflict(duplicates, fresh) {
+    pendingImportNew = fresh;
+    els.importModal.hidden = true; // stack-free: hide the review modal beneath
+    els.importConflictList.innerHTML = '';
+    duplicates.forEach(function (d) {
+      const row = document.createElement('div');
+      row.className = 'conflict-row';
+      const imp = document.createElement('div');
+      imp.className = 'conflict-imported';
+      const nm = document.createElement('div'); nm.className = 'c-name'; nm.textContent = d.imported.name;
+      const u = document.createElement('div'); u.className = 'c-url'; u.textContent = d.imported.url; u.title = d.imported.url;
+      imp.appendChild(nm); imp.appendChild(u);
+      const arrow = document.createElement('div'); arrow.className = 'conflict-arrow'; arrow.textContent = '→';
+      const ex = document.createElement('div');
+      ex.className = 'conflict-existing';
+      ex.innerHTML = 'already in library as <span class="c-tag"></span>';
+      ex.querySelector('.c-tag').textContent = d.existingName || d.existingId;
+      row.appendChild(imp); row.appendChild(arrow); row.appendChild(ex);
+      els.importConflictList.appendChild(row);
+    });
+    els.importConflictSummary.textContent = duplicates.length + ' duplicate' + (duplicates.length === 1 ? '' : 's') +
+      ' · ' + fresh.length + ' new to add';
+    els.importConflictAdd.disabled = fresh.length === 0;
+    els.importConflictAdd.textContent = fresh.length === 0 ? 'No new channels' : ('Add ' + fresh.length + ' new channel' + (fresh.length === 1 ? '' : 's'));
+    els.importConflict.hidden = false;
+    els.scrim.hidden = false;
+  }
+  function closeImportConflict() {
+    els.importConflict.hidden = true;
+    els.importConflictAdd.disabled = false;
+    maybeHideScrim();
+  }
+  els.importConflictClose.addEventListener('click', closeImport); // ✕ abandons the whole import
+  els.importConflictCancel.addEventListener('click', function () {
+    closeImportConflict();
+    els.importModal.hidden = false; // Back → return to the review list
+    els.scrim.hidden = false;
+  });
+  els.importConflictAdd.addEventListener('click', function () {
+    if (pendingImportNew.length === 0) return;
+    const restore = btnLoading(els.importConflictAdd);
+    commitImport(pendingImportNew, restore);
   });
 
   els.leftDrawerToggle.addEventListener('click', function () { openDrawer('left'); });
   els.rightDrawerToggle.addEventListener('click', function () { openDrawer('right'); });
-  els.scrim.addEventListener('click', function () { closeDrawers(); closePicker(); closeAddChannel(); closeImport(); });
+  els.scrim.addEventListener('click', function () { closeDrawers(); closePicker(); closeAddChannel(); closeImport(); closeImportConflict(); });
   Array.prototype.slice.call(document.querySelectorAll('[data-close-drawer]')).forEach(function (b) {
     b.addEventListener('click', closeDrawers);
   });
@@ -1365,7 +1454,7 @@
   // ── Keyboard shortcuts ───────────────────────────────────────────────────
   window.addEventListener('keydown', function (e) {
     const inInput = document.activeElement && document.activeElement.tagName === 'INPUT';
-    if (e.key === 'Escape') { closeDrawers(); closePicker(); closeAddChannel(); closeImport(); }
+    if (e.key === 'Escape') { closeDrawers(); closePicker(); closeAddChannel(); closeImport(); closeImportConflict(); }
     if (e.key === '/' && !inInput) { e.preventDefault(); openDrawer('right'); setTimeout(function () { els.search.focus(); }, 0); }
   });
 
