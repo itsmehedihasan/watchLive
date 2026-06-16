@@ -108,11 +108,17 @@
     channelCount: $('channelCount'), syncBtn: $('syncBtn'),
     categoryList: $('categoryList'), catLoading: $('catLoading'),
     healthToggle: $('healthToggle'), healthStatus: $('healthStatus'),
-    healthOverlay: $('healthOverlay'), healthOverlayProgress: $('healthOverlayProgress'),
-    healthOverlayFill: $('healthOverlayFill'),
     picker: $('picker'), pickerTitle: $('pickerTitle'), pickerClose: $('pickerClose'),
     pickerSearch: $('pickerSearch'), pickerSearchClear: $('pickerSearchClear'),
     pickerList: $('pickerList'), pickerCount: $('pickerCount'),
+    addChannelBtn: $('addChannelBtn'), addChannel: $('addChannel'),
+    addChannelForm: $('addChannelForm'), addChannelName: $('addChannelName'),
+    addChannelUrl: $('addChannelUrl'), addChannelError: $('addChannelError'),
+    addChannelClose: $('addChannelClose'), addChannelCancel: $('addChannelCancel'),
+    addChannelSave: $('addChannelSave'),
+    importBtn: $('importBtn'), importFile: $('importFile'), importModal: $('importModal'),
+    importList: $('importList'), importCount: $('importCount'), importError: $('importError'),
+    importClose: $('importClose'), importCancel: $('importCancel'), importSave: $('importSave'),
   };
 
   function proxyUrl(url) { return '/api/proxy?url=' + encodeURIComponent(url); }
@@ -139,24 +145,32 @@
 
   // ── Favourites ───────────────────────────────────────────────────────────
   // User-pinned channels, shown in a "Favourites" section at the top of the
-  // category sidebar. Keyed by name (IDs shift on re-sync) and persisted per
-  // browser, like dead marks. Favourites ignore the "Working only" filter.
-  let favMarks = {};
-  try { favMarks = JSON.parse(localStorage.getItem('livetv_fav')) || {}; } catch (e) { /* fresh start */ }
-  function favKey(ch) { return ch.name.toLowerCase(); }
-  function isFav(ch) { return !!favMarks[favKey(ch)]; }
+  // category sidebar. Now persisted server-side in the catalog, keyed by the
+  // channel's stable ID (which survives a re-sync), and delivered as
+  // ch.is_favourite in /api/channels. Favourites ignore the "Working only"
+  // filter.
+  function isFav(ch) { return !!ch.is_favourite; }
+  // Toggle a favourite optimistically, then persist. On failure the flag is
+  // reverted and the UI re-synced.
   function setFav(ch, on) {
-    const k = favKey(ch);
-    if (on === !!favMarks[k]) return;
-    if (on) favMarks[k] = Date.now(); else delete favMarks[k];
-    try { localStorage.setItem('livetv_fav', JSON.stringify(favMarks)); } catch (e) { /* quota */ }
+    if (!!ch.is_favourite === on) return;
+    ch.is_favourite = on;
+    fetch('/api/favourite', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: ch.id, on: on }),
+    })
+      .then(function (r) { if (!r.ok) throw new Error('favourite failed: ' + r.status); })
+      .catch(function () { ch.is_favourite = !on; onFavChanged(); });
   }
   // After a pin toggle: rebuild the category sidebar (Favourites membership
   // changed) and fix the pin icons in the other lists in place (no scroll jump).
   function onFavChanged() {
     renderCategorySidebar();
+    const favById = {};
+    channels.forEach(function (ch) { if (ch.is_favourite) favById[ch.id] = true; });
     Array.prototype.slice.call(document.querySelectorAll('.pin-btn')).forEach(function (pin) {
-      const on = !!favMarks[pin.dataset.favkey];
+      const on = !!favById[pin.dataset.favid];
       pin.classList.toggle('faved', on);
       pin.title = on ? 'Remove from Favourites' : 'Add to Favourites';
     });
@@ -181,8 +195,6 @@
   let healthProbing = false;
   let healthDone = 0, healthTotal = 0;
   let healthPoll = null;
-  let healthOverlayDismissed = false;
-  let channelsEtag = null; // content hash of the current list; gates the health cache
 
   function passesHealth(ch) {
     if (!healthOn) return true;
@@ -982,13 +994,148 @@
   }
   function maybeHideScrim() {
     const anyOpen = els.categorySidebar.classList.contains('open') ||
-                  els.sidebar.classList.contains('open') || !els.picker.hidden;
+                  els.sidebar.classList.contains('open') || !els.picker.hidden ||
+                  !els.addChannel.hidden || !els.importModal.hidden;
     els.scrim.hidden = !anyOpen;
   }
 
+  // ── Add-channel modal ─────────────────────────────────────────────────────
+  function openAddChannel() {
+    closeDrawers();
+    els.addChannelError.hidden = true;
+    els.addChannelForm.reset();
+    els.addChannel.hidden = false;
+    els.scrim.hidden = false;
+    setTimeout(function () { els.addChannelName.focus(); }, 0);
+  }
+  function closeAddChannel() {
+    els.addChannel.hidden = true;
+    els.addChannelSave.disabled = false;
+    els.addChannelSave.textContent = 'Save';
+    maybeHideScrim();
+  }
+  els.addChannelBtn.addEventListener('click', openAddChannel);
+  els.addChannelClose.addEventListener('click', closeAddChannel);
+  els.addChannelCancel.addEventListener('click', closeAddChannel);
+  els.addChannelForm.addEventListener('submit', function (e) {
+    e.preventDefault();
+    const name = els.addChannelName.value.trim();
+    const url = els.addChannelUrl.value.trim();
+    if (!name || !/^https?:\/\//i.test(url)) {
+      els.addChannelError.textContent = 'Enter a name and an http(s) stream link.';
+      els.addChannelError.hidden = false;
+      return;
+    }
+    els.addChannelSave.disabled = true;
+    els.addChannelSave.textContent = 'Saving…';
+    fetch('/api/channels/add', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: name, url: url }),
+    })
+      .then(function (r) { if (!r.ok) throw new Error('add failed: ' + r.status); return r.json(); })
+      .then(function () { closeAddChannel(); loadChannels(); })
+      .catch(function () {
+        els.addChannelError.textContent = 'Could not add the channel. Check the link and try again.';
+        els.addChannelError.hidden = false;
+        els.addChannelSave.disabled = false;
+        els.addChannelSave.textContent = 'Save';
+      });
+  });
+
+  // ── Import an .m3u playlist ───────────────────────────────────────────────
+  function closeImport() {
+    els.importModal.hidden = true;
+    els.importList.innerHTML = '';
+    els.importError.hidden = true;
+    els.importSave.disabled = false;
+    els.importSave.textContent = 'Save to library';
+    maybeHideScrim();
+  }
+  function updateImportCount() {
+    const n = els.importList.querySelectorAll('.import-row').length;
+    els.importCount.textContent = n + ' channel' + (n === 1 ? '' : 's');
+  }
+  function addImportRow(entry) {
+    const row = document.createElement('div');
+    row.className = 'import-row';
+    const name = document.createElement('input');
+    name.className = 'import-name'; name.type = 'text'; name.placeholder = 'Name';
+    name.value = entry.name || '';
+    const url = document.createElement('input');
+    url.className = 'import-url'; url.type = 'text'; url.placeholder = 'https://…';
+    url.value = entry.url || '';
+    const rm = document.createElement('button');
+    rm.className = 'import-row-remove'; rm.type = 'button'; rm.title = 'Remove this channel'; rm.textContent = '✕';
+    rm.addEventListener('click', function () { row.remove(); updateImportCount(); });
+    row.appendChild(name); row.appendChild(url); row.appendChild(rm);
+    els.importList.appendChild(row);
+  }
+  function openImportReview(entries) {
+    closeDrawers();
+    els.importList.innerHTML = '';
+    els.importError.hidden = true;
+    entries.forEach(addImportRow);
+    updateImportCount();
+    els.importModal.hidden = false;
+    els.scrim.hidden = false;
+  }
+
+  els.importBtn.addEventListener('click', function () { els.importFile.click(); });
+  els.importFile.addEventListener('change', function () {
+    const file = els.importFile.files && els.importFile.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = function () {
+      fetch('/api/import/parse', { method: 'POST', body: reader.result })
+        .then(function (r) {
+          if (!r.ok) return r.text().then(function (t) { throw new Error(t || ('parse failed: ' + r.status)); });
+          return r.json();
+        })
+        .then(function (d) { openImportReview((d && d.entries) || []); })
+        .catch(function (err) {
+          openImportReview([]);
+          els.importError.textContent = String(err.message || 'Could not read that playlist.');
+          els.importError.hidden = false;
+        });
+    };
+    reader.readAsText(file);
+    els.importFile.value = ''; // allow re-selecting the same file later
+  });
+  els.importClose.addEventListener('click', closeImport);
+  els.importCancel.addEventListener('click', closeImport);
+  els.importSave.addEventListener('click', function () {
+    const entries = [];
+    Array.prototype.slice.call(els.importList.querySelectorAll('.import-row')).forEach(function (row) {
+      const name = row.querySelector('.import-name').value.trim();
+      const url = row.querySelector('.import-url').value.trim();
+      if (name && /^https?:\/\//i.test(url)) entries.push({ name: name, url: url });
+    });
+    if (entries.length === 0) {
+      els.importError.textContent = 'Nothing to save — each channel needs a name and an http(s) link.';
+      els.importError.hidden = false;
+      return;
+    }
+    els.importSave.disabled = true;
+    els.importSave.textContent = 'Saving…';
+    fetch('/api/import/save', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ entries: entries }),
+    })
+      .then(function (r) { if (!r.ok) throw new Error('save failed: ' + r.status); return r.json(); })
+      .then(function () { closeImport(); loadChannels(); })
+      .catch(function () {
+        els.importError.textContent = 'Could not save the channels. Please try again.';
+        els.importError.hidden = false;
+        els.importSave.disabled = false;
+        els.importSave.textContent = 'Save to library';
+      });
+  });
+
   els.leftDrawerToggle.addEventListener('click', function () { openDrawer('left'); });
   els.rightDrawerToggle.addEventListener('click', function () { openDrawer('right'); });
-  els.scrim.addEventListener('click', function () { closeDrawers(); closePicker(); });
+  els.scrim.addEventListener('click', function () { closeDrawers(); closePicker(); closeAddChannel(); closeImport(); });
   Array.prototype.slice.call(document.querySelectorAll('[data-close-drawer]')).forEach(function (b) {
     b.addEventListener('click', closeDrawers);
   });
@@ -1014,7 +1161,7 @@
     // Pin toggle (a span, not a button — a <button> can't nest in a <button>).
     const pin = document.createElement('span');
     pin.className = 'pin-btn' + (isFav(ch) ? ' faved' : '');
-    pin.dataset.favkey = favKey(ch);
+    pin.dataset.favid = ch.id;
     pin.setAttribute('role', 'button');
     pin.title = isFav(ch) ? 'Remove from Favourites' : 'Add to Favourites';
     pin.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round">' +
@@ -1218,7 +1365,7 @@
   // ── Keyboard shortcuts ───────────────────────────────────────────────────
   window.addEventListener('keydown', function (e) {
     const inInput = document.activeElement && document.activeElement.tagName === 'INPUT';
-    if (e.key === 'Escape') { closeDrawers(); closePicker(); }
+    if (e.key === 'Escape') { closeDrawers(); closePicker(); closeAddChannel(); closeImport(); }
     if (e.key === '/' && !inInput) { e.preventDefault(); openDrawer('right'); setTimeout(function () { els.search.focus(); }, 0); }
   });
 
@@ -1261,75 +1408,66 @@
 
   function updateHealthStatus() {
     const el = els.healthStatus;
-    if (!healthOn) { el.hidden = true; el.textContent = ''; }
-    else {
-      el.hidden = false;
-      if (healthProbing) el.textContent = 'Checking ' + healthDone + ' / ' + healthTotal + ' · ' + countAlive() + ' live';
-      else if (healthTotal) el.textContent = countAlive() + ' working of ' + healthTotal;
-      else el.textContent = 'Starting…';
-    }
-    updateHealthOverlay();
+    if (!healthOn) { el.hidden = true; el.textContent = ''; return; }
+    el.hidden = false;
+    if (healthProbing) el.textContent = 'Re-checking ' + healthDone + ' / ' + healthTotal + ' · ' + countAlive() + ' live';
+    else if (healthTotal) el.textContent = countAlive() + ' working of ' + healthTotal;
+    else el.textContent = '';
   }
 
-  function updateHealthOverlay() {
-    const show = healthOn && healthProbing && !healthOverlayDismissed;
-    els.healthOverlay.hidden = !show;
-    if (!show) return;
-    els.healthOverlayProgress.textContent = healthTotal
-      ? healthDone + ' / ' + healthTotal + ' checked · ' + countAlive() + ' live'
-      : 'Starting…';
-    const pct = healthTotal ? Math.round((healthDone / healthTotal) * 100) : 0;
-    els.healthOverlayFill.style.width = pct + '%';
-  }
-
+  // Apply a probe snapshot. Verdicts are merged into the health map, but the
+  // browse lists are re-rendered only when a verdict actually CHANGED (or the
+  // pass just finished) — so a background re-check that finds nothing different
+  // never moves the list under the user, and there is no per-poll churn.
   function applyHealthSnapshot(snap) {
     if (!snap) return;
     healthDone = snap.done || 0;
     healthTotal = snap.total || 0;
-    if (snap.status) { for (const id in snap.status) { health[id] = snap.status[id]; } }
+    let changed = false;
+    if (snap.status) {
+      for (const id in snap.status) {
+        const v = snap.status[id];
+        if (health[id] !== v) { health[id] = v; changed = true; }
+      }
+    }
+    const wasProbing = healthProbing;
     healthProbing = !!snap.running;
     if (!snap.running) stopHealthPolling();
-    if (healthOn) renderHealthLists();
+    // Re-render when verdicts changed, or once when the pass finishes (so a
+    // final settle is reflected even if the last poll carried no new verdicts).
+    if (healthOn && (changed || (wasProbing && !snap.running))) renderHealthLists();
     updateHealthStatus();
   }
 
   function pollHealth() {
     fetch('/api/health').then(function (r) { return r.json(); }).then(applyHealthSnapshot).catch(function () {});
   }
+  // Force a probe (Sync button, working-only toggle off→on). Silent: progress
+  // shows only in the drawer-footer status line, never a blocking overlay.
   function startHealthProbe(force) {
     healthProbing = true;
-    healthOverlayDismissed = false;
     updateHealthStatus();
     fetch('/api/health' + (force ? '?force=1' : ''), { method: 'POST' })
       .then(function (r) { return r.json(); }).then(applyHealthSnapshot).catch(function () {});
     if (!healthPoll) healthPoll = setInterval(pollHealth, 1500);
   }
 
-  // On page load, reuse a cached pass instead of re-probing: ask the server what
-  // it already has and only probe when there's no finished pass for the current
-  // catalog (etag mismatch). The server persists passes to disk, so this stays a
-  // cache hit across restarts until the catalog changes or the user re-toggles.
-  function ensureHealth() {
+  // The server owns probing (it re-checks stale streams on startup). The page
+  // just observes: if a pass is already running, poll it silently and reconcile
+  // verdicts as they land. It never starts its own probe — Sync and the toggle do.
+  function observeHealth() {
     fetch('/api/health')
       .then(function (r) { return r.json(); })
       .then(function (snap) {
-        const hit = snap && snap.finished && !snap.running &&
-                  snap.etag && snap.etag === channelsEtag &&
-                  snap.status && Object.keys(snap.status).length > 0;
-        if (hit) {
-          applyHealthSnapshot(snap); // restore verdicts — no probe, no overlay
-        } else {
-          startHealthProbe(false);   // nothing usable for this list → probe
-        }
+        applyHealthSnapshot(snap);
+        if (snap && snap.running && !healthPoll) healthPoll = setInterval(pollHealth, 1500);
       })
-      .catch(function () { startHealthProbe(false); });
+      .catch(function () {});
   }
   function stopHealthPolling() {
     if (healthPoll) { clearInterval(healthPoll); healthPoll = null; }
     healthProbing = false;
   }
-
-  $('healthOverlayHide').addEventListener('click', function () { healthOverlayDismissed = true; updateHealthOverlay(); });
 
   els.healthToggle.addEventListener('click', function () {
     healthOn = !healthOn;
@@ -1349,7 +1487,14 @@
     btn.disabled = true; btn.textContent = 'Syncing…';
     fetch('/api/sync', { method: 'POST' })
       .then(function (r) { if (!r.ok) throw new Error('sync failed: ' + r.status); return r.json(); })
-      .then(function () { btn.textContent = '⟳ Sync'; btn.disabled = false; loadChannels(); })
+      .then(function () {
+        btn.textContent = '⟳ Sync'; btn.disabled = false;
+        loadChannels();
+        // A sync is an explicit "refresh everything" gesture: re-probe the whole
+        // catalog so channels that recovered flip is_working false→true (and dead
+        // ones true→false) in the DB. Only when the working filter is engaged.
+        if (healthOn) startHealthProbe(true);
+      })
       .catch(function () {
         btn.textContent = 'Sync failed';
         setTimeout(function () { btn.textContent = '⟳ Sync'; btn.disabled = false; }, 3000);
@@ -1386,21 +1531,29 @@
     fetch('/api/channels')
       .then(function (r) {
         if (!r.ok) throw new Error('channels fetch failed: ' + r.status);
-        channelsEtag = r.headers.get('ETag'); // gates the health cache to this list version
         return r.json();
       })
       .then(function (data) {
         channels = Array.isArray(data) ? data : [];
         channelsLoading = false;
+        // Seed the working-state map from the catalog (is_working persists
+        // server-side now), so the "Working only" filter is correct on first
+        // paint without any probe. Unprobed (null) channels stay shown.
         health = {};
-        healthDone = healthTotal = 0;
+        let probed = 0;
+        channels.forEach(function (ch) {
+          if (ch.is_working === true) { health[ch.id] = true; probed++; }
+          else if (ch.is_working === false) { health[ch.id] = false; probed++; }
+        });
+        healthDone = healthTotal = probed;
         stopHealthPolling();
-        // Reuse a cached pass when possible; only probe a never-seen catalog.
-        if (healthOn && !sourceRefreshing) ensureHealth();
         renderCategorySidebar();
         renderChannelList();
         if (!els.picker.hidden) renderPicker();
         updateHealthStatus();
+        // The server re-checks stale streams on startup; just observe a running
+        // pass silently and reconcile verdicts as they land.
+        if (healthOn && !sourceRefreshing) observeHealth();
       })
       .catch(function () { channelsLoading = false; renderChannelList(); });
   }

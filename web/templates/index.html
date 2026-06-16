@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <html lang="en" class="dark">
+
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, minimum-scale=1, maximum-scale=5">
@@ -14,6 +15,7 @@
   <meta name="description" content="Watch up to four live channels at once — news, sports, movies and more.">
   <link rel="stylesheet" href="/static/style.css">
 </head>
+
 <body>
   <div class="wall">
 
@@ -25,25 +27,48 @@
         <div class="rail-row">
           <button id="gridAdd" class="rail-icon-btn" title="Add a screen">
             <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
-              <rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/>
-              <rect x="3" y="14" width="7" height="7" rx="1"/>
-              <line x1="17.5" y1="14" x2="17.5" y2="21"/><line x1="14" y1="17.5" x2="21" y2="17.5"/>
+              <rect x="3" y="3" width="7" height="7" rx="1" />
+              <rect x="14" y="3" width="7" height="7" rx="1" />
+              <rect x="3" y="14" width="7" height="7" rx="1" />
+              <line x1="17.5" y1="14" x2="17.5" y2="21" />
+              <line x1="14" y1="17.5" x2="21" y2="17.5" />
             </svg>
           </button>
           <button id="gridRemove" class="rail-icon-btn" title="Remove the last screen">
             <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
-              <rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/>
-              <rect x="3" y="14" width="7" height="7" rx="1"/>
-              <line x1="14" y1="17.5" x2="21" y2="17.5"/>
+              <rect x="3" y="3" width="7" height="7" rx="1" />
+              <rect x="14" y="3" width="7" height="7" rx="1" />
+              <rect x="3" y="14" width="7" height="7" rx="1" />
+              <line x1="14" y1="17.5" x2="21" y2="17.5" />
             </svg>
           </button>
         </div>
       </section>
-
       <!-- Audio source picker (one button per cell) -->
       <section class="rail-section">
         <div class="rail-label">Audio</div>
         <div id="audioButtons" class="rail-grid"></div>
+      </section>
+
+      <!-- Add a custom channel / import a playlist -->
+      <section class="rail-section">
+        <div class="rail-label">Add</div>
+        <div class="rail-row">
+          <button id="addChannelBtn" class="rail-icon-btn" title="Add a custom channel">
+            <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+              <line x1="12" y1="5" x2="12" y2="19" />
+              <line x1="5" y1="12" x2="19" y2="12" />
+            </svg>
+          </button>
+          <button id="importBtn" class="rail-icon-btn" title="Import an .m3u playlist">
+            <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+              <path d="M12 3v12" />
+              <path d="M7 10l5 5 5-5" />
+              <path d="M5 21h14" />
+            </svg>
+          </button>
+        </div>
+        <input id="importFile" type="file" accept=".m3u,.m3u8,audio/x-mpegurl,application/vnd.apple.mpegurl" hidden>
       </section>
 
       <!-- Record source picker (one button per cell) -->
@@ -64,26 +89,31 @@
         <div class="rail-label">Volume</div>
         <button id="volUp" class="vol-step" title="Volume up" aria-label="Volume up">
           <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4" viewBox="0 0 24 24">
-            <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+            <line x1="12" y1="5" x2="12" y2="19" />
+            <line x1="5" y1="12" x2="19" y2="12" />
           </svg>
         </button>
         <div class="vol-slider-wrap">
-          <input id="volume" class="vol-slider" type="range" min="0" max="100" value="100"
-                 aria-label="Volume" title="Volume">
+          <input id="volume" class="vol-slider" type="range" min="0" max="100" value="100" aria-label="Volume"
+            title="Volume">
         </div>
         <button id="volDown" class="vol-step" title="Volume down" aria-label="Volume down">
           <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4" viewBox="0 0 24 24">
-            <line x1="5" y1="12" x2="19" y2="12"/>
+            <line x1="5" y1="12" x2="19" y2="12" />
           </svg>
         </button>
         <button id="muteBtn" class="rail-icon-btn" title="Mute / unmute audio cell" aria-pressed="false">
-          <svg class="ico-vol" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
-            <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
-            <path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M18.5 5.5a9 9 0 0 1 0 13"/>
+          <svg class="ico-vol" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2"
+            viewBox="0 0 24 24">
+            <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
+            <path d="M15.5 8.5a5 5 0 0 1 0 7" />
+            <path d="M18.5 5.5a9 9 0 0 1 0 13" />
           </svg>
-          <svg class="ico-muted" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" hidden>
-            <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
-            <line x1="22" y1="9" x2="16" y2="15"/><line x1="16" y1="9" x2="22" y2="15"/>
+          <svg class="ico-muted" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2"
+            viewBox="0 0 24 24" hidden>
+            <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
+            <line x1="22" y1="9" x2="16" y2="15" />
+            <line x1="16" y1="9" x2="22" y2="15" />
           </svg>
         </button>
       </section>
@@ -93,12 +123,16 @@
     <!-- ── Drawer toggles (float the browse sidebars) ─────────────── -->
     <button id="leftDrawerToggle" class="drawer-toggle drawer-toggle-left" title="Browse by category">
       <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
-        <line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/>
+        <line x1="3" y1="6" x2="21" y2="6" />
+        <line x1="3" y1="12" x2="21" y2="12" />
+        <line x1="3" y1="18" x2="21" y2="18" />
       </svg>
     </button>
     <button id="rightDrawerToggle" class="drawer-toggle drawer-toggle-right" title="Browse by country">
       <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
-        <line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/>
+        <line x1="3" y1="6" x2="21" y2="6" />
+        <line x1="3" y1="12" x2="21" y2="12" />
+        <line x1="3" y1="18" x2="21" y2="18" />
       </svg>
     </button>
 
@@ -123,7 +157,7 @@
     </div>
     <div class="drawer-foot">
       <button id="healthToggle" class="health-toggle" role="switch" aria-checked="false"
-              title="Probe every stream from the server and hide ones that are offline, blocked or geo-restricted">
+        title="Probe every stream from the server and hide ones that are offline, blocked or geo-restricted">
         <span class="health-switch"><span class="health-knob"></span></span>
         <span class="health-toggle-label">Working only</span>
       </button>
@@ -139,8 +173,10 @@
     </div>
     <div class="search-wrap">
       <div class="search-box">
-        <svg class="search-icon" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
-          <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+        <svg class="search-icon" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"
+          viewBox="0 0 24 24">
+          <circle cx="11" cy="11" r="8" />
+          <line x1="21" y1="21" x2="16.65" y2="16.65" />
         </svg>
         <input id="search" type="text" placeholder="Search channels…" autocomplete="off">
         <button id="searchClear" class="search-clear" hidden>✕</button>
@@ -170,8 +206,10 @@
       </div>
       <div class="search-wrap">
         <div class="search-box">
-          <svg class="search-icon" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
-            <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+          <svg class="search-icon" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"
+            viewBox="0 0 24 24">
+            <circle cx="11" cy="11" r="8" />
+            <line x1="21" y1="21" x2="16.65" y2="16.65" />
           </svg>
           <input id="pickerSearch" type="text" placeholder="Search live channels…" autocomplete="off">
           <button id="pickerSearchClear" class="search-clear" hidden>✕</button>
@@ -182,14 +220,49 @@
     </div>
   </div>
 
-  <!-- Full-screen loader shown while the "Working only" probe is running -->
-  <div id="healthOverlay" class="health-overlay" hidden>
-    <div class="spinner"></div>
-    <p class="health-overlay-title">Checking channels…</p>
-    <p id="healthOverlayProgress" class="health-overlay-progress overlay-muted"></p>
-    <div class="health-overlay-bar"><div id="healthOverlayFill" class="health-overlay-fill"></div></div>
-    <p class="health-overlay-hint">Hiding streams that are offline, blocked or geo-restricted</p>
-    <button id="healthOverlayHide" class="health-overlay-hide">Hide — keep checking in background</button>
+  <!-- ── Add-channel modal ──────────────────────────────────────── -->
+  <div id="addChannel" class="picker add-modal" hidden>
+    <div class="picker-panel add-panel">
+      <div class="picker-head">
+        <span class="picker-title">Add a channel</span>
+        <button id="addChannelClose" class="picker-close" title="Close">✕</button>
+      </div>
+      <form id="addChannelForm" class="add-form">
+        <label class="add-field">
+          <span>Channel name</span>
+          <input id="addChannelName" type="text" placeholder="e.g. My News Channel" autocomplete="off" required>
+        </label>
+        <label class="add-field">
+          <span>Stream link</span>
+          <input id="addChannelUrl" type="url" placeholder="https://…/stream.m3u8" autocomplete="off" required>
+        </label>
+        <p id="addChannelError" class="add-error" hidden></p>
+        <div class="add-actions">
+          <button type="button" id="addChannelCancel" class="add-btn add-btn-ghost">Cancel</button>
+          <button type="submit" id="addChannelSave" class="add-btn add-btn-primary">Save</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- ── Import-playlist review modal ───────────────────────────── -->
+  <div id="importModal" class="picker import-modal" hidden>
+    <div class="picker-panel import-panel">
+      <div class="picker-head">
+        <span class="picker-title">Review imported channels</span>
+        <button id="importClose" class="picker-close" title="Close">✕</button>
+      </div>
+      <div class="import-subhead">
+        <span id="importCount" class="import-count"></span>
+        <span class="import-hint">Edit names or links, remove rows you don't want, then save.</span>
+      </div>
+      <div id="importList" class="import-list"></div>
+      <p id="importError" class="add-error" hidden></p>
+      <div class="add-actions import-actions">
+        <button type="button" id="importCancel" class="add-btn add-btn-ghost">Cancel</button>
+        <button type="button" id="importSave" class="add-btn add-btn-primary">Save to library</button>
+      </div>
+    </div>
   </div>
 
   <script src="/static/hls.min.js"></script>
@@ -197,4 +270,5 @@
   <script src="/static/mpegts.js"></script>
   <script src="/static/app.js"></script>
 </body>
+
 </html>

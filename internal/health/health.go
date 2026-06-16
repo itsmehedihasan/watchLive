@@ -7,17 +7,16 @@
 //
 // Probing is manifest-only: one GET per server, first reachable server wins,
 // no segment fetch. A pass over a large list (10k+ channels) takes a while, so
-// results are cached and a Snapshot can be polled while a pass is in flight.
+// a Snapshot can be polled while a pass is in flight, and a completion hook
+// (OnFinish) persists the verdicts — the catalog store writes them to SQLite.
 package health
 
 import (
 	"context"
 	"crypto/tls"
-	"encoding/json"
 	"io"
 	"net/http"
 	"net/url"
-	"os"
 	"regexp"
 	"strings"
 	"sync"
@@ -80,16 +79,7 @@ type Prober struct {
 	etag     string
 	when     time.Time // when the current/last pass started
 	results  map[string]bool
-	path     string // on-disk cache file; "" disables persistence
-}
-
-// cacheFile is the on-disk form of a finished pass. The etag pins the verdicts
-// to a specific playlist version: a different catalog has a different etag and
-// the cache is ignored, so stale verdicts can never map to the wrong channels.
-type cacheFile struct {
-	Etag   string          `json:"etag"`
-	When   time.Time       `json:"when"`
-	Status map[string]bool `json:"status"`
+	onFinish func(verdicts map[string]bool, at time.Time)
 }
 
 // New builds a Prober with its own HTTP client tuned for many short-lived
@@ -109,30 +99,32 @@ func New() *Prober {
 	}
 }
 
-// LoadCache points the prober at an on-disk cache file and, if it holds a
-// finished pass, loads those verdicts as the current (finished) state. This is
-// what lets a fresh process serve health results without re-probing: the next
-// Start for the same etag is reused, and a GET sees a finished pass. Best-effort
-// — a missing or unreadable file just leaves the prober empty.
-func (p *Prober) LoadCache(path string) {
+// OnFinish registers a callback invoked once each time a pass completes (and is
+// not superseded), with the full set of verdicts and the time the pass started.
+// The catalog store uses it to persist is_working / last_checked_at to SQLite,
+// so verdicts survive a restart without any file cache here.
+func (p *Prober) OnFinish(fn func(verdicts map[string]bool, at time.Time)) {
+	p.mu.Lock()
+	p.onFinish = fn
+	p.mu.Unlock()
+}
+
+// Seed loads previously-persisted verdicts as the prober's current (finished)
+// state for a given etag, so a fresh process serves health results without
+// re-probing until they go stale. Verdicts the store reads back from SQLite are
+// passed in here at startup.
+func (p *Prober) Seed(etag string, verdicts map[string]bool, at time.Time) {
+	if len(verdicts) == 0 {
+		return
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.path = path
-
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return
-	}
-	var c cacheFile
-	if err := json.Unmarshal(data, &c); err != nil || c.Etag == "" || len(c.Status) == 0 {
-		return
-	}
-	p.results = c.Status
-	p.etag = c.Etag
-	p.when = c.When
+	p.results = verdicts
+	p.etag = etag
+	p.when = at
 	p.finished = true
-	p.total = len(c.Status)
-	p.done = len(c.Status)
+	p.total = len(verdicts)
+	p.done = len(verdicts)
 }
 
 // Start begins a probe pass over targets unless one is already adequate:
@@ -230,41 +222,30 @@ func (p *Prober) run(ctx context.Context, gen int, targets []Target) {
 
 	wg.Wait()
 	p.mu.Lock()
-	var save *cacheFile
+	var (
+		fn      func(map[string]bool, time.Time)
+		verdict map[string]bool
+		when    time.Time
+	)
 	if p.gen == gen {
 		p.running = false
 		p.finished = true
 		p.cancel = nil
-		if p.path != "" {
-			status := make(map[string]bool, len(p.results))
+		if p.onFinish != nil {
+			fn = p.onFinish
+			when = p.when
+			verdict = make(map[string]bool, len(p.results))
 			for id, alive := range p.results {
-				status[id] = alive
+				verdict[id] = alive
 			}
-			save = &cacheFile{Etag: p.etag, When: p.when, Status: status}
 		}
 	}
 	p.mu.Unlock()
 
-	// Persist outside the lock — the write is small but disk I/O shouldn't block
-	// concurrent Snapshot/Start calls. A cancelled/superseded pass saves nothing.
-	if save != nil {
-		writeCache(p.path, save)
-	}
-}
-
-// writeCache atomically replaces the cache file with the finished pass. Best-
-// effort: a failure just means the next process re-probes.
-func writeCache(path string, c *cacheFile) {
-	data, err := json.Marshal(c)
-	if err != nil {
-		return
-	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
-		return
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		os.Remove(tmp)
+	// Persist outside the lock — the store write shouldn't block concurrent
+	// Snapshot/Start calls. A cancelled/superseded pass invokes nothing.
+	if fn != nil {
+		fn(verdict, when)
 	}
 }
 

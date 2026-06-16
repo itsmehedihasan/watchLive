@@ -26,6 +26,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -37,6 +38,7 @@ import (
 	"watchlive/internal/playlist"
 	"watchlive/internal/proxy"
 	"watchlive/internal/recorder"
+	"watchlive/internal/store"
 	"watchlive/internal/viewers"
 )
 
@@ -54,72 +56,57 @@ var staticFS embed.FS
 //go:embed .\seed.m3u
 var seedPlaylist []byte
 
-// channelStore holds the parsed playlist and reloads it when the source file
-// changes on disk. The JSON and gzipped-JSON payloads for /api/channels are
-// precomputed once per reload — with 10k+ channels the list is megabytes, so
-// compressing per request would burn CPU for an identical result.
+// healthTTL is how stale a channel's working verdict may get before a probe
+// pass re-checks it. Streams rarely flip within hours, and a full pass is
+// minutes of egress, so a few hours balances freshness against load.
+const healthTTL = 6 * time.Hour
+
+// channelStore is the read-side cache in front of the SQLite catalog. The JSON
+// and gzipped-JSON payloads for /api/channels are precomputed once per change —
+// with 10k+ channels the list is megabytes, so compressing per request would
+// burn CPU for an identical result. rebuild() refreshes them from the DB after
+// any mutation (sync, favourite toggle, manual add/delete, health write).
 type channelStore struct {
-	mu       sync.RWMutex
-	channels []playlist.Channel
-	jsonRaw  []byte
-	jsonGz   []byte
-	etag     string
-	path     string
-	modTime  time.Time
+	st        *store.Store
+	sourceURL string
+	prune     bool
+
+	mu      sync.RWMutex
+	jsonRaw []byte
+	jsonGz  []byte
+	etag    string
+	count   int
 	// refreshing reports whether a source refresh (API fetch) is in flight, so
 	// the UI can show an "updating" state and re-fetch when it lands.
 	refreshing bool
 
 	// refreshMu serializes source refreshes (startup + manual Sync) so two
-	// fetches never race on the playlist file.
+	// fetches never race.
 	refreshMu sync.Mutex
 }
 
-func newChannelStore(path string) *channelStore {
-	cs := &channelStore{path: path}
-	cs.reload()
+func newChannelStore(st *store.Store, sourceURL string, prune bool) *channelStore {
+	cs := &channelStore{st: st, sourceURL: sourceURL, prune: prune}
+	if err := cs.rebuild(); err != nil {
+		log.Printf("playlist: initial payload build: %v", err)
+	}
 	return cs
 }
 
-// reload re-reads the playlist from disk. When the file doesn't exist yet, it
-// falls back to the embedded seed playlist so the first run is never empty.
-// Returns the number of channels loaded.
-func (cs *channelStore) reload() int {
-	data, err := os.ReadFile(cs.path)
+// rebuild reloads the catalog from the DB and recomputes the cached payloads.
+// The DB read and marshalling happen outside the lock; only the pointer swap
+// holds it, so concurrent /api/channels reads never block on disk I/O.
+func (cs *channelStore) rebuild() error {
+	chs, err := cs.st.ListChannels()
 	if err != nil {
-		if !errors.Is(err, os.ErrNotExist) {
-			log.Printf("playlist: read %s: %v (keeping current list)", cs.path, err)
-			return cs.count()
-		}
-		// No list.m3u yet — serve the embedded seed (zero modTime: reloadIfChanged
-		// keys off the on-disk file, which is still absent). The background refresh
-		// writes a real list.m3u and a later reload picks it up.
-		log.Printf("playlist: %s not found, loading embedded seed", cs.path)
-		return cs.setFromBytes(seedPlaylist, time.Time{})
+		return err
 	}
-	info, _ := os.Stat(cs.path)
-	var modTime time.Time
-	if info != nil {
-		modTime = info.ModTime()
+	if chs == nil {
+		chs = []store.Channel{} // marshal to [] not null, so the UI always gets an array
 	}
-	return cs.setFromBytes(data, modTime)
-}
-
-// setFromBytes parses an M3U payload and, if it yields any channels, swaps it in
-// as the current list along with the precomputed JSON/gzip/etag. A payload that
-// parses to zero channels (or fails to marshal) is rejected and the current list
-// is kept. Returns the channel count after the attempt.
-func (cs *channelStore) setFromBytes(data []byte, modTime time.Time) int {
-	parsed := playlist.Parse(string(data))
-	if len(parsed) == 0 {
-		log.Printf("playlist: parsed 0 channels, keeping current list")
-		return cs.count()
-	}
-
-	raw, err := json.Marshal(parsed)
+	raw, err := json.Marshal(chs)
 	if err != nil {
-		log.Printf("playlist: marshal: %v (keeping current list)", err)
-		return cs.count()
+		return err
 	}
 	var buf bytes.Buffer
 	gz, _ := gzip.NewWriterLevel(&buf, gzip.BestCompression)
@@ -129,13 +116,29 @@ func (cs *channelStore) setFromBytes(data []byte, modTime time.Time) int {
 	etag := `"` + hex.EncodeToString(sum[:8]) + `"`
 
 	cs.mu.Lock()
-	cs.channels = parsed
 	cs.jsonRaw = raw
 	cs.jsonGz = buf.Bytes()
 	cs.etag = etag
-	cs.modTime = modTime
+	cs.count = len(chs)
 	cs.mu.Unlock()
-	return len(parsed)
+	return nil
+}
+
+// seedIfEmpty populates an empty catalog from the embedded seed playlist so the
+// first run is never blank, even offline. A non-empty catalog is left untouched.
+func (cs *channelStore) seedIfEmpty(seed []byte) error {
+	empty, err := cs.st.IsEmpty()
+	if err != nil || !empty {
+		return err
+	}
+	chs := playlist.Parse(string(seed))
+	if len(chs) == 0 {
+		return nil
+	}
+	if _, _, _, err := cs.st.UpsertCatalog(chs); err != nil {
+		return err
+	}
+	return cs.rebuild()
 }
 
 // payload returns the precomputed /api/channels response bodies.
@@ -145,42 +148,16 @@ func (cs *channelStore) payload() (raw, gz []byte, etag string) {
 	return cs.jsonRaw, cs.jsonGz, cs.etag
 }
 
-// reloadIfChanged reloads only when the file's mtime moved.
-func (cs *channelStore) reloadIfChanged() {
-	info, err := os.Stat(cs.path)
-	if err != nil {
-		return
-	}
-	cs.mu.RLock()
-	changed := !info.ModTime().Equal(cs.modTime)
-	cs.mu.RUnlock()
-	if changed {
-		n := cs.reload()
-		log.Printf("playlist: reloaded %d channels", n)
-	}
-}
-
-func (cs *channelStore) count() int {
+func (cs *channelStore) etagValue() string {
 	cs.mu.RLock()
 	defer cs.mu.RUnlock()
-	return len(cs.channels)
+	return cs.etag
 }
 
-// healthTargets snapshots the current channels as probe targets along with the
-// list's etag. The etag lets the prober reuse results until the playlist
-// actually changes (a re-sync reassigns IDs, so old verdicts would be wrong).
-func (cs *channelStore) healthTargets() ([]health.Target, string) {
+func (cs *channelStore) channelCount() int {
 	cs.mu.RLock()
 	defer cs.mu.RUnlock()
-	targets := make([]health.Target, 0, len(cs.channels))
-	for _, ch := range cs.channels {
-		urls := make([]string, 0, len(ch.Servers))
-		for _, s := range ch.Servers {
-			urls = append(urls, s.URL)
-		}
-		targets = append(targets, health.Target{ID: ch.ID, URLs: urls})
-	}
-	return targets, cs.etag
+	return cs.count
 }
 
 func (cs *channelStore) setRefreshing(v bool) {
@@ -196,39 +173,38 @@ func (cs *channelStore) isRefreshing() bool {
 }
 
 // refresh downloads the upstream playlist, resolves each channel's country and
-// category from the iptv-org database, writes the result to the playlist file
-// (which thereby doubles as the offline fallback), and reloads. The previous
-// file is backed up once to <path>.bak so a user-curated list is recoverable.
-// Returns the channel count after reload.
-func (cs *channelStore) refresh(sourceURL string) (int, error) {
+// category from the iptv-org database, and upserts the result into the catalog
+// by stable ID — new channels inserted, existing ones updated, user state
+// (favourites, working verdicts, manual rows) preserved. Returns the channel
+// count after the rebuild.
+func (cs *channelStore) refresh() (int, error) {
 	cs.refreshMu.Lock()
 	defer cs.refreshMu.Unlock()
 	cs.setRefreshing(true)
 	defer cs.setRefreshing(false)
 
-	enriched, n, err := fetchAndEnrich(sourceURL)
+	enriched, n, err := fetchAndEnrich(cs.sourceURL)
 	if err != nil {
 		return 0, err
 	}
-
-	// One-time backup of any pre-existing playlist before we start overwriting
-	// it with the API catalog.
-	if bak := cs.path + ".bak"; fileExists(cs.path) && !fileExists(bak) {
-		if data, err := os.ReadFile(cs.path); err == nil {
-			os.WriteFile(bak, data, 0o644)
+	chs := playlist.Parse(string(enriched))
+	ins, upd, seen, err := cs.st.UpsertCatalog(chs)
+	if err != nil {
+		return 0, fmt.Errorf("upsert: %w", err)
+	}
+	if cs.prune {
+		if pruned, perr := cs.st.PruneOrphans(seen); perr != nil {
+			log.Printf("source: prune: %v", perr)
+		} else if pruned > 0 {
+			log.Printf("source: pruned %d orphaned channels", pruned)
 		}
 	}
-
-	tmp := cs.path + ".tmp"
-	if err := os.WriteFile(tmp, enriched, 0o644); err != nil {
-		return 0, fmt.Errorf("write: %w", err)
+	cs.st.SetMeta("last_sync", strconv.FormatInt(time.Now().Unix(), 10))
+	if err := cs.rebuild(); err != nil {
+		return 0, err
 	}
-	if err := os.Rename(tmp, cs.path); err != nil {
-		os.Remove(tmp)
-		return 0, fmt.Errorf("replace: %w", err)
-	}
-	log.Printf("source: enriched %d entries from %s", n, sourceURL)
-	return cs.reload(), nil
+	log.Printf("source: synced %d entries from %s (%d new, %d updated)", n, cs.sourceURL, ins, upd)
+	return cs.channelCount(), nil
 }
 
 // fetchAndEnrich downloads the source playlist and rewrites it with resolved
@@ -259,58 +235,49 @@ func fetchAndEnrich(sourceURL string) ([]byte, int, error) {
 	return enriched, n, nil
 }
 
-func fileExists(path string) bool {
-	_, err := os.Stat(path)
-	return err == nil
-}
-
 func main() {
 	addr := flag.String("addr", ":3000", "listen address")
-	playlistPath := flag.String("playlist", "", "path to M3U playlist cache (default: list.m3u next to the binary)")
-	sourceURL := flag.String("source-url", "https://iptv-org.github.io/iptv/index.m3u", "upstream playlist fetched at startup and by Sync; list.m3u is the offline fallback")
-	noRefresh := flag.Bool("no-refresh", false, "skip the startup fetch from -source-url and use the local list.m3u as-is")
+	dbPath := flag.String("db", "", "path to the SQLite catalog (default: catalog.db next to the binary)")
+	sourceURL := flag.String("source-url", "https://iptv-org.github.io/iptv/index.m3u", "upstream playlist fetched at startup and by Sync")
+	noRefresh := flag.Bool("no-refresh", false, "skip the startup fetch from -source-url and use the catalog as-is")
+	prune := flag.Bool("prune", false, "on sync, delete channels no longer upstream (keeps favourited and manual ones)")
 	cacheMB := flag.Int64("cache-mb", 200, "segment cache size in MB")
 	recDir := flag.String("rec-dir", "recordings", "directory for saved screen recordings")
 	open := flag.Bool("open", true, "open the web UI in the default browser once the server is listening")
 	flag.Parse()
 
-	// Default playlist resolution: prefer list.m3u next to the executable, but
-	// fall back to ./list.m3u (the working directory) when it isn't there. The
-	// fallback matters for `go run .`, where the binary lives in a temp build
-	// dir that never contains the playlist.
-	path := *playlistPath
+	// Default DB resolution: store/catalog.db next to the executable, so a
+	// distributed single binary keeps its catalog (and the health verdicts within
+	// it) beside it and reuses them on every restart. `go run .` (temp build dir)
+	// gets an ephemeral DB that simply re-fetches on first launch.
+	path := *dbPath
 	if path == "" {
+		path = filepath.Join("store", "catalog.db")
 		if exe, err := os.Executable(); err == nil {
-			candidate := filepath.Join(filepath.Dir(exe), "list.m3u")
-			if _, err := os.Stat(candidate); err == nil {
-				path = candidate
-			}
+			path = filepath.Join(filepath.Dir(exe), "store", "catalog.db")
 		}
-		if path == "" {
-			path = "list.m3u"
+	}
+	if dir := filepath.Dir(path); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			log.Fatalf("store: create %s: %v", dir, err)
 		}
 	}
 
-	channels := newChannelStore(path)
-	log.Printf("playlist: %d channels loaded from %s", channels.count(), path)
-
-	// Channels come from the API; the local list.m3u is just the offline cache.
-	// Serve whatever is on disk immediately, then refresh from -source-url in the
-	// background so the first paint isn't blocked on the network. Mark refreshing
-	// up front so the very first /api/source poll already reports it.
-	if !*noRefresh {
-		channels.setRefreshing(true)
-		go func() {
-			n, err := channels.refresh(*sourceURL)
-			if err != nil {
-				log.Printf("source: refresh failed, using local fallback (%d channels): %v", channels.count(), err)
-				return
-			}
-			log.Printf("source: refreshed to %d channels from %s", n, *sourceURL)
-		}()
+	st, err := store.Open(path)
+	if err != nil {
+		log.Fatalf("store: open %s: %v", path, err)
 	}
+	defer st.Close()
 
-	store := viewers.NewStore()
+	channels := newChannelStore(st, *sourceURL, *prune)
+	// Cold start: an empty catalog is seeded synchronously from the embedded
+	// playlist before we serve, so the first paint is never blank even offline.
+	if err := channels.seedIfEmpty(seedPlaylist); err != nil {
+		log.Printf("playlist: seed: %v", err)
+	}
+	log.Printf("playlist: %d channels in catalog %s", channels.channelCount(), path)
+
+	viewerStore := viewers.NewStore()
 	proxyHandler := proxy.New(*cacheMB << 20)
 
 	// Screen recording: resolve an ffmpeg (embedded copy, else PATH) and wire a
@@ -322,12 +289,62 @@ func main() {
 	} else {
 		log.Printf("recording: disabled (ffmpeg not found)")
 	}
+
 	prober := health.New()
-	// Persist health verdicts next to the playlist and load any prior pass, so a
-	// restart (or a reopened browser) reuses results instead of re-probing every
-	// stream. The cache is keyed by the list's content etag, so a changed catalog
-	// re-probes automatically; the "Working only" toggle forces a re-probe too.
-	prober.LoadCache(filepath.Join(filepath.Dir(path), "health.json"))
+	// Verdicts persist in the catalog (channels.is_working). On completion of a
+	// pass, write them back and rebuild the payload so the new state ships in
+	// /api/channels. Seed the prober from the catalog so a fresh process serves
+	// health results for the current list without re-probing until they go stale.
+	prober.OnFinish(func(verdicts map[string]bool, at time.Time) {
+		if err := st.SetHealth(verdicts, at); err != nil {
+			log.Printf("health: persist verdicts: %v", err)
+		}
+		if err := channels.rebuild(); err != nil {
+			log.Printf("health: rebuild after verdicts: %v", err)
+		}
+	})
+	if verdicts, err := st.HealthVerdicts(); err == nil && len(verdicts) > 0 {
+		prober.Seed(channels.etagValue(), verdicts, time.Now())
+	}
+
+	// startStaleProbe kicks a silent background pass over channels whose verdict
+	// is missing or older than healthTTL. It is a no-op when nothing is stale, so
+	// a restart right after a probe costs nothing; a fresh DB probes everything
+	// once. The server owns this (not the page), so browser refreshes just observe
+	// the running pass instead of each starting their own.
+	startStaleProbe := func() {
+		targets, err := st.StaleTargets(healthTTL, false)
+		if err != nil {
+			log.Printf("health: stale targets: %v", err)
+			return
+		}
+		if len(targets) == 0 {
+			return
+		}
+		// Targets are already filtered to the stale set, so force past the
+		// prober's own freshness gate.
+		prober.Start(targets, channels.etagValue(), true)
+		log.Printf("health: background re-check of %d stale channel(s)", len(targets))
+	}
+
+	// The catalog is the source of truth; refresh from -source-url in the
+	// background so the first paint isn't blocked on the network, then re-check
+	// stale streams. Mark refreshing up front so the first /api/source poll
+	// already reports it. With -no-refresh we skip the network and just re-check.
+	if !*noRefresh {
+		channels.setRefreshing(true)
+		go func() {
+			n, err := channels.refresh()
+			if err != nil {
+				log.Printf("source: refresh failed, using catalog (%d channels): %v", channels.channelCount(), err)
+			} else {
+				log.Printf("source: refreshed to %d channels from %s", n, *sourceURL)
+			}
+			startStaleProbe() // covers any channels the sync just added
+		}()
+	} else {
+		go startStaleProbe()
+	}
 
 	indexTmpl := template.Must(template.ParseFS(templateFS, "web/templates/index.html"))
 	staticSub, err := fs.Sub(staticFS, "web/static")
@@ -338,7 +355,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.Handle("GET /api/proxy", proxyHandler)
 	mux.Handle("OPTIONS /api/proxy", proxyHandler)
-	mux.Handle("/api/viewers", &viewers.Handler{Store: store})
+	mux.Handle("/api/viewers", &viewers.Handler{Store: viewerStore})
 	// Service-Worker-Allowed widens the SW scope from /static/ to / so the SW
 	// can intercept navigations to the root and control the full app.
 	swHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -370,11 +387,12 @@ func main() {
 		w.Write(raw)
 	})
 
-	// Sync re-fetches the full catalog from the API (resolving country and
-	// category) and overwrites the local cache. refresh() serializes itself, so
-	// a double-click can't race two downloads.
+	// Sync re-fetches the full catalog from the API and upserts it into the
+	// catalog by stable ID (preserving favourites, working verdicts, and manual
+	// rows). refresh() serializes itself, so a double-click can't race two
+	// downloads.
 	mux.HandleFunc("POST /api/sync", func(w http.ResponseWriter, r *http.Request) {
-		n, err := channels.refresh(*sourceURL)
+		n, err := channels.refresh()
 		if err != nil {
 			http.Error(w, "sync: "+err.Error(), http.StatusBadGateway)
 			return
@@ -388,7 +406,112 @@ func main() {
 	mux.HandleFunc("GET /api/source", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		fmt.Fprintf(w, `{"refreshing":%v,"channels":%d,"recordingAvailable":%v}`,
-			channels.isRefreshing(), channels.count(), rec.Available())
+			channels.isRefreshing(), channels.channelCount(), rec.Available())
+	})
+
+	// Favourites and manual channels live in the catalog (replacing the old
+	// browser localStorage), keyed by stable ID so they survive a re-sync.
+	mux.HandleFunc("POST /api/favourite", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			ID string `json:"id"`
+			On bool   `json:"on"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.ID == "" {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		ok, err := st.SetFavourite(body.ID, body.On)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if !ok {
+			http.Error(w, "channel not found", http.StatusNotFound)
+			return
+		}
+		channels.rebuild()
+		writeJSON(w, r, map[string]bool{"ok": true})
+	})
+
+	mux.HandleFunc("POST /api/channels/add", func(w http.ResponseWriter, r *http.Request) {
+		var body struct{ Name, URL string }
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		name, url := strings.TrimSpace(body.Name), strings.TrimSpace(body.URL)
+		if name == "" || !isStreamURL(url) {
+			http.Error(w, "channel name and an http(s) stream link are required", http.StatusBadRequest)
+			return
+		}
+		ch, err := st.AddManual(name, url)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		channels.rebuild()
+		log.Printf("channels: added manual %q (%s)", name, ch.ID)
+		writeJSON(w, r, ch)
+	})
+
+	mux.HandleFunc("DELETE /api/channels/add", func(w http.ResponseWriter, r *http.Request) {
+		var body struct{ ID string }
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.ID == "" {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		switch err := st.DeleteManual(body.ID); {
+		case errors.Is(err, store.ErrNotFound):
+			http.Error(w, "channel not found", http.StatusNotFound)
+			return
+		case errors.Is(err, store.ErrNotManual):
+			http.Error(w, "only manually-added channels can be removed", http.StatusConflict)
+			return
+		case err != nil:
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		channels.rebuild()
+		writeJSON(w, r, map[string]bool{"ok": true})
+	})
+
+	// Import a user-supplied .m3u: /parse extracts (name,url) entries for the
+	// review popup without saving; /save persists the reviewed list as manual
+	// channels. Parsing reuses the canonical playlist extractor.
+	mux.HandleFunc("POST /api/import/parse", func(w http.ResponseWriter, r *http.Request) {
+		data, err := io.ReadAll(io.LimitReader(r.Body, 16<<20))
+		if err != nil {
+			http.Error(w, "read: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		entries := playlist.ParseEntries(string(data))
+		out := make([]store.ImportEntry, 0, len(entries))
+		for _, e := range entries {
+			out = append(out, store.ImportEntry{Name: e.Name, URL: e.URL})
+		}
+		if len(out) == 0 {
+			http.Error(w, "no channels found — is this a valid .m3u playlist?", http.StatusUnprocessableEntity)
+			return
+		}
+		writeJSON(w, r, map[string]any{"entries": out})
+	})
+
+	mux.HandleFunc("POST /api/import/save", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Entries []store.ImportEntry `json:"entries"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		added, err := st.ImportManual(body.Entries)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		channels.rebuild()
+		log.Printf("channels: imported %d manual channel(s)", added)
+		writeJSON(w, r, map[string]int{"added": added})
 	})
 
 	// ── Screen recording (server-side, ffmpeg → 720p H.264/AAC MP4) ──────────
@@ -439,24 +562,31 @@ func main() {
 		http.ServeFile(w, r, filepath.Join(rec.Dir(), name))
 	})
 
-	mux.HandleFunc("POST /api/reload", func(w http.ResponseWriter, r *http.Request) {
-		n := channels.reload()
-		log.Printf("playlist: manual reload → %d channels", n)
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"channels":%d}`, n)
-	})
-
-	// Server-side stream health. POST starts (or reuses) a probe pass over the
-	// current playlist; GET returns its progress and verdicts. The "Working
-	// only" toggle in the UI drives this: it kicks off a pass and polls until
-	// done, hiding channels the server couldn't reach.
+	// Server-side stream health. POST probes the channels whose verdict is
+	// missing or stale (force=1 — the "Working only" toggle — re-probes every
+	// channel); GET returns progress and verdicts. Completed verdicts are
+	// persisted to the catalog via the OnFinish hook, so /api/channels carries
+	// the working state for steady-state filtering and this endpoint is only the
+	// probe engine.
 	mux.HandleFunc("POST /api/health", func(w http.ResponseWriter, r *http.Request) {
-		// force=1 (the "Working only" toggle) re-probes even a fresh, unchanged
-		// list; a plain POST reuses a running/fresh pass for the same etag.
 		force := r.URL.Query().Get("force") == "1"
-		targets, etag := channels.healthTargets()
-		snap := prober.Start(targets, etag, force)
-		log.Printf("health: probe requested (force=%v, %d channels, running=%v done=%d)", force, snap.Total, snap.Running, snap.Done)
+		if snap := prober.Snapshot(); snap.Running {
+			writeJSON(w, r, snap) // a pass is already in flight; let it finish
+			return
+		}
+		targets, err := st.StaleTargets(healthTTL, force)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if len(targets) == 0 {
+			writeJSON(w, r, prober.Snapshot()) // everything fresh; nothing to probe
+			return
+		}
+		// We've already selected exactly the targets that need probing, so bypass
+		// the prober's own freshness gate with force=true.
+		snap := prober.Start(targets, channels.etagValue(), true)
+		log.Printf("health: probing %d channel(s) (force=%v)", snap.Total, force)
 		writeJSON(w, r, snap)
 	})
 	mux.HandleFunc("GET /api/health", func(w http.ResponseWriter, r *http.Request) {
@@ -479,7 +609,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Background maintenance: prune stale viewer sessions, pick up playlist edits.
+	// Background maintenance: prune stale viewer sessions.
 	go func() {
 		ticker := time.NewTicker(10 * time.Second)
 		defer ticker.Stop()
@@ -488,8 +618,7 @@ func main() {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				store.Prune()
-				channels.reloadIfChanged()
+				viewerStore.Prune()
 			}
 		}
 	}()
@@ -523,62 +652,8 @@ func main() {
 	}
 }
 
-// mergeNewEntries appends entries from upstream whose stream URL is not already
-// present in existing, deduplicating by URL. Existing content is preserved
-// verbatim; each appended entry keeps its #EXTINF line plus any directive lines
-// (e.g. #EXTVLCOPT) and the URL. Returns the merged playlist and the number of
-// entries added — added==0 means nothing changed and existing is returned as is.
-func mergeNewEntries(existing, upstream []byte) ([]byte, int) {
-	seen := make(map[string]bool)
-	for _, line := range strings.Split(string(existing), "\n") {
-		if u := strings.TrimSpace(line); isStreamURL(u) {
-			seen[u] = true
-		}
-	}
-
-	var out strings.Builder
-	out.Write(existing)
-	if len(existing) > 0 && !strings.HasSuffix(string(existing), "\n") {
-		out.WriteByte('\n')
-	}
-
-	var block []string // lines of the entry currently being read
-	var blockURL string
-	added := 0
-
-	flush := func() {
-		if blockURL != "" && !seen[blockURL] {
-			seen[blockURL] = true
-			added++
-			for _, l := range block {
-				out.WriteString(l)
-				out.WriteByte('\n')
-			}
-		}
-		block = block[:0]
-		blockURL = ""
-	}
-
-	for _, raw := range strings.Split(string(upstream), "\n") {
-		line := strings.TrimSpace(raw)
-		if strings.HasPrefix(line, "#EXTINF") {
-			flush() // finalize the previous entry before starting a new one
-			block = append(block, line)
-		} else if len(block) > 0 && line != "" {
-			block = append(block, line)
-			if blockURL == "" && isStreamURL(line) {
-				blockURL = line
-			}
-		}
-	}
-	flush()
-
-	if added == 0 {
-		return existing, 0
-	}
-	return []byte(out.String()), added
-}
-
+// isStreamURL reports whether line is an http(s) URL — used to validate a
+// manually-added channel's stream link.
 func isStreamURL(line string) bool {
 	return strings.HasPrefix(line, "http://") || strings.HasPrefix(line, "https://")
 }

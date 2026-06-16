@@ -56,11 +56,102 @@ func TestParseGroupsServers(t *testing.T) {
 		t.Errorf("server order wrong: %+v", star.Servers)
 	}
 
-	// IDs are sequential indices.
+	// No tvg-id in the sample → every ID is a stable "h:" hash, unique and
+	// non-positional.
+	ids := make(map[string]bool)
 	for i, ch := range got {
-		if ch.ID != string(rune('0'+i)) {
-			t.Errorf("channel %d has ID %q", i, ch.ID)
+		if ch.ID == "" {
+			t.Errorf("channel %d has empty ID", i)
 		}
+		if got := ch.ID[:2]; got != "h:" {
+			t.Errorf("channel %d ID %q is not a hash id", i, ch.ID)
+		}
+		if ids[ch.ID] {
+			t.Errorf("duplicate ID %q", ch.ID)
+		}
+		ids[ch.ID] = true
+	}
+}
+
+func TestParseEntries(t *testing.T) {
+	// ParseEntries returns one row per stream (no merging), unlike Parse.
+	got := ParseEntries(sample)
+	// Sample has: T Sports (dup URL collapses to 1), Somoy TV, Star Sports x2,
+	// Peace TV — "No URL Channel" dropped. That's 5 raw entries.
+	if len(got) != 5 {
+		t.Fatalf("expected 5 raw entries, got %d: %+v", len(got), got)
+	}
+	// The two Star Sports stay as separate entries here (not merged).
+	star := 0
+	for _, e := range got {
+		if e.Name == "Star Sports" {
+			star++
+			if e.URL == "" {
+				t.Errorf("entry missing URL: %+v", e)
+			}
+		}
+	}
+	if star != 2 {
+		t.Errorf("expected 2 Star Sports entries, got %d", star)
+	}
+}
+
+func TestParseStableIDs(t *testing.T) {
+	const m3u = `#EXTM3U
+#EXTINF:-1 tvg-id="BBCNews.uk@SD" group-title="UK",BBC News
+https://example.com/bbc.m3u8
+#EXTINF:-1 group-title="UK",No TVG Channel
+https://example.com/notvg.m3u8
+`
+	got := Parse(m3u)
+	byName := map[string]Channel{}
+	for _, ch := range got {
+		byName[ch.Name] = ch
+	}
+
+	// tvg-id wins, with the @-suffix stripped.
+	if id := byName["BBC News"].ID; id != "tvg:BBCNews.uk" {
+		t.Errorf("BBC News ID = %q, want tvg:BBCNews.uk", id)
+	}
+	// No tvg-id → hash id.
+	if id := byName["No TVG Channel"].ID; len(id) < 2 || id[:2] != "h:" {
+		t.Errorf("No TVG Channel ID = %q, want an h: hash id", id)
+	}
+
+	// Stability: re-parsing the same content yields identical IDs.
+	again := Parse(m3u)
+	for i := range got {
+		if got[i].ID != again[i].ID {
+			t.Errorf("ID not stable across parses at %d: %q vs %q", i, got[i].ID, again[i].ID)
+		}
+	}
+}
+
+func TestParseTvgIDCollision(t *testing.T) {
+	// Two distinct channels (different groups) carrying the SAME tvg-id: the
+	// first claims tvg:, the second must fall back to a hash id so the IDs stay
+	// unique (the SQLite primary key depends on it).
+	const m3u = `#EXTM3U
+#EXTINF:-1 tvg-id="Dup.x" group-title="A",Alpha
+https://example.com/a.m3u8
+#EXTINF:-1 tvg-id="Dup.x" group-title="B",Beta
+https://example.com/b.m3u8
+`
+	got := Parse(m3u)
+	if len(got) != 2 {
+		t.Fatalf("expected 2 channels, got %d", len(got))
+	}
+	if got[0].ID == got[1].ID {
+		t.Fatalf("colliding tvg-ids produced duplicate IDs: %q", got[0].ID)
+	}
+	tvgCount := 0
+	for _, ch := range got {
+		if ch.ID == "tvg:Dup.x" {
+			tvgCount++
+		}
+	}
+	if tvgCount != 1 {
+		t.Errorf("expected exactly one channel to keep tvg:Dup.x, got %d", tvgCount)
 	}
 }
 

@@ -3,7 +3,6 @@ package health
 import (
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"testing"
 	"time"
 )
@@ -137,9 +136,9 @@ func TestProberReusesUntilEtagChanges(t *testing.T) {
 	}
 }
 
-// A finished pass is written to disk and a fresh Prober that loads it reports a
-// finished pass (and reuses it for the same etag) without probing again.
-func TestProberPersistsAndReloads(t *testing.T) {
+// OnFinish fires once a pass completes, carrying the verdicts; Seed restores a
+// prior pass so a fresh Prober reports finished and reuses it without probing.
+func TestProberOnFinishAndSeed(t *testing.T) {
 	var hits int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits++
@@ -149,28 +148,32 @@ func TestProberPersistsAndReloads(t *testing.T) {
 	defer srv.Close()
 
 	targets := []Target{{ID: "a", URLs: []string{srv.URL + "/a.m3u8"}}}
-	cachePath := filepath.Join(t.TempDir(), "health.json")
 
-	// First process: probe once and persist.
+	// First process: probe once; OnFinish captures the verdicts (as the store
+	// would, to persist them).
+	var saved map[string]bool
 	p1 := New()
-	p1.LoadCache(cachePath) // nothing on disk yet
+	p1.OnFinish(func(v map[string]bool, _ time.Time) { saved = v })
 	p1.Start(targets, "v1", false)
 	waitFinished(t, p1)
 	if hits != 1 {
 		t.Fatalf("first pass: hits = %d, want 1", hits)
 	}
+	if saved == nil || !saved["a"] {
+		t.Fatalf("OnFinish verdicts = %+v, want a=true", saved)
+	}
 
-	// Second process: load the saved pass — finished, no probe.
+	// Second process: seed from the saved verdicts — finished, no probe.
 	p2 := New()
-	p2.LoadCache(cachePath)
+	p2.Seed("v1", saved, time.Now())
 	snap := p2.Snapshot()
 	if !snap.Finished || snap.Etag != "v1" || !snap.Status["a"] {
-		t.Fatalf("loaded snapshot = %+v, want finished v1 with a=true", snap)
+		t.Fatalf("seeded snapshot = %+v, want finished v1 with a=true", snap)
 	}
-	// Same etag → reuse the loaded verdicts, still no new fetch.
+	// Same etag → reuse the seeded verdicts, still no new fetch.
 	p2.Start(targets, "v1", false)
 	waitFinished(t, p2)
 	if hits != 1 {
-		t.Errorf("reload re-probed: hits = %d, want 1", hits)
+		t.Errorf("seeded reuse re-probed: hits = %d, want 1", hits)
 	}
 }
