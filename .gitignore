@@ -10,6 +10,9 @@ catalog.db
 catalog.db-wal
 catalog.db-shm
 recordings/
+# ClearKey DRM pairs — local convenience cache, never committed.
+keys.json
+keys.json.tmp
 # Embedded ffmpeg is fetched by build.ps1, not committed (keep bin/.gitkeep).
 internal/ffmpeg/bin/ffmpeg.exe
 internal/ffmpeg/bin/ffmpeg

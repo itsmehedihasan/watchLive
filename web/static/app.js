@@ -77,6 +77,7 @@
   let sourceRefreshing = false; // server is fetching the catalog from the API
   let search = '';              // country-drawer search
   let topChannelIds = [];       // channel ids ranked by tune-ins
+  let clearKeys = {};           // global ClearKey map (KID→KEY) from /api/keys
 
   const MAX_CELLS = 4;
   const cells = [];               // one entry per grid cell (see makeCell)
@@ -112,8 +113,11 @@
     pickerSearch: $('pickerSearch'), pickerSearchClear: $('pickerSearchClear'),
     pickerList: $('pickerList'), pickerCount: $('pickerCount'),
     addChannelBtn: $('addChannelBtn'), addChannel: $('addChannel'),
+    addChannelTitle: $('addChannelTitle'),
     addChannelForm: $('addChannelForm'), addChannelName: $('addChannelName'),
-    addChannelUrl: $('addChannelUrl'), addChannelError: $('addChannelError'),
+    addChannelUrl: $('addChannelUrl'), addChannelLicense: $('addChannelLicense'),
+    addChannelLicToggle: $('addChannelLicToggle'), addChannelLicWrap: $('addChannelLicWrap'),
+    addChannelError: $('addChannelError'),
     addChannelClose: $('addChannelClose'), addChannelCancel: $('addChannelCancel'),
     addChannelSave: $('addChannelSave'),
     importBtn: $('importBtn'), importFile: $('importFile'), importModal: $('importModal'),
@@ -153,6 +157,9 @@
   // ch.is_favourite in /api/channels. Favourites ignore the "Working only"
   // filter.
   function isFav(ch) { return !!ch.is_favourite; }
+  // Manually-added channels carry a "manual:" id namespace; only these can have
+  // their link edited or be deleted (feed channels are sync-owned).
+  function isManual(ch) { return ch.id.indexOf('manual:') === 0; }
   // Toggle a favourite optimistically, then persist. On failure the flag is
   // reverted and the UI re-synced.
   function setFav(ch, on) {
@@ -479,8 +486,33 @@
     cell.shaka = player;
     player.attach(cell.video).then(function () {
       if (token !== cell.token) return;
-      player.getNetworkingEngine().registerRequestFilter(function (_, req) {
-        req.uris = req.uris.map(function (u) { return proxyUrl(u); });
+      // CENC-encrypted streams carry their ClearKey pairs on the channel; feed
+      // them to Shaka so it can decrypt and proceed to fetch media segments.
+      // CENC-encrypted streams need their ClearKey pairs before load(). Merge the
+      // global keystore (keys.json, applies to any matching KID) with any keys
+      // bound to this channel; Shaka picks the KID its manifest advertises.
+      const chKeys = (cell.channel && cell.channel.clear_keys) || {};
+      const keys = Object.assign({}, clearKeys, chKeys);
+      if (Object.keys(keys).length) {
+        player.configure({ drm: { clearKeys: keys } });
+      }
+      player.getNetworkingEngine().registerRequestFilter(function (type, req) {
+        // Only manifest + segment fetches need the proxy (CORS + header
+        // spoofing). Leave LICENSE requests (local data: URIs Shaka resolves
+        // itself — proxying them POSTs to our GET-only proxy and 405s) and
+        // TIMING requests alone: proxying the live clock-sync request would
+        // cache the current-time response as a "segment" for minutes, freezing
+        // Shaka's live edge and stalling playback right after the initial
+        // buffer (~10s). time.akamai.com is a public CORS time service meant to
+        // be fetched directly.
+        const RT = shaka.net.NetworkingEngine.RequestType;
+        if (type !== RT.MANIFEST && type !== RT.SEGMENT) return;
+        const ownApi = location.origin + '/api/';
+        req.uris = req.uris.map(function (u) {
+          if (!/^https?:/i.test(u)) return u;     // data:/blob: — leave alone
+          if (u.indexOf(ownApi) === 0) return u;  // already same-origin — never re-wrap (no proxy?url=proxy?url=…)
+          return proxyUrl(u);
+        });
       });
       player.addEventListener('error', function () { if (token === cell.token) failover(cell); });
       player.addEventListener('adaptation', function () { if (token === cell.token) refreshCellSettings(cell); });
@@ -998,51 +1030,94 @@
   function maybeHideScrim() {
     const anyOpen = els.categorySidebar.classList.contains('open') ||
                   els.sidebar.classList.contains('open') || !els.picker.hidden ||
-                  !els.addChannel.hidden || !els.importModal.hidden || !els.importConflict.hidden;
+                  !els.addChannel.hidden ||
+                  !els.importModal.hidden || !els.importConflict.hidden;
     els.scrim.hidden = !anyOpen;
   }
 
-  // ── Add-channel modal ─────────────────────────────────────────────────────
-  function openAddChannel() {
+  // ── Channel modal — shared by Add (+) and Edit (pen) ──────────────────────
+  // One modal serves both: 'add' creates a manual channel, 'edit' updates an
+  // existing one in place (same id, so favourite/health survive). The license
+  // field is collapsed behind the 3-dot toggle and only revealed on demand.
+  let channelModalMode = 'add';
+  let channelModalId = null;
+
+  function setLicenseOpen(on) {
+    els.addChannelLicToggle.classList.toggle('open', on);
+    els.addChannelLicToggle.setAttribute('aria-expanded', on ? 'true' : 'false');
+    els.addChannelLicWrap.classList.toggle('show', on);
+  }
+
+  function openChannelModal(mode, ch) {
     closeDrawers();
+    channelModalMode = mode;
+    channelModalId = (mode === 'edit' && ch) ? ch.id : null;
     els.addChannelError.hidden = true;
     els.addChannelForm.reset();
+    setLicenseOpen(false); // license hidden by default
+    const editing = mode === 'edit' && ch;
+    els.addChannelTitle.textContent = editing ? 'Update stream link' : 'Add a channel';
+    els.addChannelSave.textContent = editing ? 'Update' : 'Save';
+    els.addChannelSave.disabled = false;
+    if (editing) {
+      els.addChannelName.value = ch.name || '';
+      els.addChannelUrl.value = (ch.servers && ch.servers[0] && ch.servers[0].url) || '';
+    }
     els.addChannel.hidden = false;
     els.scrim.hidden = false;
-    setTimeout(function () { els.addChannelName.focus(); }, 0);
+    setTimeout(function () {
+      if (editing) { els.addChannelUrl.focus(); els.addChannelUrl.select(); }
+      else els.addChannelName.focus();
+    }, 0);
   }
+  function openAddChannel() { openChannelModal('add', null); }
+  function openEditChannel(ch) { openChannelModal('edit', ch); }
+
   function closeAddChannel() {
     els.addChannel.hidden = true;
     els.addChannelSave.disabled = false;
-    els.addChannelSave.textContent = 'Save';
+    els.addChannelSave.textContent = channelModalMode === 'edit' ? 'Update' : 'Save';
+    channelModalId = null;
     maybeHideScrim();
   }
+
   els.addChannelBtn.addEventListener('click', openAddChannel);
   els.addChannelClose.addEventListener('click', closeAddChannel);
   els.addChannelCancel.addEventListener('click', closeAddChannel);
+  els.addChannelLicToggle.addEventListener('click', function () {
+    setLicenseOpen(!els.addChannelLicWrap.classList.contains('show'));
+  });
   els.addChannelForm.addEventListener('submit', function (e) {
     e.preventDefault();
     const name = els.addChannelName.value.trim();
     const url = els.addChannelUrl.value.trim();
+    const license = els.addChannelLicense.value.trim();
     if (!name || !/^https?:\/\//i.test(url)) {
       els.addChannelError.textContent = 'Enter a name and an http(s) stream link.';
       els.addChannelError.hidden = false;
       return;
     }
+    const editing = channelModalMode === 'edit';
+    const endpoint = editing ? '/api/channels/update' : '/api/channels/add';
+    const payload = editing
+      ? { id: channelModalId, name: name, url: url, license: license }
+      : { name: name, url: url, license: license };
     els.addChannelSave.disabled = true;
-    els.addChannelSave.textContent = 'Saving…';
-    fetch('/api/channels/add', {
+    els.addChannelSave.textContent = editing ? 'Updating…' : 'Saving…';
+    fetch(endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: name, url: url }),
+      body: JSON.stringify(payload),
     })
-      .then(function (r) { if (!r.ok) throw new Error('add failed: ' + r.status); return r.json(); })
-      .then(function () { closeAddChannel(); loadChannels(); })
+      .then(function (r) { if (!r.ok) throw new Error('save failed: ' + r.status); return r.json(); })
+      .then(function () { closeAddChannel(); loadKeys(); loadChannels(); })
       .catch(function () {
-        els.addChannelError.textContent = 'Could not add the channel. Check the link and try again.';
+        els.addChannelError.textContent = editing
+          ? 'Could not update the channel. Check the link and try again.'
+          : 'Could not add the channel. Check the link and try again.';
         els.addChannelError.hidden = false;
         els.addChannelSave.disabled = false;
-        els.addChannelSave.textContent = 'Save';
+        els.addChannelSave.textContent = editing ? 'Update' : 'Save';
       });
   });
 
@@ -1062,6 +1137,9 @@
   function addImportRow(entry) {
     const row = document.createElement('div');
     row.className = 'import-row';
+    // ClearKey pairs parsed from the playlist ride along on the row (no UI), so
+    // they survive review and reach the save/check requests unchanged.
+    if (entry.clear_keys && Object.keys(entry.clear_keys).length) row._clearKeys = entry.clear_keys;
     const name = document.createElement('input');
     name.className = 'import-name'; name.type = 'text'; name.placeholder = 'Name';
     name.value = entry.name || '';
@@ -1125,7 +1203,7 @@
       body: JSON.stringify({ entries: entries }),
     })
       .then(function (r) { if (!r.ok) throw new Error('save failed: ' + r.status); return r.json(); })
-      .then(function () { closeImportConflict(); closeImport(); loadChannels(); })
+      .then(function () { closeImportConflict(); closeImport(); loadKeys(); loadChannels(); })
       .catch(function () {
         restore();
         els.importError.textContent = 'Could not save the channels. Please try again.';
@@ -1138,7 +1216,11 @@
     Array.prototype.slice.call(els.importList.querySelectorAll('.import-row')).forEach(function (row) {
       const name = row.querySelector('.import-name').value.trim();
       const url = row.querySelector('.import-url').value.trim();
-      if (name && /^https?:\/\//i.test(url)) entries.push({ name: name, url: url });
+      if (name && /^https?:\/\//i.test(url)) {
+        const e = { name: name, url: url };
+        if (row._clearKeys) e.clear_keys = row._clearKeys;
+        entries.push(e);
+      }
     });
     return entries;
   }
@@ -1261,6 +1343,21 @@
       onFavChanged();
     });
     btn.appendChild(pin);
+    // Edit-link (pen) — only for manually-added channels; a feed channel's link
+    // is overwritten on the next sync, so editing it would be futile.
+    if (isManual(ch)) {
+      const edit = document.createElement('span');
+      edit.className = 'edit-btn';
+      edit.setAttribute('role', 'button');
+      edit.title = 'Update stream link';
+      edit.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+        '<path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>';
+      edit.addEventListener('click', function (e) {
+        e.stopPropagation();
+        openEditChannel(ch);
+      });
+      btn.appendChild(edit);
+    }
     btn.addEventListener('click', function () { onClick(ch); });
     return btn;
   }
@@ -1616,6 +1713,17 @@
   }
 
   // ── Init ─────────────────────────────────────────────────────────────────
+  // Fetch the global ClearKey map once at startup (and after any key change).
+  // It's handed to Shaka on every DASH stream, which uses only the KID its
+  // manifest advertises and ignores the rest. Failure is non-fatal — clear
+  // streams play regardless.
+  function loadKeys() {
+    fetch('/api/keys')
+      .then(function (r) { return r.ok ? r.json() : {}; })
+      .then(function (data) { clearKeys = (data && typeof data === 'object') ? data : {}; })
+      .catch(function () { /* keep whatever we had */ });
+  }
+
   function loadChannels() {
     fetch('/api/channels')
       .then(function (r) {
@@ -1670,6 +1778,7 @@
     renderCategorySidebar();
     renderChannelList();
     updateHealthStatus();
+    loadKeys();
     loadChannels();
     pollSource();
     beat();

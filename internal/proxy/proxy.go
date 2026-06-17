@@ -225,14 +225,19 @@ func (h *Handler) fetchUpstream(target string) fetchResult {
 	}
 
 	if isDASH {
-		// DASH manifests are NOT rewritten — the Shaka client routes every
-		// segment request back through this proxy via a request filter, so the
-		// manifest's relative URLs must stay intact. Short TTL keeps the live
-		// manifest fresh.
+		// The Shaka client routes every segment request back through this proxy
+		// via a request filter, so segment URLs stay absolute. But Shaka resolves
+		// the manifest's RELATIVE URLs against the URL it fetched the manifest
+		// from — which is our /api/proxy?url=… endpoint, not the real origin — so
+		// without help a relative "seg.dash" resolves to /api/seg.dash and 404s.
+		// Inject an absolute <BaseURL> (the manifest's own directory) so relative
+		// resolution targets the real origin; the request filter then proxies the
+		// resulting absolute URLs. Short TTL keeps the live manifest fresh.
 		body, err := io.ReadAll(io.LimitReader(resp.Body, maxPlaylistLen))
 		if err != nil {
 			return fetchResult{err: err}
 		}
+		body = []byte(injectDASHBaseURL(string(body), target))
 		ct := contentType
 		if ct == "" {
 			ct = "application/dash+xml"
@@ -369,6 +374,33 @@ func RewritePlaylist(text, targetURL string) string {
 		lines[i] = proxied(trimmed)
 	}
 	return strings.Join(lines, "\n")
+}
+
+// mpdOpenRe matches the opening <MPD …> tag (case-insensitive, attributes and
+// newlines allowed) so a BaseURL can be inserted as its first child.
+var mpdOpenRe = regexp.MustCompile(`(?is)<MPD\b[^>]*>`)
+
+// injectDASHBaseURL inserts an absolute <BaseURL> — the manifest's own
+// directory — as the first child of <MPD>, so a Shaka client resolves the
+// manifest's relative segment URLs against the real origin rather than the
+// /api/proxy?url=… URL it was fetched through (which would 404 every segment).
+// Per the DASH spec an absolute MPD-level BaseURL is the base for all relative
+// URLs below it, exactly the resolution that would have happened had the
+// manifest been loaded directly. Manifests with no <MPD> tag (or already an
+// absolute BaseURL) are returned unchanged.
+func injectDASHBaseURL(mpd, manifestURL string) string {
+	loc := mpdOpenRe.FindStringIndex(mpd)
+	if loc == nil {
+		return mpd // not a manifest we recognize — leave it alone
+	}
+	base := manifestURL
+	if i := strings.LastIndex(manifestURL, "/"); i >= 0 {
+		base = manifestURL[:i+1]
+	}
+	// & is the only char that must be escaped inside an XML text node here; the
+	// rest of a URL is valid character data.
+	base = strings.ReplaceAll(base, "&", "&amp;")
+	return mpd[:loc[1]] + "<BaseURL>" + base + "</BaseURL>" + mpd[loc[1]:]
 }
 
 func isHTTPURL(s string) bool {

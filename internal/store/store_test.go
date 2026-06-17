@@ -84,7 +84,7 @@ func TestUpsertPreservesUserState(t *testing.T) {
 
 func TestUpsertNeverTouchesManual(t *testing.T) {
 	s := open(t)
-	m, err := s.AddManual("My Stream", "http://m/1")
+	m, err := s.AddManual("My Stream", "http://m/1", nil)
 	if err != nil {
 		t.Fatalf("AddManual: %v", err)
 	}
@@ -114,8 +114,8 @@ func TestSetFavouriteMissing(t *testing.T) {
 
 func TestAddManualIdempotentAndNamespaced(t *testing.T) {
 	s := open(t)
-	a, _ := s.AddManual("Chan", "http://c/1")
-	b, _ := s.AddManual("Chan", "http://c/1")
+	a, _ := s.AddManual("Chan", "http://c/1", nil)
+	b, _ := s.AddManual("Chan", "http://c/1", nil)
 	if a.ID != b.ID {
 		t.Errorf("re-add changed id: %q vs %q", a.ID, b.ID)
 	}
@@ -130,7 +130,7 @@ func TestAddManualIdempotentAndNamespaced(t *testing.T) {
 	}
 
 	// Different URL → distinct channel.
-	c, _ := s.AddManual("Chan", "http://c/2")
+	c, _ := s.AddManual("Chan", "http://c/2", nil)
 	if c.ID == a.ID {
 		t.Error("different url should yield a different id")
 	}
@@ -138,7 +138,7 @@ func TestAddManualIdempotentAndNamespaced(t *testing.T) {
 
 func TestDeleteManual(t *testing.T) {
 	s := open(t)
-	m, _ := s.AddManual("Gone", "http://g/1")
+	m, _ := s.AddManual("Gone", "http://g/1", nil)
 	if _, _, _, err := s.UpsertCatalog([]playlist.Channel{ch("tvg:f", "Feed", "http://f/1")}); err != nil {
 		t.Fatalf("upsert: %v", err)
 	}
@@ -154,6 +154,52 @@ func TestDeleteManual(t *testing.T) {
 	}
 	if n, _ := s.Count(); n != 1 {
 		t.Errorf("after delete want 1 row, got %d", n)
+	}
+}
+
+func TestUpdateManual(t *testing.T) {
+	s := open(t)
+	m, _ := s.AddManual("Mine", "http://m/old", nil)
+	s.SetFavourite(m.ID, true)
+	s.SetHealth(map[string]bool{m.ID: true}, time.Unix(1000, 0))
+
+	// Updating keeps the same id, so favourite/health state survives.
+	got, err := s.UpdateManual(m.ID, "  Mine HD  ", "  http://m/new  ")
+	if err != nil {
+		t.Fatalf("UpdateManual: %v", err)
+	}
+	if got.ID != m.ID {
+		t.Errorf("id changed on update: %q -> %q", m.ID, got.ID)
+	}
+	if got.Name != "Mine HD" {
+		t.Errorf("name not updated/trimmed: %q", got.Name)
+	}
+	if len(got.Servers) != 1 || got.Servers[0].URL != "http://m/new" {
+		t.Errorf("link not updated/trimmed: %+v", got.Servers)
+	}
+	if !got.IsFavourite {
+		t.Error("favourite lost on update")
+	}
+	if got.IsWorking == nil || !*got.IsWorking {
+		t.Error("health verdict lost on update")
+	}
+
+	// The new URL is indexed; the old one is gone.
+	idx, _ := s.URLIndex()
+	if _, ok := idx["http://m/new"]; !ok {
+		t.Error("updated URL not indexed")
+	}
+	if _, ok := idx["http://m/old"]; ok {
+		t.Error("old URL still indexed after update")
+	}
+
+	// Feed channels and unknown ids are refused.
+	s.UpsertCatalog([]playlist.Channel{ch("tvg:f", "Feed", "http://f/1")})
+	if _, err := s.UpdateManual("tvg:f", "Feed", "http://f/2"); err != ErrNotManual {
+		t.Errorf("update feed: got %v, want ErrNotManual", err)
+	}
+	if _, err := s.UpdateManual("manual:missing", "X", "http://x/1"); err != ErrNotFound {
+		t.Errorf("update missing: got %v, want ErrNotFound", err)
 	}
 }
 
@@ -233,7 +279,7 @@ func TestPruneOrphans(t *testing.T) {
 		ch("orphan", "Orphan", "http://o"),
 	})
 	s.SetFavourite("fav", true)
-	man, _ := s.AddManual("Man", "http://m")
+	man, _ := s.AddManual("Man", "http://m", nil)
 
 	// New feed no longer contains "fav" or "orphan".
 	_, _, seen, _ := s.UpsertCatalog([]playlist.Channel{ch("keep", "Keep", "http://k")})
@@ -320,7 +366,7 @@ func TestImportManual(t *testing.T) {
 func TestURLIndex(t *testing.T) {
 	s := open(t)
 	s.UpsertCatalog([]playlist.Channel{ch("tvg:x", "Multi", "http://x/1", "http://x/2")})
-	s.AddManual("Mine", "http://m/1")
+	s.AddManual("Mine", "http://m/1", nil)
 	idx, err := s.URLIndex()
 	if err != nil {
 		t.Fatalf("URLIndex: %v", err)
@@ -333,6 +379,46 @@ func TestURLIndex(t *testing.T) {
 	}
 	if _, ok := idx["http://absent"]; ok {
 		t.Error("unexpected URL in index")
+	}
+}
+
+func TestClearKeysRoundTrip(t *testing.T) {
+	s := open(t)
+
+	keys := map[string]string{"549ab7cd35a64bb6bb479ecead04d69d": "829799ed534d11fcadeb4b192467e050"}
+
+	// Manual add carries the key through to ListChannels.
+	if _, err := s.AddManual("DRM Chan", "https://x/index.mpd", keys); err != nil {
+		t.Fatalf("AddManual: %v", err)
+	}
+	// Import carries it too.
+	if _, err := s.ImportManual([]ImportEntry{{Name: "DRM Import", URL: "https://y/index.mpd", ClearKeys: keys}}); err != nil {
+		t.Fatalf("ImportManual: %v", err)
+	}
+	// A feed channel with a key survives upsert.
+	feed := ch("tvg:drm", "DRM Feed", "https://z/index.mpd")
+	feed.ClearKeys = keys
+	if _, _, _, err := s.UpsertCatalog([]playlist.Channel{feed}); err != nil {
+		t.Fatalf("UpsertCatalog: %v", err)
+	}
+
+	chans, _ := s.ListChannels()
+	if len(chans) != 3 {
+		t.Fatalf("want 3 channels, got %d", len(chans))
+	}
+	for _, c := range chans {
+		if c.ClearKeys["549ab7cd35a64bb6bb479ecead04d69d"] != "829799ed534d11fcadeb4b192467e050" {
+			t.Errorf("%s lost its clear key: %+v", c.Name, c.ClearKeys)
+		}
+	}
+
+	// A clear channel has no keys (nil, not an empty map artefact).
+	if _, err := s.AddManual("Clear", "https://c/stream.m3u8", nil); err != nil {
+		t.Fatalf("AddManual clear: %v", err)
+	}
+	got, _ := s.getChannel("manual:" + manualHash("Clear", "https://c/stream.m3u8"))
+	if got.ClearKeys != nil {
+		t.Errorf("clear channel should have nil ClearKeys, got %+v", got.ClearKeys)
 	}
 }
 

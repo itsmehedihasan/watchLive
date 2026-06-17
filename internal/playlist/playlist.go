@@ -29,6 +29,12 @@ type Channel struct {
 	Type    string   `json:"type"`
 	Servers []Server `json:"servers"`
 
+	// ClearKeys holds ClearKey DRM decryption keys as {kidHex: keyHex} (lowercase,
+	// dash-free). Present only for CENC-encrypted streams whose key travels with
+	// the entry (e.g. a #KODIPROP:…license_key= line); fed verbatim to Shaka's
+	// drm.clearKeys config. Omitted when the stream is clear.
+	ClearKeys map[string]string `json:"clear_keys,omitempty"`
+
 	// TvgID is the upstream tvg-id (when present); it seeds the stable channel
 	// ID. mergeKey is the (group, normalized-name) key the channel was merged
 	// under and is the fallback basis for the stable ID. Neither is serialized.
@@ -42,6 +48,12 @@ var (
 	genreRe = regexp.MustCompile(`tvg-genre="([^"]*)"`)
 	tvgIDRe = regexp.MustCompile(`tvg-id="([^"]*)"`)
 	httpRe  = regexp.MustCompile(`(?i)^https?://`)
+	// license_key in a #KODIPROP / #EXTVLCOPT directive carries ClearKey pairs
+	// (KID:KEY[,KID:KEY…]) for CENC streams; a Widevine license-server URL also
+	// lands here but is rejected by ParseClearKeys (not KID:KEY hex form).
+	licenseKeyRe = regexp.MustCompile(`(?i)license_key=(.+)$`)
+	// A ClearKey KID or key is 16 bytes = 32 hex chars (dashes stripped).
+	hexKeyRe = regexp.MustCompile(`^[0-9a-f]{32}$`)
 	// Quality suffixes like "(720p)", "(1080p)", "(2160p)" and resolution
 	// forms like "(640x360)" — used as iptv-org naming convention.
 	qualityRe = regexp.MustCompile(`\s*\((\d{3,4}p|\d+x\d+)\)`)
@@ -94,6 +106,50 @@ func normalizeName(name string) (clean, label string) {
 // for the same channel are merged into a Channel with multiple Servers.
 type Entry struct {
 	Name, Logo, Group, URL, Genre, TvgID string
+	// ClearKeys holds any ClearKey pairs parsed from a #KODIPROP/#EXTVLCOPT
+	// license_key directive between this #EXTINF and its URL. Nil when clear.
+	ClearKeys map[string]string
+}
+
+// ParseClearKeys parses a ClearKey license string of the form
+// "KID:KEY[,KID:KEY…]" (separators: comma, semicolon, or whitespace) into a
+// {kidHex: keyHex} map with lowercase, dash-free 32-hex-char values. Anything
+// that isn't a valid hex KID:KEY pair (e.g. a Widevine license URL) is skipped;
+// returns nil when nothing valid is found.
+func ParseClearKeys(s string) map[string]string {
+	fields := strings.FieldsFunc(s, func(r rune) bool {
+		switch r {
+		case ',', ';', ' ', '\t', '\n', '\r':
+			return true
+		}
+		return false
+	})
+	out := make(map[string]string)
+	for _, f := range fields {
+		kid, key, ok := strings.Cut(f, ":")
+		if !ok {
+			continue
+		}
+		kid, key = normalizeHexKey(kid), normalizeHexKey(key)
+		if kid != "" && key != "" {
+			out[kid] = key
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// normalizeHexKey lowercases a KID/key and strips dashes (UUID-form KIDs), then
+// validates it as 32 hex chars; returns "" when not a valid 16-byte hex value.
+func normalizeHexKey(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	s = strings.ReplaceAll(s, "-", "")
+	if !hexKeyRe.MatchString(s) {
+		return ""
+	}
+	return s
 }
 
 // ParseEntries extracts the raw (name, url, …) entries from M3U content, one per
@@ -145,14 +201,22 @@ func ParseEntries(content string) []Entry {
 			continue
 		}
 
-		// Take the first valid HTTP URL after this #EXTINF line.
+		// Take the first valid HTTP URL after this #EXTINF line, capturing any
+		// ClearKey license_key directive that precedes it in the same block.
 		url := ""
+		clearRaw := ""
 		for j := i + 1; j < len(lines); j++ {
 			next := lines[j]
 			if strings.HasPrefix(next, "#EXTINF") {
 				break
 			}
-			if next != "" && !strings.HasPrefix(next, "#") && httpRe.MatchString(next) {
+			if strings.HasPrefix(next, "#") {
+				if m := licenseKeyRe.FindStringSubmatch(next); m != nil {
+					clearRaw = m[1]
+				}
+				continue
+			}
+			if next != "" && httpRe.MatchString(next) {
 				url = next
 				break
 			}
@@ -166,7 +230,7 @@ func ParseEntries(content string) []Entry {
 			continue
 		}
 		seen[key] = struct{}{}
-		entries = append(entries, Entry{Name: name, Logo: logo, Group: group, URL: url, Genre: genre, TvgID: tvgID})
+		entries = append(entries, Entry{Name: name, Logo: logo, Group: group, URL: url, Genre: genre, TvgID: tvgID, ClearKeys: ParseClearKeys(clearRaw)})
 	}
 	return entries
 }
@@ -241,6 +305,10 @@ func Parse(content string) []Channel {
 		// mirroring the logo backfill above.
 		if ch.TvgID == "" {
 			ch.TvgID = e.TvgID
+		}
+		// First entry carrying ClearKey pairs wins for the merged channel.
+		if len(ch.ClearKeys) == 0 && len(e.ClearKeys) > 0 {
+			ch.ClearKeys = e.ClearKeys
 		}
 
 		dup := false

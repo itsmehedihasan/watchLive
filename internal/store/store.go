@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS channels (
     grp             TEXT NOT NULL DEFAULT '',
     typ             TEXT NOT NULL DEFAULT '',
     servers         TEXT NOT NULL DEFAULT '[]',
+    clear_keys      TEXT NOT NULL DEFAULT '',
     is_working      INTEGER,
     last_checked_at INTEGER,
     is_favourite    INTEGER NOT NULL DEFAULT 0,
@@ -71,6 +72,9 @@ type Channel struct {
 	Group       string            `json:"group"`
 	Type        string            `json:"type"`
 	Servers     []playlist.Server `json:"servers"`
+	// ClearKeys holds ClearKey DRM pairs {kidHex: keyHex} for CENC streams,
+	// passed straight to Shaka's drm.clearKeys. Omitted when the stream is clear.
+	ClearKeys   map[string]string `json:"clear_keys,omitempty"`
 	IsFavourite bool              `json:"is_favourite"`
 	// IsWorking is null until the channel has been probed, then true/false. The
 	// frontend treats only an explicit false as "hide when working-only".
@@ -109,6 +113,13 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("store: migrate: %w", err)
 	}
+	// Columns added after the initial schema. SQLite has no "ADD COLUMN IF NOT
+	// EXISTS", so a duplicate-column error on an already-migrated DB is benign.
+	if _, err := db.Exec(`ALTER TABLE channels ADD COLUMN clear_keys TEXT NOT NULL DEFAULT ''`); err != nil &&
+		!strings.Contains(err.Error(), "duplicate column") {
+		db.Close()
+		return nil, fmt.Errorf("store: migrate clear_keys: %w", err)
+	}
 	return &Store{db: db}, nil
 }
 
@@ -132,7 +143,7 @@ func (s *Store) IsEmpty() (bool, error) {
 // carrying its favourite and working state.
 func (s *Store) ListChannels() ([]Channel, error) {
 	rows, err := s.db.Query(`
-		SELECT id, name, logo, grp, typ, servers, is_favourite, is_working
+		SELECT id, name, logo, grp, typ, servers, clear_keys, is_favourite, is_working
 		FROM channels ORDER BY sort_name, name`)
 	if err != nil {
 		return nil, err
@@ -158,15 +169,21 @@ func scanChannel(row scanner) (Channel, error) {
 	var (
 		ch        Channel
 		serversJS string
+		clearJS   string
 		fav       int
 		working   sql.NullInt64
 	)
-	if err := row.Scan(&ch.ID, &ch.Name, &ch.Logo, &ch.Group, &ch.Type, &serversJS, &fav, &working); err != nil {
+	if err := row.Scan(&ch.ID, &ch.Name, &ch.Logo, &ch.Group, &ch.Type, &serversJS, &clearJS, &fav, &working); err != nil {
 		return Channel{}, err
 	}
 	if serversJS != "" {
 		if err := json.Unmarshal([]byte(serversJS), &ch.Servers); err != nil {
 			return Channel{}, fmt.Errorf("store: servers json for %s: %w", ch.ID, err)
+		}
+	}
+	if clearJS != "" {
+		if err := json.Unmarshal([]byte(clearJS), &ch.ClearKeys); err != nil {
+			return Channel{}, fmt.Errorf("store: clear_keys json for %s: %w", ch.ID, err)
 		}
 	}
 	ch.IsFavourite = fav != 0
@@ -202,11 +219,12 @@ func (s *Store) UpsertCatalog(chs []playlist.Channel) (ins, upd int, seen map[st
 	// the SET list so they survive a re-sync; the WHERE keeps manual rows (which
 	// never appear in the feed anyway) untouched even on an ID collision.
 	stmt, err := tx.Prepare(`
-		INSERT INTO channels (id, name, logo, grp, typ, servers, sort_name, is_manual)
-		VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+		INSERT INTO channels (id, name, logo, grp, typ, servers, clear_keys, sort_name, is_manual)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
 		ON CONFLICT(id) DO UPDATE SET
 			name=excluded.name, logo=excluded.logo, grp=excluded.grp,
-			typ=excluded.typ, servers=excluded.servers, sort_name=excluded.sort_name
+			typ=excluded.typ, servers=excluded.servers, clear_keys=excluded.clear_keys,
+			sort_name=excluded.sort_name
 		WHERE channels.is_manual = 0`)
 	if err != nil {
 		return 0, 0, nil, err
@@ -218,7 +236,7 @@ func (s *Store) UpsertCatalog(chs []playlist.Channel) (ins, upd int, seen map[st
 		if merr != nil || string(serversJS) == "null" {
 			serversJS = []byte("[]")
 		}
-		if _, err = stmt.Exec(ch.ID, ch.Name, ch.Logo, ch.Group, ch.Type, string(serversJS), strings.ToLower(ch.Name)); err != nil {
+		if _, err = stmt.Exec(ch.ID, ch.Name, ch.Logo, ch.Group, ch.Type, string(serversJS), marshalKeys(ch.ClearKeys), strings.ToLower(ch.Name)); err != nil {
 			return 0, 0, nil, err
 		}
 		if seen[ch.ID] {
@@ -273,18 +291,18 @@ func (s *Store) SetFavourite(id string, on bool) (ok bool, err error) {
 // AddManual inserts a user-provided channel. It is favourited and marked working
 // by default (the user just gave us a URL they want), and idempotent on the same
 // name+url so a re-add doesn't duplicate.
-func (s *Store) AddManual(name, url string) (Channel, error) {
+func (s *Store) AddManual(name, url string, clearKeys map[string]string) (Channel, error) {
 	name, url = strings.TrimSpace(name), strings.TrimSpace(url)
 	id := "manual:" + manualHash(name, url)
 	serversJS, _ := json.Marshal([]playlist.Server{{URL: url}})
 
 	_, err := s.db.Exec(`
 		INSERT INTO channels
-			(id, name, logo, grp, typ, servers, is_working, last_checked_at, is_favourite, is_manual, sort_name)
-		VALUES (?, ?, '', ?, ?, ?, 1, ?, 1, 1, ?)
+			(id, name, logo, grp, typ, servers, clear_keys, is_working, last_checked_at, is_favourite, is_manual, sort_name)
+		VALUES (?, ?, '', ?, ?, ?, ?, 1, ?, 1, 1, ?)
 		ON CONFLICT(id) DO UPDATE SET
-			name=excluded.name, servers=excluded.servers, sort_name=excluded.sort_name`,
-		id, name, manualGroup, manualType, string(serversJS), now().Unix(), strings.ToLower(name))
+			name=excluded.name, servers=excluded.servers, clear_keys=excluded.clear_keys, sort_name=excluded.sort_name`,
+		id, name, manualGroup, manualType, string(serversJS), marshalKeys(clearKeys), now().Unix(), strings.ToLower(name))
 	if err != nil {
 		return Channel{}, err
 	}
@@ -296,6 +314,9 @@ func (s *Store) AddManual(name, url string) (Channel, error) {
 type ImportEntry struct {
 	Name string `json:"name"`
 	URL  string `json:"url"`
+	// ClearKeys carries ClearKey pairs parsed from the playlist (or passed
+	// through the review UI) for CENC streams. Nil when clear.
+	ClearKeys map[string]string `json:"clear_keys,omitempty"`
 }
 
 // ChannelRef identifies an existing channel by a link, for the import
@@ -365,10 +386,10 @@ func (s *Store) ImportManual(entries []ImportEntry) (added int, err error) {
 	}()
 	stmt, err := tx.Prepare(`
 		INSERT INTO channels
-			(id, name, logo, grp, typ, servers, is_working, last_checked_at, is_favourite, is_manual, sort_name)
-		VALUES (?, ?, '', ?, ?, ?, 1, ?, 0, 1, ?)
+			(id, name, logo, grp, typ, servers, clear_keys, is_working, last_checked_at, is_favourite, is_manual, sort_name)
+		VALUES (?, ?, '', ?, ?, ?, ?, 1, ?, 0, 1, ?)
 		ON CONFLICT(id) DO UPDATE SET
-			name=excluded.name, servers=excluded.servers, sort_name=excluded.sort_name`)
+			name=excluded.name, servers=excluded.servers, clear_keys=excluded.clear_keys, sort_name=excluded.sort_name`)
 	if err != nil {
 		return 0, err
 	}
@@ -390,7 +411,7 @@ func (s *Store) ImportManual(entries []ImportEntry) (added int, err error) {
 		seenURL[url] = true
 		id := "manual:" + manualHash(name, url)
 		serversJS, _ := json.Marshal([]playlist.Server{{URL: url}})
-		if _, err = stmt.Exec(id, name, manualGroup, manualType, string(serversJS), ts, strings.ToLower(name)); err != nil {
+		if _, err = stmt.Exec(id, name, manualGroup, manualType, string(serversJS), marshalKeys(e.ClearKeys), ts, strings.ToLower(name)); err != nil {
 			return 0, err
 		}
 		added++
@@ -399,6 +420,34 @@ func (s *Store) ImportManual(entries []ImportEntry) (added int, err error) {
 		return 0, err
 	}
 	return added, nil
+}
+
+// UpdateManual replaces a manual channel's name and stream link in place, keyed
+// by ID so the favourite/health state tied to that ID survives the edit (the ID
+// is opaque after creation, so it intentionally does NOT track the new
+// name/url hash). It refuses feed channels (their fields are overwritten on the
+// next sync anyway), mirroring DeleteManual's errors: ErrNotFound when the id is
+// unknown, ErrNotManual when it exists but isn't a manual entry.
+func (s *Store) UpdateManual(id, name, url string) (Channel, error) {
+	name, url = strings.TrimSpace(name), strings.TrimSpace(url)
+	var isManual int
+	err := s.db.QueryRow(`SELECT is_manual FROM channels WHERE id=?`, id).Scan(&isManual)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Channel{}, ErrNotFound
+	}
+	if err != nil {
+		return Channel{}, err
+	}
+	if isManual == 0 {
+		return Channel{}, ErrNotManual
+	}
+	serversJS, _ := json.Marshal([]playlist.Server{{URL: url}})
+	if _, err := s.db.Exec(
+		`UPDATE channels SET name=?, sort_name=?, servers=? WHERE id=? AND is_manual=1`,
+		name, strings.ToLower(name), string(serversJS), id); err != nil {
+		return Channel{}, err
+	}
+	return s.getChannel(id)
 }
 
 // DeleteManual removes a manually-added channel. It refuses feed channels:
@@ -422,7 +471,7 @@ func (s *Store) DeleteManual(id string) error {
 
 func (s *Store) getChannel(id string) (Channel, error) {
 	row := s.db.QueryRow(`
-		SELECT id, name, logo, grp, typ, servers, is_favourite, is_working
+		SELECT id, name, logo, grp, typ, servers, clear_keys, is_favourite, is_working
 		FROM channels WHERE id=?`, id)
 	return scanChannel(row)
 }
@@ -589,6 +638,19 @@ func (s *Store) SetMeta(key, value string) error {
 		INSERT INTO meta (key, value) VALUES (?, ?)
 		ON CONFLICT(key) DO UPDATE SET value=excluded.value`, key, value)
 	return err
+}
+
+// marshalKeys serializes a ClearKey map to JSON for the clear_keys column,
+// returning "" (the column default) when there are no keys.
+func marshalKeys(keys map[string]string) string {
+	if len(keys) == 0 {
+		return ""
+	}
+	b, err := json.Marshal(keys)
+	if err != nil {
+		return ""
+	}
+	return string(b)
 }
 
 func manualHash(name, url string) string {

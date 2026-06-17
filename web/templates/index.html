@@ -220,11 +220,11 @@
     </div>
   </div>
 
-  <!-- ── Add-channel modal ──────────────────────────────────────── -->
+  <!-- ── Channel modal — shared by Add (+) and Edit (pen) ─────────── -->
   <div id="addChannel" class="picker add-modal" hidden>
     <div class="picker-panel add-panel">
       <div class="picker-head">
-        <span class="picker-title">Add a channel</span>
+        <span class="picker-title" id="addChannelTitle">Add a channel</span>
         <button id="addChannelClose" class="picker-close" title="Close">✕</button>
       </div>
       <form id="addChannelForm" class="add-form">
@@ -234,7 +234,16 @@
         </label>
         <label class="add-field">
           <span>Stream link</span>
-          <input id="addChannelUrl" type="url" placeholder="https://…/stream.m3u8" autocomplete="off" required>
+          <div class="add-link-row">
+            <input id="addChannelUrl" type="url" placeholder="https://…/stream.m3u8" autocomplete="off" required>
+            <button type="button" id="addChannelLicToggle" class="dots-btn" title="DRM license key" aria-expanded="false">
+              <svg viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="5" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="12" cy="19" r="2"/></svg>
+            </button>
+          </div>
+        </label>
+        <label class="add-field add-license" id="addChannelLicWrap">
+          <span>License key <span class="add-hint">optional · ClearKey</span></span>
+          <input id="addChannelLicense" type="text" placeholder="KID:KEY (hex) — for DRM .mpd streams" autocomplete="off">
         </label>
         <p id="addChannelError" class="add-error" hidden></p>
         <div class="add-actions">

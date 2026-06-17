@@ -139,7 +139,7 @@ func TestProxyPlaylistRewriteEndToEnd(t *testing.T) {
 	}
 }
 
-func TestProxyDASHManifestNotRewritten(t *testing.T) {
+func TestProxyDASHBaseURLInjected(t *testing.T) {
 	const manifest = `<?xml version="1.0"?>
 <MPD><Period><AdaptationSet><Representation><BaseURL>video/</BaseURL>
 <SegmentTemplate media="seg-$Number$.m4s" initialization="init.mp4"/>
@@ -160,16 +160,62 @@ func TestProxyDASHManifestNotRewritten(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status %d", rec.Code)
 	}
-	// Manifest must be passed through byte-for-byte (Shaka's request filter
-	// handles proxy routing, not server-side rewriting).
-	if rec.Body.String() != manifest {
-		t.Errorf("DASH manifest was modified:\n%s", rec.Body.String())
+	// An absolute BaseURL (the manifest's own directory) must be injected as the
+	// first child of <MPD> so the client resolves relative segment URLs against
+	// the real origin, not the /api/proxy URL it fetched the manifest through.
+	want := "<MPD><BaseURL>" + upstream.URL + "/live/</BaseURL>"
+	if !strings.Contains(rec.Body.String(), want) {
+		t.Errorf("expected injected BaseURL %q in:\n%s", want, rec.Body.String())
+	}
+	// The original relative BaseURL below must be preserved (it chains under the
+	// injected absolute one).
+	if !strings.Contains(rec.Body.String(), "<BaseURL>video/</BaseURL>") {
+		t.Errorf("original relative BaseURL was lost:\n%s", rec.Body.String())
 	}
 	if ct := rec.Header().Get("Content-Type"); ct != "application/dash+xml" {
 		t.Errorf("content type %q, want application/dash+xml", ct)
 	}
 	if !strings.Contains(rec.Header().Get("Cache-Control"), "no-cache") {
 		t.Errorf("DASH manifest must not be browser-cached: %q", rec.Header().Get("Cache-Control"))
+	}
+}
+
+func TestInjectDASHBaseURL(t *testing.T) {
+	cases := []struct {
+		name, mpd, url, wantContains string
+	}{
+		{
+			name:         "attributes on MPD tag",
+			mpd:          `<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="dynamic"><Period/></MPD>`,
+			url:          "https://cdn.example.com/a/b/index.mpd",
+			wantContains: `type="dynamic"><BaseURL>https://cdn.example.com/a/b/</BaseURL><Period/>`,
+		},
+		{
+			name:         "query on manifest url is dropped from base",
+			mpd:          `<MPD><Period/></MPD>`,
+			url:          "https://cdn.example.com/x/index.mpd?token=abc",
+			wantContains: `<BaseURL>https://cdn.example.com/x/</BaseURL>`,
+		},
+		{
+			name:         "ampersand in base is escaped",
+			mpd:          `<MPD></MPD>`,
+			url:          "https://cdn.example.com/p&q/index.mpd",
+			wantContains: `<BaseURL>https://cdn.example.com/p&amp;q/</BaseURL>`,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := injectDASHBaseURL(c.mpd, c.url)
+			if !strings.Contains(got, c.wantContains) {
+				t.Errorf("injectDASHBaseURL = %q, want it to contain %q", got, c.wantContains)
+			}
+		})
+	}
+
+	// A document with no <MPD> tag is returned unchanged.
+	const notMPD = `<xml>nope</xml>`
+	if got := injectDASHBaseURL(notMPD, "https://x/y.mpd"); got != notMPD {
+		t.Errorf("non-MPD doc was modified: %q", got)
 	}
 }
 

@@ -35,6 +35,7 @@ import (
 	"watchlive/internal/ffmpeg"
 	"watchlive/internal/genre"
 	"watchlive/internal/health"
+	"watchlive/internal/keystore"
 	"watchlive/internal/playlist"
 	"watchlive/internal/proxy"
 	"watchlive/internal/recorder"
@@ -246,16 +247,20 @@ func main() {
 	open := flag.Bool("open", true, "open the web UI in the default browser once the server is listening")
 	flag.Parse()
 
-	// Default DB resolution: store/catalog.db next to the executable, so a
-	// distributed single binary keeps its catalog (and the health verdicts within
-	// it) beside it and reuses them on every restart. `go run .` (temp build dir)
-	// gets an ephemeral DB that simply re-fetches on first launch.
+	// baseDir is where the catalog directory and keys.json live: beside the
+	// executable for a distributed single binary, so it keeps its state next to
+	// it across restarts. EXCEPTION: under `go run` the binary lives in a temp
+	// go-build dir that's deleted on exit, so exe-relative state would be
+	// ephemeral (favourites/manual adds/keys would vanish every run). Detect that
+	// and fall back to the working directory instead.
+	baseDir := "."
+	if exe, err := os.Executable(); err == nil && !isEphemeralExe(exe) {
+		baseDir = filepath.Dir(exe)
+	}
+
 	path := *dbPath
 	if path == "" {
-		path = filepath.Join("store", "catalog.db")
-		if exe, err := os.Executable(); err == nil {
-			path = filepath.Join(filepath.Dir(exe), "store", "catalog.db")
-		}
+		path = filepath.Join(baseDir, "store", "catalog.db")
 	}
 	if dir := filepath.Dir(path); dir != "" && dir != "." {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -268,6 +273,31 @@ func main() {
 		log.Fatalf("store: open %s: %v", path, err)
 	}
 	defer st.Close()
+
+	// ClearKey keystore: a standalone keys.json beside the catalog dir (NOT inside
+	// it), so DRM keys survive a catalog wipe and apply globally to any DASH
+	// stream whose manifest KID matches. Seed the keys we've already captured so a
+	// fresh file still has them; Merge is idempotent and only writes on a change.
+	keysPath := filepath.Join(baseDir, "keys.json")
+	ks, err := keystore.Open(keysPath)
+	if err != nil {
+		log.Fatalf("keystore: open %s: %v", keysPath, err)
+	}
+	// Seed only KIDs not already present, so a hand-edit or a UI update to one of
+	// these keys is never reverted on the next startup.
+	existing := ks.All()
+	toSeed := map[string]string{}
+	for kid, key := range seedClearKeys {
+		if _, ok := existing[kid]; !ok {
+			toSeed[kid] = key
+		}
+	}
+	if n, err := ks.Merge(toSeed); err != nil {
+		log.Printf("keystore: seed: %v", err)
+	} else if n > 0 {
+		log.Printf("keystore: seeded %d known key(s)", n)
+	}
+	log.Printf("keystore: %d ClearKey pair(s) in %s", ks.Count(), keysPath)
 
 	channels := newChannelStore(st, *sourceURL, *prune)
 	// Cold start: an empty catalog is seeded synchronously from the embedded
@@ -434,7 +464,7 @@ func main() {
 	})
 
 	mux.HandleFunc("POST /api/channels/add", func(w http.ResponseWriter, r *http.Request) {
-		var body struct{ Name, URL string }
+		var body struct{ Name, URL, License string }
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
@@ -444,13 +474,60 @@ func main() {
 			http.Error(w, "channel name and an http(s) stream link are required", http.StatusBadRequest)
 			return
 		}
-		ch, err := st.AddManual(name, url)
+		ch, err := st.AddManual(name, url, nil)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+		// Optional ClearKey for CENC streams, entered as "KID:KEY"; ignored if not
+		// a valid hex pair (e.g. a stray Widevine URL). Keys live in the global
+		// keystore (keys.json), not the catalog, so they survive a DB wipe and
+		// apply to any DASH stream advertising a matching KID.
+		if keys := playlist.ParseClearKeys(body.License); len(keys) > 0 {
+			if n, err := ks.Merge(keys); err != nil {
+				log.Printf("keystore: merge on add: %v", err)
+			} else if n > 0 {
+				log.Printf("keystore: +%d key(s) from add %q", n, name)
+			}
+		}
 		channels.rebuild()
 		log.Printf("channels: added manual %q (%s)", name, ch.ID)
+		writeJSON(w, r, ch)
+	})
+
+	mux.HandleFunc("POST /api/channels/update", func(w http.ResponseWriter, r *http.Request) {
+		var body struct{ ID, Name, URL, License string }
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		name, url := strings.TrimSpace(body.Name), strings.TrimSpace(body.URL)
+		if body.ID == "" || name == "" || !isStreamURL(url) {
+			http.Error(w, "channel id, name and an http(s) stream link are required", http.StatusBadRequest)
+			return
+		}
+		ch, err := st.UpdateManual(body.ID, name, url)
+		switch {
+		case errors.Is(err, store.ErrNotFound):
+			http.Error(w, "channel not found", http.StatusNotFound)
+			return
+		case errors.Is(err, store.ErrNotManual):
+			http.Error(w, "only manually-added channels can be edited", http.StatusConflict)
+			return
+		case err != nil:
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		// Optional ClearKey edit — merged into the global keystore like /add.
+		if keys := playlist.ParseClearKeys(body.License); len(keys) > 0 {
+			if n, err := ks.Merge(keys); err != nil {
+				log.Printf("keystore: merge on update: %v", err)
+			} else if n > 0 {
+				log.Printf("keystore: +%d key(s) from update %q", n, ch.Name)
+			}
+		}
+		channels.rebuild()
+		log.Printf("channels: updated manual %q (%s)", ch.Name, ch.ID)
 		writeJSON(w, r, ch)
 	})
 
@@ -487,7 +564,7 @@ func main() {
 		entries := playlist.ParseEntries(string(data))
 		out := make([]store.ImportEntry, 0, len(entries))
 		for _, e := range entries {
-			out = append(out, store.ImportEntry{Name: e.Name, URL: e.URL})
+			out = append(out, store.ImportEntry{Name: e.Name, URL: e.URL, ClearKeys: e.ClearKeys})
 		}
 		if len(out) == 0 {
 			http.Error(w, "no channels found — is this a valid .m3u playlist?", http.StatusUnprocessableEntity)
@@ -534,7 +611,7 @@ func main() {
 				continue // repeated link within the file — keep the first only
 			}
 			seen[url] = true
-			newOnes = append(newOnes, store.ImportEntry{Name: name, URL: url})
+			newOnes = append(newOnes, store.ImportEntry{Name: name, URL: url, ClearKeys: e.ClearKeys})
 		}
 		writeJSON(w, r, map[string]any{"new": newOnes, "duplicates": dups})
 	})
@@ -552,9 +629,27 @@ func main() {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+		// Auto-harvest any ClearKey pairs the playlist carried (e.g. #KODIPROP
+		// license_key) into the global keystore in one write, so imported DRM
+		// channels just play without re-entering keys.
+		harvest := map[string]string{}
+		for _, e := range body.Entries {
+			for kid, key := range e.ClearKeys {
+				harvest[kid] = key
+			}
+		}
+		if n, err := ks.Merge(harvest); err != nil {
+			log.Printf("keystore: merge on import: %v", err)
+		} else if n > 0 {
+			log.Printf("keystore: +%d key(s) harvested from import", n)
+		}
 		channels.rebuild()
 		log.Printf("channels: imported %d manual channel(s)", added)
 		writeJSON(w, r, map[string]int{"added": added})
+	})
+
+	mux.HandleFunc("GET /api/keys", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, r, ks.All())
 	})
 
 	// ── Screen recording (server-side, ffmpeg → 720p H.264/AAC MP4) ──────────
@@ -699,6 +794,31 @@ func main() {
 // manually-added channel's stream link.
 func isStreamURL(line string) bool {
 	return strings.HasPrefix(line, "http://") || strings.HasPrefix(line, "https://")
+}
+
+// seedClearKeys are ClearKey pairs (KID→KEY, lowercase hex) we've already
+// captured and want available regardless of catalog wipes. They're merged into
+// keys.json on startup; the merge is idempotent, so editing keys.json by hand
+// wins on later runs only if a KID here isn't present (a present KID is left as
+// stored). New keys normally arrive via the UI, not here.
+var seedClearKeys = map[string]string{
+	"549ab7cd35a64bb6bb479ecead04d69d": "829799ed534d11fcadeb4b192467e050", // WC Tv -en (ch299)
+	"893bc63340876605f52886a42e0ccce5": "d6c46d2d691056fbd091bf1f01b21a91", // captured, channel TBD
+}
+
+// isEphemeralExe reports whether the binary is a throwaway build produced by
+// `go run` (it lives in a temp go-build dir that's removed on exit). In that
+// case an exe-relative DB would be discarded every run, so we prefer a stable
+// working-directory path instead.
+func isEphemeralExe(exe string) bool {
+	dir := strings.ToLower(filepath.Dir(exe))
+	if strings.Contains(dir, "go-build") {
+		return true
+	}
+	if tmp := strings.ToLower(os.TempDir()); tmp != "" && strings.HasPrefix(dir, tmp) {
+		return true
+	}
+	return false
 }
 
 // writeJSON marshals v and writes it, gzipping when the client accepts it. The

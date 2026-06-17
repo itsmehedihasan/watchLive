@@ -468,17 +468,20 @@ input { font-family: inherit; }
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 
-/* Pin / favourite toggle on each channel row */
-.pin-btn {
+/* Pin / favourite toggle + edit-link (pen) on each channel row */
+.pin-btn, .edit-btn {
   flex-shrink: 0; display: flex; align-items: center; justify-content: center;
   width: 26px; height: 26px; border-radius: 7px;
   color: #4b5566; transition: color .15s, background .15s;
 
   & svg { width: 14px; height: 14px; }
   &:hover { color: #cfd6e4; background: var(--input-bg); }
+}
+.pin-btn {
   &.faved { color: #f5b301; }
   &.faved svg { fill: #f5b301; }
 }
+.edit-btn:hover { color: #60a5fa; }
 
 .empty-state, .list-loading {
   display: flex; flex-direction: column; align-items: center; justify-content: center;
@@ -564,6 +567,32 @@ input { font-family: inherit; }
 
   &:focus { outline: none; border-color: #4b6bdc; }
 }
+.add-hint { font-weight: 500; opacity: .65; text-transform: none; }
+
+/* Stream-link row: the url input + a 3-dot toggle that reveals the license field. */
+.add-link-row { display: flex; align-items: stretch; gap: 8px; }
+.add-link-row input { flex: 1; min-width: 0; }
+.dots-btn {
+  flex-shrink: 0; width: 40px; display: flex; align-items: center; justify-content: center;
+  background: var(--input-bg); border: 1px solid var(--border); border-radius: 8px;
+  color: var(--muted); cursor: pointer;
+  transition: color .15s, background .15s, border-color .15s;
+
+  & svg { width: 16px; height: 16px; transition: transform .25s ease; }
+  &:hover { color: #fff; background: #1d2433; }
+  /* Hidden → vertical dots (⋮); shown → rotate 90° to horizontal (⋯). */
+  &.open { color: #60a5fa; border-color: #60a5fa; }
+  &.open svg { transform: rotate(90deg); }
+}
+
+/* License field collapses by default; the negative margin cancels the form's
+   14px gap while collapsed so there's no phantom space. */
+.add-license {
+  overflow: hidden;
+  max-height: 0; opacity: 0; margin-top: -14px;
+  transition: max-height .25s ease, opacity .2s ease, margin-top .25s ease;
+}
+.add-license.show { max-height: 92px; opacity: 1; margin-top: 0; }
 .add-error { font-size: 12px; color: #f87171; margin: -4px 0 0; }
 .add-actions { display: flex; justify-content: flex-end; gap: 8px; }
 .add-btn {

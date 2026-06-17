@@ -230,6 +230,72 @@ func TestClassify(t *testing.T) {
 	}
 }
 
+func TestParseClearKeys(t *testing.T) {
+	cases := []struct {
+		in   string
+		want map[string]string
+	}{
+		{"549ab7cd35a64bb6bb479ecead04d69d:829799ed534d11fcadeb4b192467e050",
+			map[string]string{"549ab7cd35a64bb6bb479ecead04d69d": "829799ed534d11fcadeb4b192467e050"}},
+		// UUID-form KID with dashes, uppercase → normalized.
+		{"549AB7CD-35A6-4BB6-BB47-9ECEAD04D69D:829799ED534D11FCADEB4B192467E050",
+			map[string]string{"549ab7cd35a64bb6bb479ecead04d69d": "829799ed534d11fcadeb4b192467e050"}},
+		// Two pairs, comma-separated.
+		{"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb,cccccccccccccccccccccccccccccccc:dddddddddddddddddddddddddddddddd",
+			map[string]string{"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "cccccccccccccccccccccccccccccccc": "dddddddddddddddddddddddddddddddd"}},
+		// Widevine license URL is not a hex pair → nil.
+		{"https://license.example.com/widevine", nil},
+		{"", nil},
+		{"garbage", nil},
+	}
+	for _, c := range cases {
+		got := ParseClearKeys(c.in)
+		if len(got) != len(c.want) {
+			t.Errorf("ParseClearKeys(%q) = %v, want %v", c.in, got, c.want)
+			continue
+		}
+		for k, v := range c.want {
+			if got[k] != v {
+				t.Errorf("ParseClearKeys(%q)[%q] = %q, want %q", c.in, k, got[k], v)
+			}
+		}
+	}
+}
+
+func TestParseKodipropClearKey(t *testing.T) {
+	const m3u = `#EXTM3U
+#EXTINF:-1 group-title="DRM",Cignal 299
+#KODIPROP:inputstream.adaptive.license_type=clearkey
+#KODIPROP:inputstream.adaptive.license_key=549ab7cd35a64bb6bb479ecead04d69d:829799ed534d11fcadeb4b192467e050
+https://example.com/ch299/index.mpd
+#EXTINF:-1 group-title="Clear",Plain Channel
+https://example.com/plain/index.m3u8
+`
+	// ParseEntries surfaces the key on the encrypted entry only.
+	entries := ParseEntries(m3u)
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 entries, got %d", len(entries))
+	}
+	byName := map[string]Entry{}
+	for _, e := range entries {
+		byName[e.Name] = e
+	}
+	if byName["Cignal 299"].ClearKeys["549ab7cd35a64bb6bb479ecead04d69d"] != "829799ed534d11fcadeb4b192467e050" {
+		t.Errorf("KODIPROP key not parsed: %+v", byName["Cignal 299"].ClearKeys)
+	}
+	if byName["Plain Channel"].ClearKeys != nil {
+		t.Errorf("clear entry should have no keys: %+v", byName["Plain Channel"].ClearKeys)
+	}
+
+	// Parse carries the key onto the merged channel.
+	chans := Parse(m3u)
+	for _, ch := range chans {
+		if ch.Name == "Cignal 299" && ch.ClearKeys["549ab7cd35a64bb6bb479ecead04d69d"] == "" {
+			t.Errorf("merged channel lost its clear key: %+v", ch)
+		}
+	}
+}
+
 func TestParseEmpty(t *testing.T) {
 	if got := Parse(""); len(got) != 0 {
 		t.Errorf("expected no channels from empty input, got %d", len(got))
