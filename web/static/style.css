@@ -268,6 +268,20 @@ input { font-family: inherit; }
 .overlay-emoji { font-size: 44px; }
 .error-title { color: #f87171; font-weight: 600; font-size: 15px; }
 
+/* Per-cell buffering indicator — PotPlayer-style: a blue bold text line in the
+   top-left corner over the video, no backdrop. Each cell shows its own % since
+   every cell owns its own <video> and buffer. pointer-events:none keeps the
+   mic/controls underneath clickable. */
+.cell-buffering {
+  position: absolute; top: 44px; left: 10px; z-index: 15;
+  pointer-events: none;
+}
+.buf-text {
+  font-size: 15px; font-weight: 700; color: #3b9dff;
+  text-shadow: 0 1px 3px rgba(0, 0, 0, .9), 0 0 2px rgba(0, 0, 0, .9);
+  white-space: nowrap;
+}
+
 .primary-btn {
   margin-top: 4px; padding: 7px 18px;
   background: var(--blue); color: #fff;
@@ -289,8 +303,12 @@ input { font-family: inherit; }
   -webkit-backdrop-filter: blur(4px); backdrop-filter: blur(4px);
   transition: all .15s;
 
-  &:hover { background: rgba(0, 0, 0, .8); color: #fff; }
+  &:hover { background: rgba(0, 0, 0, .8); }
+  /* Audio source (unmuted): blue. */
   &.active { color: var(--blue-light); border-color: var(--blue-light); background: rgba(37, 99, 235, .25); }
+  /* Muted (not the audio source): the crossed-speaker glyph reads red so the
+     muted state is obvious at a glance, distinct from the blue active cell. */
+  & .ico-off { color: #f87171; }
 }
 
 /* Play / pause — top-left, beside the mic */

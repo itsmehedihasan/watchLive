@@ -36,6 +36,14 @@ export function makeCell(idx) {
   loading.hidden = true;
   stage.appendChild(loading);
 
+  // Per-cell buffering gauge (PotPlayer-style). Each cell owns its own <video>,
+  // so its buffered ranges — and therefore this %  — are independent of the others.
+  const buffering = document.createElement('div');
+  buffering.className = 'cell-buffering';
+  buffering.hidden = true;
+  buffering.innerHTML = '<span class="buf-text">Buffering : 0% complete</span>';
+  stage.appendChild(buffering);
+
   const error = document.createElement('div');
   error.className = 'cell-overlay cell-error';
   error.hidden = true;
@@ -48,7 +56,7 @@ export function makeCell(idx) {
 
   const mic = document.createElement('button');
   mic.className = 'cell-mic';
-  mic.title = 'Use this cell's audio';
+  mic.title = 'Use this cell’s audio';
   mic.innerHTML =
     '<svg class="ico-on" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">' +
       '<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/></svg>' +
@@ -117,9 +125,69 @@ export function makeCell(idx) {
   empty.appendChild(pick);
   root.appendChild(empty);
 
+  // --- Buffering monitor (PotPlayer-style %) ---------------------------------
+  // A live stream plays right at the live edge, so the forward buffer naturally
+  // stays near zero — a raw "buffer ahead" % would just sit at ~2% forever.
+  // Instead, on a stall we FREEZE the playhead (auto-pause), let the underlying
+  // player keep downloading into the buffer, and show how full it is getting
+  // toward FILL_TARGET seconds. With the playhead frozen the buffer actually
+  // grows, so the % climbs 0→100, then we resume — exactly like PotPlayer.
+  const FILL_TARGET = 4; // seconds to queue up before resuming after a stall
+  const bufText = buffering.querySelector('.buf-text');
+  let bufTimer = 0;
+  let filling = false;   // currently buffering with the playhead frozen
+  let autoPaused = false; // the pause was ours (a refill), not the user's
+
+  function bufferedAhead() {
+    const b = video.buffered, t = video.currentTime;
+    for (let i = 0; i < b.length; i++) {
+      // Tolerate tiny gaps so a 1-frame hole at the playhead doesn't read as 0.
+      if (b.start(i) <= t + 0.25 && t < b.end(i) + 0.25) return Math.max(0, b.end(i) - t);
+    }
+    return 0;
+  }
+  function paintBuf() {
+    const ahead = bufferedAhead();
+    const pct = Math.max(0, Math.min(100, Math.round((ahead / FILL_TARGET) * 100)));
+    bufText.textContent = 'Buffering : ' + pct + '% complete';
+    if (filling && (ahead >= FILL_TARGET || video.readyState >= 4)) resumeFromBuffering();
+  }
+  function startFilling() {
+    if (filling || !cell.channel || !loading.hidden || video.ended) return;
+    filling = true;
+    autoPaused = true;
+    try { video.pause(); } catch (e) { /* ignore */ }
+    buffering.hidden = false;
+    paintBuf();
+    if (!bufTimer) bufTimer = window.setInterval(paintBuf, 200);
+  }
+  function stopOverlay() {
+    buffering.hidden = true;
+    if (bufTimer) { clearInterval(bufTimer); bufTimer = 0; }
+  }
+  function resumeFromBuffering() {
+    if (!filling) return;
+    filling = false;
+    stopOverlay();
+    autoPaused = false;
+    video.play().catch(function () { /* will retry on next event */ });
+  }
+  function hideBuffering() { filling = false; autoPaused = false; stopOverlay(); }
+  cell.hideBuffering = hideBuffering;
+
+  // A real stall while we WANT to be playing → start a PotPlayer-style refill.
+  video.addEventListener('waiting', function () { if (!video.paused || autoPaused) startFilling(); });
+  video.addEventListener('stalled', function () { if (!video.paused || autoPaused) startFilling(); });
+  // The player recovered on its own (enough data) → drop the overlay.
+  video.addEventListener('playing', function () { if (filling) { filling = false; } stopOverlay(); });
+  video.addEventListener('pause', function () {
+    if (autoPaused) { autoPaused = false; return; } // our own refill pause — keep filling
+    hideBuffering(); // user paused → abort refill, no auto-resume
+  });
+
   cell.root = root;
   cell.video = video;
-  cell.els = { stage: stage, empty: empty, loading: loading, error: error, mic: mic, play: play, label: label, settings: settings, pickLabel: pick.querySelector('.cell-pick-label') };
+  cell.els = { stage: stage, empty: empty, loading: loading, buffering: buffering, error: error, mic: mic, play: play, label: label, settings: settings, pickLabel: pick.querySelector('.cell-pick-label') };
   return cell;
 }
 
@@ -269,6 +337,7 @@ export function assignChannel(cellIdx, ch) {
   const cell = cells[cellIdx];
   if (!cell) return;
   if (state.recId && cellIdx === state.recCellIdx) stopRecording();
+  if (cell.hideBuffering) cell.hideBuffering();
   cell.channel = ch;
   cell.serverIdx = 0;
   cell.failedServers = {};
@@ -285,6 +354,7 @@ export function assignChannel(cellIdx, ch) {
 export function clearCell(cell) {
   if (state.openSettingsCell === cell) closeCellSettings();
   if (state.recId && cell.idx === state.recCellIdx) stopRecording();
+  if (cell.hideBuffering) cell.hideBuffering();
   destroyCellPlayer(cell);
   cell.channel = null;
   cell.root.classList.remove('filled');
