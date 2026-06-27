@@ -54,6 +54,8 @@ CREATE TABLE IF NOT EXISTS channels (
     clear_keys      TEXT NOT NULL DEFAULT '',
     http_user_agent TEXT NOT NULL DEFAULT '',
     http_referer    TEXT NOT NULL DEFAULT '',
+    resolver        TEXT NOT NULL DEFAULT '',
+    resolver_arg    TEXT NOT NULL DEFAULT '',
     is_working      INTEGER,
     last_checked_at INTEGER,
     is_favourite    INTEGER NOT NULL DEFAULT 0,
@@ -80,8 +82,14 @@ type Channel struct {
 	ClearKeys map[string]string `json:"clear_keys,omitempty"`
 	// UserAgent / Referer are #EXTVLCOPT header hints the proxy applies to the
 	// upstream fetch; empty when the channel specified none. Not secrets.
-	UserAgent   string `json:"http_user_agent,omitempty"`
-	Referer     string `json:"http_referer,omitempty"`
+	UserAgent string `json:"http_user_agent,omitempty"`
+	Referer   string `json:"http_referer,omitempty"`
+	// Resolver / ResolverArg make a channel "dynamic": instead of a fixed stream
+	// URL, the app resolves a fresh signed URL at play time via the named provider
+	// (e.g. "exposestrat") using ResolverArg (e.g. the stream slug). Empty for
+	// ordinary channels. Servers still holds the last-resolved URL as a cache/hint.
+	Resolver    string `json:"resolver,omitempty"`
+	ResolverArg string `json:"resolver_arg,omitempty"`
 	IsFavourite bool   `json:"is_favourite"`
 	// IsWorking is null until the channel has been probed, then true/false. The
 	// frontend treats only an explicit false as "hide when working-only".
@@ -122,7 +130,7 @@ func Open(path string) (*Store, error) {
 	}
 	// Columns added after the initial schema. SQLite has no "ADD COLUMN IF NOT
 	// EXISTS", so a duplicate-column error on an already-migrated DB is benign.
-	for _, col := range []string{"clear_keys", "http_user_agent", "http_referer"} {
+	for _, col := range []string{"clear_keys", "http_user_agent", "http_referer", "resolver", "resolver_arg"} {
 		if _, err := db.Exec(`ALTER TABLE channels ADD COLUMN ` + col + ` TEXT NOT NULL DEFAULT ''`); err != nil &&
 			!strings.Contains(err.Error(), "duplicate column") {
 			db.Close()
@@ -152,7 +160,7 @@ func (s *Store) IsEmpty() (bool, error) {
 // carrying its favourite and working state.
 func (s *Store) ListChannels() ([]Channel, error) {
 	rows, err := s.db.Query(`
-		SELECT id, name, logo, grp, typ, servers, clear_keys, http_user_agent, http_referer, is_favourite, is_working
+		SELECT id, name, logo, grp, typ, servers, clear_keys, http_user_agent, http_referer, resolver, resolver_arg, is_favourite, is_working
 		FROM channels ORDER BY sort_name, name`)
 	if err != nil {
 		return nil, err
@@ -182,7 +190,7 @@ func scanChannel(row scanner) (Channel, error) {
 		fav       int
 		working   sql.NullInt64
 	)
-	if err := row.Scan(&ch.ID, &ch.Name, &ch.Logo, &ch.Group, &ch.Type, &serversJS, &clearJS, &ch.UserAgent, &ch.Referer, &fav, &working); err != nil {
+	if err := row.Scan(&ch.ID, &ch.Name, &ch.Logo, &ch.Group, &ch.Type, &serversJS, &clearJS, &ch.UserAgent, &ch.Referer, &ch.Resolver, &ch.ResolverArg, &fav, &working); err != nil {
 		return Channel{}, err
 	}
 	if serversJS != "" {
@@ -319,6 +327,45 @@ func (s *Store) AddManual(name, url string, clearKeys map[string]string, referer
 		return Channel{}, err
 	}
 	return s.getChannel(id)
+}
+
+// AddResolvable inserts a dynamic channel whose playable URL is not stored but
+// resolved at play time by the named provider from arg (e.g. a stream slug).
+// referer/userAgent are the headers the *resolved* stream needs when played.
+// Like AddManual it is favourited + working by default and idempotent on
+// name+provider+arg. Servers starts empty and is filled by SetResolvedURL after
+// the first resolve.
+func (s *Store) AddResolvable(name, provider, arg, referer, userAgent string) (Channel, error) {
+	name, provider, arg = strings.TrimSpace(name), strings.TrimSpace(provider), strings.TrimSpace(arg)
+	referer, userAgent = strings.TrimSpace(referer), strings.TrimSpace(userAgent)
+	id := "manual:" + manualHash(name, provider+"|"+arg)
+	_, err := s.db.Exec(`
+		INSERT INTO channels
+			(id, name, logo, grp, typ, servers, clear_keys, http_referer, http_user_agent, resolver, resolver_arg, is_working, last_checked_at, is_favourite, is_manual, sort_name)
+		VALUES (?, ?, '', ?, ?, '[]', '', ?, ?, ?, ?, 1, ?, 1, 1, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			name=excluded.name, http_referer=excluded.http_referer, http_user_agent=excluded.http_user_agent,
+			resolver=excluded.resolver, resolver_arg=excluded.resolver_arg, sort_name=excluded.sort_name`,
+		id, name, manualGroup, manualType, referer, userAgent, provider, arg, now().Unix(), strings.ToLower(name))
+	if err != nil {
+		return Channel{}, err
+	}
+	return s.getChannel(id)
+}
+
+// SetResolvedURL caches a freshly-resolved stream URL into a channel's servers[0]
+// so the proxy's per-host header map (keyed by upstream host) picks up a rotated
+// CDN host. It touches only servers; the resolver recipe and user state are kept.
+func (s *Store) SetResolvedURL(id, streamURL string) error {
+	serversJS, _ := json.Marshal([]playlist.Server{{URL: streamURL}})
+	res, err := s.db.Exec(`UPDATE channels SET servers=? WHERE id=?`, string(serversJS), id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // ImportEntry is one channel from an imported playlist after the user has
@@ -537,9 +584,18 @@ func (s *Store) DeleteManual(id string) error {
 	return err
 }
 
+// Get returns a single channel by id, or ErrNotFound if absent.
+func (s *Store) Get(id string) (Channel, error) {
+	ch, err := s.getChannel(id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Channel{}, ErrNotFound
+	}
+	return ch, err
+}
+
 func (s *Store) getChannel(id string) (Channel, error) {
 	row := s.db.QueryRow(`
-		SELECT id, name, logo, grp, typ, servers, clear_keys, http_user_agent, http_referer, is_favourite, is_working
+		SELECT id, name, logo, grp, typ, servers, clear_keys, http_user_agent, http_referer, resolver, resolver_arg, is_favourite, is_working
 		FROM channels WHERE id=?`, id)
 	return scanChannel(row)
 }

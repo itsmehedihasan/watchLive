@@ -44,6 +44,7 @@ import (
 	"watchlive/internal/playlist"
 	"watchlive/internal/proxy"
 	"watchlive/internal/recorder"
+	"watchlive/internal/resolver"
 	"watchlive/internal/store"
 	"watchlive/internal/viewers"
 )
@@ -467,7 +468,13 @@ func main() {
 		log.Fatal(err)
 	}
 
-	mux := newMux(proxyHandler, viewerStore, staticSub, channels, st, ks, rec, prober, indexTmpl)
+	// Resolver: some embed providers serve only short-lived signed URLs that must
+	// be fetched fresh at play time (the token is unforgeable). Register provider
+	// families here; channels store a recipe (resolver + arg) instead of a URL.
+	resolverMgr := resolver.NewManager()
+	resolverMgr.Add(resolver.Exposestrat{})
+
+	mux := newMux(proxyHandler, viewerStore, staticSub, channels, st, ks, rec, prober, resolverMgr, indexTmpl)
 
 	srv := &http.Server{
 		Addr:              *addr,
@@ -624,7 +631,7 @@ func displayAddr(addr string) string {
 
 // newMux registers every HTTP route and returns the configured mux. Extracted
 // from main so handlers are exercisable in tests against a temp store.
-func newMux(proxyHandler *proxy.Handler, viewerStore *viewers.Store, staticSub fs.FS, channels *channelStore, st *store.Store, ks *keystore.Store, rec *recorder.Recorder, prober *health.Prober, indexTmpl *template.Template) *http.ServeMux {
+func newMux(proxyHandler *proxy.Handler, viewerStore *viewers.Store, staticSub fs.FS, channels *channelStore, st *store.Store, ks *keystore.Store, rec *recorder.Recorder, prober *health.Prober, resolverMgr *resolver.Manager, indexTmpl *template.Template) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.Handle("GET /api/proxy", proxyHandler)
 	mux.Handle("OPTIONS /api/proxy", proxyHandler)
@@ -732,6 +739,78 @@ func newMux(proxyHandler *proxy.Handler, viewerStore *viewers.Store, staticSub f
 		channels.rebuild()
 		log.Printf("channels: added manual %q (%s)", name, ch.ID)
 		writeJSON(w, r, ch)
+	})
+
+	// Add a dynamic channel resolved at play time (e.g. an exposestrat slug). The
+	// stream URL is not stored; the recipe (provider + arg) is. referer/userAgent
+	// are what the resolved stream needs when played.
+	mux.HandleFunc("POST /api/channels/add-resolvable", func(w http.ResponseWriter, r *http.Request) {
+		var body struct{ Name, Provider, Arg, Referer, UserAgent string }
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		name := strings.TrimSpace(body.Name)
+		provider := strings.TrimSpace(body.Provider)
+		arg := strings.TrimSpace(body.Arg)
+		if name == "" || arg == "" {
+			http.Error(w, "channel name and stream arg are required", http.StatusBadRequest)
+			return
+		}
+		if !resolverMgr.Has(provider) {
+			http.Error(w, "unknown resolver provider", http.StatusBadRequest)
+			return
+		}
+		ch, err := st.AddResolvable(name, provider, arg, body.Referer, body.UserAgent)
+		if err != nil {
+			serverError(w, "api", err)
+			return
+		}
+		channels.rebuild()
+		log.Printf("channels: added resolvable %q via %s:%s (%s)", name, provider, arg, ch.ID)
+		writeJSON(w, r, ch)
+	})
+
+	// Resolve a dynamic channel to a fresh playable URL. Caches the result into the
+	// channel's servers[0] (so the proxy header map picks up a rotated CDN host) and
+	// returns {url, referer} for the player to load via /api/proxy.
+	mux.HandleFunc("GET /api/resolve", func(w http.ResponseWriter, r *http.Request) {
+		id := r.URL.Query().Get("id")
+		if id == "" {
+			http.Error(w, "id required", http.StatusBadRequest)
+			return
+		}
+		ch, err := st.Get(id)
+		if errors.Is(err, store.ErrNotFound) {
+			http.Error(w, "channel not found", http.StatusNotFound)
+			return
+		}
+		if err != nil {
+			serverError(w, "api", err)
+			return
+		}
+		if ch.Resolver == "" {
+			http.Error(w, "channel is not resolvable", http.StatusBadRequest)
+			return
+		}
+		res, err := resolverMgr.Resolve(r.Context(), ch.Resolver, ch.ResolverArg)
+		if err != nil {
+			log.Printf("resolve %q (%s:%s): %v", ch.Name, ch.Resolver, ch.ResolverArg, err)
+			http.Error(w, "could not resolve stream", http.StatusBadGateway)
+			return
+		}
+		// Persist the fresh URL so the proxy's host→header map covers the (possibly
+		// rotated) CDN host before the player fetches through the proxy.
+		if err := st.SetResolvedURL(id, res.URL); err != nil {
+			log.Printf("resolve: cache url for %s: %v", id, err)
+		} else {
+			channels.rebuild()
+		}
+		ref := res.Referer
+		if ref == "" {
+			ref = ch.Referer
+		}
+		writeJSON(w, r, map[string]string{"url": res.URL, "referer": ref, "user_agent": res.UserAgent})
 	})
 
 	mux.HandleFunc("POST /api/channels/update", func(w http.ResponseWriter, r *http.Request) {

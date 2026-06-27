@@ -16,6 +16,7 @@ import (
 	"watchlive/internal/playlist"
 	"watchlive/internal/proxy"
 	"watchlive/internal/recorder"
+	"watchlive/internal/resolver"
 	"watchlive/internal/store"
 	"watchlive/internal/viewers"
 )
@@ -36,9 +37,11 @@ func testMux(t *testing.T) (*http.ServeMux, *channelStore, *store.Store) {
 	}
 	cs := newChannelStore(st, "", false)
 	tmpl := template.Must(template.New("index").Parse("ok"))
+	rmgr := resolver.NewManager()
+	rmgr.Add(resolver.Exposestrat{})
 	mux := newMux(
 		proxy.New(1<<20), viewers.NewStore(), fstest.MapFS{}, cs, st, ks,
-		recorder.New("", dir), health.New(), tmpl,
+		recorder.New("", dir), health.New(), rmgr, tmpl,
 	)
 	return mux, cs, st
 }
@@ -150,6 +153,46 @@ func TestChannelsAddHandler(t *testing.T) {
 	}
 	if rec := do(t, mux, http.MethodPost, "/api/channels/add", `{bad`); rec.Code != http.StatusBadRequest {
 		t.Errorf("bad json: got %d, want 400", rec.Code)
+	}
+}
+
+func TestAddResolvableHandler(t *testing.T) {
+	mux, _, _ := testMux(t)
+
+	rec := do(t, mux, http.MethodPost, "/api/channels/add-resolvable",
+		`{"Name":"Fox_5","Provider":"exposestrat","Arg":"nctvhd","Referer":"https://exposestrat.com/"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("add-resolvable: got %d, body %q", rec.Code, rec.Body.String())
+	}
+	var ch store.Channel
+	if err := json.Unmarshal(rec.Body.Bytes(), &ch); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if ch.Resolver != "exposestrat" || ch.ResolverArg != "nctvhd" {
+		t.Errorf("recipe not stored: %+v", ch)
+	}
+
+	// Unknown provider → 400.
+	if r := do(t, mux, http.MethodPost, "/api/channels/add-resolvable",
+		`{"Name":"x","Provider":"nope","Arg":"y"}`); r.Code != http.StatusBadRequest {
+		t.Errorf("unknown provider: got %d, want 400", r.Code)
+	}
+	// Missing arg → 400.
+	if r := do(t, mux, http.MethodPost, "/api/channels/add-resolvable",
+		`{"Name":"x","Provider":"exposestrat"}`); r.Code != http.StatusBadRequest {
+		t.Errorf("missing arg: got %d, want 400", r.Code)
+	}
+	// Resolve on a non-resolvable manual channel → 400 (no network).
+	addRec := do(t, mux, http.MethodPost, "/api/channels/add",
+		`{"Name":"Plain","URL":"https://cdn.example.com/p.m3u8"}`)
+	var plain store.Channel
+	json.Unmarshal(addRec.Body.Bytes(), &plain)
+	if r := do(t, mux, http.MethodGet, "/api/resolve?id="+plain.ID, ""); r.Code != http.StatusBadRequest {
+		t.Errorf("resolve non-resolvable: got %d, want 400", r.Code)
+	}
+	// Resolve unknown id → 404.
+	if r := do(t, mux, http.MethodGet, "/api/resolve?id=manual:missing", ""); r.Code != http.StatusNotFound {
+		t.Errorf("resolve missing: got %d, want 404", r.Code)
 	}
 }
 

@@ -226,6 +226,39 @@ func TestManualHeaderHints(t *testing.T) {
 	}
 }
 
+func TestAddResolvable(t *testing.T) {
+	s := open(t)
+	ch, err := s.AddResolvable("Fox_5", "exposestrat", "nctvhd", "https://exposestrat.com/", "")
+	if err != nil {
+		t.Fatalf("AddResolvable: %v", err)
+	}
+	if ch.Resolver != "exposestrat" || ch.ResolverArg != "nctvhd" {
+		t.Errorf("recipe not persisted: resolver=%q arg=%q", ch.Resolver, ch.ResolverArg)
+	}
+	if ch.Referer != "https://exposestrat.com/" || !ch.IsFavourite {
+		t.Errorf("defaults wrong: ref=%q fav=%v", ch.Referer, ch.IsFavourite)
+	}
+	if len(ch.Servers) != 0 {
+		t.Errorf("expected empty servers before first resolve, got %+v", ch.Servers)
+	}
+
+	// SetResolvedURL caches the fresh URL into servers[0] without disturbing the recipe.
+	const fresh = "https://cdn13.zohanayaan.com:1686/hls/nctvhd.m3u8?md5=x&expires=1"
+	if err := s.SetResolvedURL(ch.ID, fresh); err != nil {
+		t.Fatalf("SetResolvedURL: %v", err)
+	}
+	got, _ := s.Get(ch.ID)
+	if len(got.Servers) != 1 || got.Servers[0].URL != fresh {
+		t.Errorf("servers not updated: %+v", got.Servers)
+	}
+	if got.Resolver != "exposestrat" || got.ResolverArg != "nctvhd" {
+		t.Errorf("recipe lost after SetResolvedURL: %+v", got)
+	}
+	if err := s.SetResolvedURL("manual:missing", fresh); err != ErrNotFound {
+		t.Errorf("SetResolvedURL missing: got %v, want ErrNotFound", err)
+	}
+}
+
 func TestSetHealthOnlyTouchesMapped(t *testing.T) {
 	s := open(t)
 	s.UpsertCatalog([]playlist.Channel{ch("a", "A", "http://a"), ch("b", "B", "http://b")})

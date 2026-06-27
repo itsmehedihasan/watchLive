@@ -358,11 +358,36 @@ export function assignChannel(cellIdx, ch) {
   cell.root.classList.add('filled');
   cell.els.label.textContent = ch.name;
   if (state.audioCell === -1) state.audioCell = cellIdx;
-  startCellPlayback(cell);
+  if (ch.resolver) {
+    // Dynamic channel: fetch a fresh signed URL before playing. The backend caches
+    // it into ch.servers and updates the proxy header map for the (rotated) host.
+    setCellState(cell, 'loading');
+    resolveChannel(ch).then(function (ok) {
+      if (cell.channel !== ch) return; // user already switched this cell away
+      if (ok) startCellPlayback(cell);
+      else setCellState(cell, 'error');
+    });
+  } else {
+    startCellPlayback(cell);
+  }
   applyAudio();
   renderAudioButtons();
   refreshHighlights();
   beat();
+}
+
+// resolveChannel asks the backend for a fresh playable URL for a dynamic channel
+// and patches it onto ch.servers in place. Returns a promise of success.
+function resolveChannel(ch) {
+  return fetch('/api/resolve?id=' + encodeURIComponent(ch.id))
+    .then(function (r) { if (!r.ok) throw new Error('resolve ' + r.status); return r.json(); })
+    .then(function (d) {
+      if (!d || !d.url) return false;
+      ch.servers = [{ url: d.url }];
+      if (d.referer) ch.http_referer = d.referer;
+      return true;
+    })
+    .catch(function (e) { console.warn('resolve failed for', ch.name, e); return false; });
 }
 
 export function clearCell(cell) {
