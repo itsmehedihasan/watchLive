@@ -53,6 +53,10 @@ var m3u8URLRe = regexp.MustCompile(`(?i)\.m3u8(\?|$)`)
 type Target struct {
 	ID   string
 	URLs []string
+	// UserAgent / Referer are the channel's #EXTVLCOPT header hints. When set the
+	// probe sends them (mirroring the proxy) so a CDN that gates on a specific UA
+	// or referer isn't falsely judged dead by a default-header request.
+	UserAgent, Referer string
 }
 
 // Snapshot is an immutable view of the prober's state, safe to serialize.
@@ -70,7 +74,7 @@ type Prober struct {
 	client *http.Client
 
 	mu       sync.Mutex
-	gen      int             // identifies the current pass; stale workers don't write
+	gen      int // identifies the current pass; stale workers don't write
 	cancel   context.CancelFunc
 	running  bool
 	finished bool
@@ -255,7 +259,7 @@ func (p *Prober) probe(ctx context.Context, t Target) bool {
 		if ctx.Err() != nil {
 			return false
 		}
-		if p.reachable(ctx, u) {
+		if p.reachable(ctx, u, t.UserAgent, t.Referer) {
 			return true
 		}
 	}
@@ -266,19 +270,12 @@ func (p *Prober) probe(ctx context.Context, t Target) bool {
 // stream is a 2xx response that is not an HTML error page; when the URL is a
 // playlist, the body must actually be one (#EXTM3U), which rejects servers that
 // answer 200 with a redirect/notice page.
-func (p *Prober) reachable(ctx context.Context, rawURL string) bool {
+func (p *Prober) reachable(ctx context.Context, rawURL, ua, referer string) bool {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return false
 	}
-	for k, v := range browserHeaders {
-		req.Header.Set(k, v)
-	}
-	if u, err := url.Parse(rawURL); err == nil {
-		origin := u.Scheme + "://" + u.Host
-		req.Header.Set("Referer", origin+"/")
-		req.Header.Set("Origin", origin)
-	}
+	applyHeaders(req, rawURL, ua, referer)
 
 	resp, err := p.client.Do(req)
 	if err != nil {
@@ -293,6 +290,32 @@ func (p *Prober) reachable(ctx context.Context, rawURL string) bool {
 	peek, _ := io.ReadAll(io.LimitReader(resp.Body, peekBytes))
 	io.Copy(io.Discard, resp.Body)
 	return looksAlive(rawURL, resp.Header.Get("Content-Type"), peek)
+}
+
+// applyHeaders sets browser-spoofing headers on a probe request, applying the
+// channel's #EXTVLCOPT overrides when present — the channel's exact User-Agent,
+// and its Referer with Origin realigned to that referer's origin (or dropped) —
+// using the same rules as the proxy, so a probe sees what playback will.
+func applyHeaders(req *http.Request, rawURL, ua, referer string) {
+	for k, v := range browserHeaders {
+		req.Header.Set(k, v)
+	}
+	if u, err := url.Parse(rawURL); err == nil {
+		origin := u.Scheme + "://" + u.Host
+		req.Header.Set("Referer", origin+"/")
+		req.Header.Set("Origin", origin)
+	}
+	if ua != "" {
+		req.Header.Set("User-Agent", ua)
+	}
+	if referer != "" {
+		req.Header.Set("Referer", referer)
+		if ru, err := url.Parse(referer); err == nil && ru.Scheme != "" && ru.Host != "" {
+			req.Header.Set("Origin", ru.Scheme+"://"+ru.Host)
+		} else {
+			req.Header.Del("Origin")
+		}
+	}
 }
 
 // looksAlive judges a 2xx response body. Split out for testing.

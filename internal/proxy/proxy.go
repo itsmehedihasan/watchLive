@@ -8,6 +8,7 @@ package proxy
 import (
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -21,6 +22,12 @@ const (
 	segmentTTL     = 5 * time.Minute  // live segments are write-once; 5 min covers any replay window
 	maxPlaylistLen = 10 << 20         // 10 MB — sanity cap for playlist bodies
 	upstreamLimit  = 30 * time.Second // total budget for one upstream fetch
+
+	// prefetchConcurrency caps simultaneous background segment warm-ups so the
+	// proxy never opens an unbounded number of upstream connections. A live
+	// media playlist lists only a handful of segments, so this comfortably
+	// covers several channels playing at once.
+	prefetchConcurrency = 12
 )
 
 // browserHeaders spoof a real browser so stream servers don't block us.
@@ -34,6 +41,7 @@ var (
 	m3u8URLRe = regexp.MustCompile(`(?i)\.m3u8(\?|$)`)
 	mpdURLRe  = regexp.MustCompile(`(?i)\.mpd(\?|$)`)
 	tsURLRe   = regexp.MustCompile(`(?i)\.ts(\?|$)`)
+	uriAttrRe = regexp.MustCompile(`URI="([^"]+)"`)
 )
 
 // fetchResult is the outcome of one upstream fetch, shared between
@@ -65,6 +73,54 @@ type Handler struct {
 
 	mu       sync.Mutex
 	inflight map[string]*inflightCall
+
+	// Prefetch: warm upcoming segments into the cache off the playback path.
+	// sem bounds upstream fanout; pf dedups in-flight warm-ups (the cache
+	// dedups completed ones).
+	sem  chan struct{}
+	pfMu sync.Mutex
+	pf   map[string]struct{}
+
+	// allowPrivate disables the SSRF guard (set once at startup, before serving)
+	// so a trusted operator can proxy LAN/loopback stream boxes if they opt in.
+	allowPrivate bool
+
+	// upstreamHeaders overrides per-host request headers (User-Agent / Referer)
+	// from the catalog's #EXTVLCOPT hints, so a CDN that gates on a specific UA
+	// or referer gets exactly what its channel prescribes. Keyed by lowercased
+	// host (segments share the channel's host), swapped wholesale on each catalog
+	// change. Read on every upstream fetch.
+	hdrMu           sync.RWMutex
+	upstreamHeaders map[string]UpstreamHeader
+}
+
+// SetAllowPrivateUpstreams toggles whether the proxy may fetch loopback/private/
+// link-local addresses. Call once at startup before serving — it is not
+// goroutine-safe with in-flight requests.
+func (h *Handler) SetAllowPrivateUpstreams(v bool) { h.allowPrivate = v }
+
+// UpstreamHeader holds per-channel HTTP header overrides for upstream fetches.
+// An empty field falls back to the proxy's default for that header.
+type UpstreamHeader struct {
+	UserAgent string
+	Referer   string
+}
+
+// SetUpstreamHeaders replaces the host→header override map (keys must be
+// lowercased hosts). Safe to call while serving; the map is swapped under a
+// write lock and read under a read lock per fetch.
+func (h *Handler) SetUpstreamHeaders(m map[string]UpstreamHeader) {
+	h.hdrMu.Lock()
+	h.upstreamHeaders = m
+	h.hdrMu.Unlock()
+}
+
+// headerOverride returns the override for a host, if any.
+func (h *Handler) headerOverride(host string) (UpstreamHeader, bool) {
+	h.hdrMu.RLock()
+	defer h.hdrMu.RUnlock()
+	ov, ok := h.upstreamHeaders[strings.ToLower(host)]
+	return ov, ok
 }
 
 // New creates a proxy handler with a segment cache of cacheBytes capacity.
@@ -87,6 +143,8 @@ func New(cacheBytes int64) *Handler {
 		segments:     newLRUCache(cacheBytes, perItem),
 		playlists:    newLRUCache(16<<20, maxPlaylistLen),
 		inflight:     make(map[string]*inflightCall),
+		sem:          make(chan struct{}, prefetchConcurrency),
+		pf:           make(map[string]struct{}),
 	}
 }
 
@@ -104,6 +162,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	target := r.URL.Query().Get("url")
 	if target == "" || !isHTTPURL(target) {
 		http.Error(w, "Missing or invalid url parameter", http.StatusBadRequest)
+		return
+	}
+	// SSRF guard: never let the url= param reach loopback/private/link-local
+	// hosts (e.g. cloud metadata at 169.254.169.254). Opt out with the flag for
+	// trusted LAN sources. Don't echo the URL back in the error.
+	if !h.allowPrivate && !isSafeUpstream(target) {
+		http.Error(w, "Forbidden upstream address", http.StatusForbidden)
 		return
 	}
 
@@ -175,16 +240,115 @@ func (h *Handler) fetchShared(target string) fetchResult {
 	return call.res
 }
 
-// applyBrowserHeaders spoofs a real browser and sets a same-origin Referer/Origin
-// so stream servers don't block the request.
-func applyBrowserHeaders(req *http.Request, target string) {
+// schedulePrefetch warms upcoming segments into the cache in the background.
+// It is best-effort: already-cached or already-warming URLs are skipped, and
+// when the worker pool is saturated it stops rather than queueing unbounded
+// work — the player's own request will still fill any segment we miss. Segments
+// are walked in playback order so the soonest-needed ones are warmed first.
+func (h *Handler) schedulePrefetch(urls []string) {
+	for _, target := range urls {
+		if _, _, ok := h.segments.get(target); ok {
+			continue // already warm
+		}
+		select {
+		case h.sem <- struct{}{}:
+		default:
+			return // pool saturated — leave the rest to on-demand fetches
+		}
+		if !h.beginPrefetch(target) {
+			<-h.sem // another goroutine is already warming this one
+			continue
+		}
+		go func(target string) {
+			defer func() { h.endPrefetch(target); <-h.sem }()
+			h.warmSegment(target)
+		}(target)
+	}
+}
+
+// warmSegment fetches a finite segment into the segment cache using the same
+// browser-header spoofing as the live path. It deliberately skips anything that
+// isn't a bounded segment — a continuous live MPEG-TS channel (unknown or
+// oversized length) must never be buffered whole into memory.
+func (h *Handler) warmSegment(target string) {
+	req, err := http.NewRequest(http.MethodGet, target, nil)
+	if err != nil {
+		return
+	}
+	h.applyBrowserHeaders(req, target)
+
+	resp, err := h.client.Do(req)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		io.CopyN(io.Discard, resp.Body, 4096) // drain a little for connection reuse
+		return
+	}
+	if resp.ContentLength > h.segments.maxItem {
+		return // declared oversized — don't even read it
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, h.segments.maxItem+1))
+	if err != nil {
+		return
+	}
+	if int64(len(body)) <= h.segments.maxItem {
+		h.segments.set(target, body, resp.Header.Get("Content-Type"), segmentTTL)
+	}
+}
+
+// beginPrefetch claims target for warming, returning false if it is already
+// being warmed. endPrefetch releases the claim.
+func (h *Handler) beginPrefetch(target string) bool {
+	h.pfMu.Lock()
+	defer h.pfMu.Unlock()
+	if _, ok := h.pf[target]; ok {
+		return false
+	}
+	h.pf[target] = struct{}{}
+	return true
+}
+
+func (h *Handler) endPrefetch(target string) {
+	h.pfMu.Lock()
+	delete(h.pf, target)
+	h.pfMu.Unlock()
+}
+
+// applyBrowserHeaders spoofs a real browser and sets a Referer/Origin so stream
+// servers don't block the request. By default it uses a same-origin Referer; if
+// the target's host has a catalog override (a #EXTVLCOPT http-user-agent /
+// http-referrer hint), that channel's exact UA and/or referer win — and when a
+// referer is overridden, Origin is realigned to that referer's origin (or
+// dropped) so the two headers never contradict each other.
+func (h *Handler) applyBrowserHeaders(req *http.Request, target string) {
 	for k, v := range browserHeaders {
 		req.Header.Set(k, v)
 	}
-	if u, err := url.Parse(target); err == nil {
-		origin := u.Scheme + "://" + u.Host
-		req.Header.Set("Referer", origin+"/")
-		req.Header.Set("Origin", origin)
+	u, err := url.Parse(target)
+	if err != nil {
+		return
+	}
+	origin := u.Scheme + "://" + u.Host
+	req.Header.Set("Referer", origin+"/")
+	req.Header.Set("Origin", origin)
+
+	ov, ok := h.headerOverride(u.Host)
+	if !ok {
+		return
+	}
+	if ov.UserAgent != "" {
+		req.Header.Set("User-Agent", ov.UserAgent)
+	}
+	if ov.Referer != "" {
+		req.Header.Set("Referer", ov.Referer)
+		if ru, rerr := url.Parse(ov.Referer); rerr == nil && ru.Scheme != "" && ru.Host != "" {
+			req.Header.Set("Origin", ru.Scheme+"://"+ru.Host)
+		} else {
+			req.Header.Del("Origin")
+		}
 	}
 }
 
@@ -194,7 +358,7 @@ func (h *Handler) fetchUpstream(target string) fetchResult {
 	if err != nil {
 		return fetchResult{err: err}
 	}
-	applyBrowserHeaders(req, target)
+	h.applyBrowserHeaders(req, target)
 
 	resp, err := h.client.Do(req)
 	if err != nil {
@@ -221,6 +385,10 @@ func (h *Handler) fetchUpstream(target string) fetchResult {
 		}
 		rewritten := []byte(RewritePlaylist(string(body), target))
 		h.playlists.set(target, rewritten, "application/vnd.apple.mpegurl", playlistTTL)
+		// Warm the listed segments into the cache so the player's own requests
+		// for them hit the fast path instead of paying an upstream round trip.
+		// Throttled to once per playlist refresh by the 2s playlist micro-cache.
+		h.schedulePrefetch(mediaSegments(string(body), target))
 		return fetchResult{data: rewritten, contentType: "application/vnd.apple.mpegurl", status: resp.StatusCode, isPlaylist: true}
 	}
 
@@ -267,7 +435,7 @@ func (h *Handler) serveTS(w http.ResponseWriter, r *http.Request, target string)
 		http.Error(w, "Proxy fetch failed", http.StatusBadGateway)
 		return
 	}
-	applyBrowserHeaders(req, target)
+	h.applyBrowserHeaders(req, target)
 
 	resp, err := h.streamClient.Do(req)
 	if err != nil {
@@ -329,32 +497,10 @@ func (h *Handler) serveTS(w http.ResponseWriter, r *http.Request, target string)
 // ("/api/proxy?url=…"); HLS clients resolve them against the playlist URL,
 // which is itself served from this origin.
 func RewritePlaylist(text, targetURL string) string {
-	base := targetURL
-	if idx := strings.LastIndex(targetURL, "/"); idx >= 0 {
-		base = targetURL[:idx+1]
-	}
-	origin := ""
-	if u, err := url.Parse(targetURL); err == nil {
-		origin = u.Scheme + "://" + u.Host
-	}
-
-	resolve := func(href string) string {
-		switch {
-		case isHTTPURL(href):
-			return href
-		case strings.HasPrefix(href, "//"):
-			return "https:" + href
-		case strings.HasPrefix(href, "/"):
-			return origin + href
-		default:
-			return base + href
-		}
-	}
+	resolve := urlResolver(targetURL)
 	proxied := func(href string) string {
 		return "/api/proxy?url=" + url.QueryEscape(resolve(href))
 	}
-
-	uriAttrRe := regexp.MustCompile(`URI="([^"]+)"`)
 
 	lines := strings.Split(text, "\n")
 	for i, line := range lines {
@@ -374,6 +520,63 @@ func RewritePlaylist(text, targetURL string) string {
 		lines[i] = proxied(trimmed)
 	}
 	return strings.Join(lines, "\n")
+}
+
+// urlResolver returns a closure that resolves a possibly-relative playlist href
+// to an absolute upstream URL, given the playlist's own URL. Absolute,
+// scheme-relative ("//host/…"), root-relative ("/…") and path-relative forms
+// are all handled the same way the original RewritePlaylist did.
+func urlResolver(targetURL string) func(string) string {
+	base := targetURL
+	if idx := strings.LastIndex(targetURL, "/"); idx >= 0 {
+		base = targetURL[:idx+1]
+	}
+	origin := ""
+	if u, err := url.Parse(targetURL); err == nil {
+		origin = u.Scheme + "://" + u.Host
+	}
+	return func(href string) string {
+		switch {
+		case isHTTPURL(href):
+			return href
+		case strings.HasPrefix(href, "//"):
+			return "https:" + href
+		case strings.HasPrefix(href, "/"):
+			return origin + href
+		default:
+			return base + href
+		}
+	}
+}
+
+// mediaSegments extracts the resolved (absolute) segment and init-map URLs from
+// an HLS MEDIA playlist, in playback order. It returns nil for a MASTER
+// playlist (a list of variant renditions) so we don't waste bandwidth warming
+// every rendition the player will never pick — the chosen variant's own media
+// playlist triggers prefetch when the player loads it.
+func mediaSegments(text, targetURL string) []string {
+	if strings.Contains(text, "#EXT-X-STREAM-INF") {
+		return nil // master playlist
+	}
+	resolve := urlResolver(targetURL)
+	var out []string
+	for _, line := range strings.Split(text, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "#") {
+			// fMP4 init segment — needed before any media segment.
+			if strings.HasPrefix(trimmed, "#EXT-X-MAP") {
+				if m := uriAttrRe.FindStringSubmatch(trimmed); m != nil {
+					out = append(out, resolve(m[1]))
+				}
+			}
+			continue
+		}
+		out = append(out, resolve(trimmed))
+	}
+	return out
 }
 
 // mpdOpenRe matches the opening <MPD …> tag (case-insensitive, attributes and
@@ -406,6 +609,32 @@ func injectDASHBaseURL(mpd, manifestURL string) string {
 func isHTTPURL(s string) bool {
 	return strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://") ||
 		strings.HasPrefix(s, "HTTP://") || strings.HasPrefix(s, "HTTPS://")
+}
+
+// isSafeUpstream rejects URLs that point at the host's own network: loopback,
+// RFC1918/ULA private ranges, link-local (incl. 169.254.169.254 cloud metadata)
+// and the unspecified address. IP literals are checked directly; hostnames are
+// allowed best-effort (we don't resolve DNS on the hot path, so DNS-rebinding
+// is out of scope — acceptable for a personal app). "localhost" is special-cased.
+func isSafeUpstream(target string) bool {
+	u, err := url.Parse(target)
+	if err != nil {
+		return false
+	}
+	host := u.Hostname()
+	if host == "" {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return false
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if ip.IsLoopback() || ip.IsPrivate() || ip.IsUnspecified() ||
+			ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+			return false
+		}
+	}
+	return true
 }
 
 func writeCORS(h http.Header) {

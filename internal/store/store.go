@@ -51,6 +51,8 @@ CREATE TABLE IF NOT EXISTS channels (
     typ             TEXT NOT NULL DEFAULT '',
     servers         TEXT NOT NULL DEFAULT '[]',
     clear_keys      TEXT NOT NULL DEFAULT '',
+    http_user_agent TEXT NOT NULL DEFAULT '',
+    http_referer    TEXT NOT NULL DEFAULT '',
     is_working      INTEGER,
     last_checked_at INTEGER,
     is_favourite    INTEGER NOT NULL DEFAULT 0,
@@ -66,16 +68,20 @@ CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 // Channel is a catalog row as served to the UI. It mirrors playlist.Channel and
 // adds the persisted user state.
 type Channel struct {
-	ID          string            `json:"id"`
-	Name        string            `json:"name"`
-	Logo        string            `json:"logo"`
-	Group       string            `json:"group"`
-	Type        string            `json:"type"`
-	Servers     []playlist.Server `json:"servers"`
+	ID      string            `json:"id"`
+	Name    string            `json:"name"`
+	Logo    string            `json:"logo"`
+	Group   string            `json:"group"`
+	Type    string            `json:"type"`
+	Servers []playlist.Server `json:"servers"`
 	// ClearKeys holds ClearKey DRM pairs {kidHex: keyHex} for CENC streams,
 	// passed straight to Shaka's drm.clearKeys. Omitted when the stream is clear.
-	ClearKeys   map[string]string `json:"clear_keys,omitempty"`
-	IsFavourite bool              `json:"is_favourite"`
+	ClearKeys map[string]string `json:"clear_keys,omitempty"`
+	// UserAgent / Referer are #EXTVLCOPT header hints the proxy applies to the
+	// upstream fetch; empty when the channel specified none. Not secrets.
+	UserAgent   string `json:"http_user_agent,omitempty"`
+	Referer     string `json:"http_referer,omitempty"`
+	IsFavourite bool   `json:"is_favourite"`
 	// IsWorking is null until the channel has been probed, then true/false. The
 	// frontend treats only an explicit false as "hide when working-only".
 	IsWorking *bool `json:"is_working"`
@@ -115,10 +121,12 @@ func Open(path string) (*Store, error) {
 	}
 	// Columns added after the initial schema. SQLite has no "ADD COLUMN IF NOT
 	// EXISTS", so a duplicate-column error on an already-migrated DB is benign.
-	if _, err := db.Exec(`ALTER TABLE channels ADD COLUMN clear_keys TEXT NOT NULL DEFAULT ''`); err != nil &&
-		!strings.Contains(err.Error(), "duplicate column") {
-		db.Close()
-		return nil, fmt.Errorf("store: migrate clear_keys: %w", err)
+	for _, col := range []string{"clear_keys", "http_user_agent", "http_referer"} {
+		if _, err := db.Exec(`ALTER TABLE channels ADD COLUMN ` + col + ` TEXT NOT NULL DEFAULT ''`); err != nil &&
+			!strings.Contains(err.Error(), "duplicate column") {
+			db.Close()
+			return nil, fmt.Errorf("store: migrate %s: %w", col, err)
+		}
 	}
 	return &Store{db: db}, nil
 }
@@ -143,7 +151,7 @@ func (s *Store) IsEmpty() (bool, error) {
 // carrying its favourite and working state.
 func (s *Store) ListChannels() ([]Channel, error) {
 	rows, err := s.db.Query(`
-		SELECT id, name, logo, grp, typ, servers, clear_keys, is_favourite, is_working
+		SELECT id, name, logo, grp, typ, servers, clear_keys, http_user_agent, http_referer, is_favourite, is_working
 		FROM channels ORDER BY sort_name, name`)
 	if err != nil {
 		return nil, err
@@ -173,7 +181,7 @@ func scanChannel(row scanner) (Channel, error) {
 		fav       int
 		working   sql.NullInt64
 	)
-	if err := row.Scan(&ch.ID, &ch.Name, &ch.Logo, &ch.Group, &ch.Type, &serversJS, &clearJS, &fav, &working); err != nil {
+	if err := row.Scan(&ch.ID, &ch.Name, &ch.Logo, &ch.Group, &ch.Type, &serversJS, &clearJS, &ch.UserAgent, &ch.Referer, &fav, &working); err != nil {
 		return Channel{}, err
 	}
 	if serversJS != "" {
@@ -219,11 +227,12 @@ func (s *Store) UpsertCatalog(chs []playlist.Channel) (ins, upd int, seen map[st
 	// the SET list so they survive a re-sync; the WHERE keeps manual rows (which
 	// never appear in the feed anyway) untouched even on an ID collision.
 	stmt, err := tx.Prepare(`
-		INSERT INTO channels (id, name, logo, grp, typ, servers, clear_keys, sort_name, is_manual)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+		INSERT INTO channels (id, name, logo, grp, typ, servers, clear_keys, http_user_agent, http_referer, sort_name, is_manual)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
 		ON CONFLICT(id) DO UPDATE SET
 			name=excluded.name, logo=excluded.logo, grp=excluded.grp,
 			typ=excluded.typ, servers=excluded.servers, clear_keys=excluded.clear_keys,
+			http_user_agent=excluded.http_user_agent, http_referer=excluded.http_referer,
 			sort_name=excluded.sort_name
 		WHERE channels.is_manual = 0`)
 	if err != nil {
@@ -236,7 +245,7 @@ func (s *Store) UpsertCatalog(chs []playlist.Channel) (ins, upd int, seen map[st
 		if merr != nil || string(serversJS) == "null" {
 			serversJS = []byte("[]")
 		}
-		if _, err = stmt.Exec(ch.ID, ch.Name, ch.Logo, ch.Group, ch.Type, string(serversJS), marshalKeys(ch.ClearKeys), strings.ToLower(ch.Name)); err != nil {
+		if _, err = stmt.Exec(ch.ID, ch.Name, ch.Logo, ch.Group, ch.Type, string(serversJS), marshalKeys(ch.ClearKeys), ch.UserAgent, ch.Referer, strings.ToLower(ch.Name)); err != nil {
 			return 0, 0, nil, err
 		}
 		if seen[ch.ID] {
@@ -360,6 +369,61 @@ func (s *Store) URLIndex() (map[string]ChannelRef, error) {
 	return idx, rows.Err()
 }
 
+// BackfillHeaders fills the http_user_agent / http_referer columns of EXISTING
+// channels from seed channels matched by EXACT stream URL. It is fill-only (a
+// blank seed value never clears an existing column), touches no other column,
+// and adds or removes no channel — so it is safe to run repeatedly and never
+// disturbs favourites, health verdicts, logos, or categories. Returns the number
+// of channels updated. Used to seed header hints into a catalog that predates
+// the columns, without re-syncing or wiping it.
+func (s *Store) BackfillHeaders(chs []playlist.Channel) (updated int, err error) {
+	idx, err := s.URLIndex()
+	if err != nil {
+		return 0, err
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer func() {
+		if err != nil {
+			tx.Rollback()
+		}
+	}()
+	stmt, err := tx.Prepare(`
+		UPDATE channels SET
+			http_user_agent = CASE WHEN ? <> '' THEN ? ELSE http_user_agent END,
+			http_referer    = CASE WHEN ? <> '' THEN ? ELSE http_referer END
+		WHERE id = ?`)
+	if err != nil {
+		return 0, err
+	}
+	defer stmt.Close()
+
+	done := make(map[string]bool) // one update per channel (first matching URL wins)
+	for _, ch := range chs {
+		if ch.UserAgent == "" && ch.Referer == "" {
+			continue
+		}
+		for _, sv := range ch.Servers {
+			ref, ok := idx[sv.URL]
+			if !ok || done[ref.ID] {
+				continue
+			}
+			if _, err = stmt.Exec(ch.UserAgent, ch.UserAgent, ch.Referer, ch.Referer, ref.ID); err != nil {
+				return 0, err
+			}
+			done[ref.ID] = true
+			updated++
+			break // this seed channel's headers are now placed on its catalog match
+		}
+	}
+	if err = tx.Commit(); err != nil {
+		return 0, err
+	}
+	return updated, nil
+}
+
 // ImportManual bulk-inserts reviewed playlist entries as manual channels in one
 // transaction. Like AddManual they are marked working and survive re-syncs, but
 // they are NOT auto-favourited (importing a list shouldn't flood Favourites —
@@ -471,7 +535,7 @@ func (s *Store) DeleteManual(id string) error {
 
 func (s *Store) getChannel(id string) (Channel, error) {
 	row := s.db.QueryRow(`
-		SELECT id, name, logo, grp, typ, servers, clear_keys, is_favourite, is_working
+		SELECT id, name, logo, grp, typ, servers, clear_keys, http_user_agent, http_referer, is_favourite, is_working
 		FROM channels WHERE id=?`, id)
 	return scanChannel(row)
 }
@@ -516,11 +580,11 @@ func (s *Store) StaleTargets(ttl time.Duration, force bool) ([]health.Target, er
 		err  error
 	)
 	if force {
-		rows, err = s.db.Query(`SELECT id, servers FROM channels`)
+		rows, err = s.db.Query(`SELECT id, servers, http_user_agent, http_referer FROM channels`)
 	} else {
 		cutoff := now().Add(-ttl).Unix()
 		rows, err = s.db.Query(`
-			SELECT id, servers FROM channels
+			SELECT id, servers, http_user_agent, http_referer FROM channels
 			WHERE last_checked_at IS NULL OR last_checked_at < ?`, cutoff)
 	}
 	if err != nil {
@@ -530,8 +594,8 @@ func (s *Store) StaleTargets(ttl time.Duration, force bool) ([]health.Target, er
 
 	var targets []health.Target
 	for rows.Next() {
-		var id, serversJS string
-		if err := rows.Scan(&id, &serversJS); err != nil {
+		var id, serversJS, ua, referer string
+		if err := rows.Scan(&id, &serversJS, &ua, &referer); err != nil {
 			return nil, err
 		}
 		var servers []playlist.Server
@@ -544,7 +608,7 @@ func (s *Store) StaleTargets(ttl time.Duration, force bool) ([]health.Target, er
 		for _, sv := range servers {
 			urls = append(urls, sv.URL)
 		}
-		targets = append(targets, health.Target{ID: id, URLs: urls})
+		targets = append(targets, health.Target{ID: id, URLs: urls, UserAgent: ua, Referer: referer})
 	}
 	return targets, rows.Err()
 }

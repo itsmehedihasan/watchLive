@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -75,6 +76,7 @@ func TestProxySegmentCachingAndSingleflight(t *testing.T) {
 	defer upstream.Close()
 
 	h := New(10 << 20)
+	h.SetAllowPrivateUpstreams(true) // httptest binds loopback
 	segURL := upstream.URL + "/seg001.m4s"
 
 	// 8 concurrent requests for the same segment → exactly one upstream fetch.
@@ -122,6 +124,7 @@ func TestProxyPlaylistRewriteEndToEnd(t *testing.T) {
 	defer upstream.Close()
 
 	h := New(10 << 20)
+	h.SetAllowPrivateUpstreams(true) // httptest binds loopback
 	plURL := upstream.URL + "/live/index.m3u8"
 	req := httptest.NewRequest(http.MethodGet, "/api/proxy?url="+url.QueryEscape(plURL), nil)
 	rec := httptest.NewRecorder()
@@ -153,6 +156,7 @@ func TestProxyDASHBaseURLInjected(t *testing.T) {
 	defer upstream.Close()
 
 	h := New(10 << 20)
+	h.SetAllowPrivateUpstreams(true) // httptest binds loopback
 	req := httptest.NewRequest(http.MethodGet, "/api/proxy?url="+url.QueryEscape(upstream.URL+"/live/manifest.mpd"), nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -234,6 +238,7 @@ func TestProxyRawTSStreaming(t *testing.T) {
 	defer live.Close()
 
 	h := New(10 << 20)
+	h.SetAllowPrivateUpstreams(true) // httptest binds loopback
 	req := httptest.NewRequest(http.MethodGet, "/api/proxy?url="+url.QueryEscape(live.URL+"/channel.ts"), nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -268,6 +273,102 @@ func TestProxyRawTSStreaming(t *testing.T) {
 	}
 }
 
+func TestMediaSegments(t *testing.T) {
+	target := "https://cdn.example.com/tv/ch1/index.m3u8"
+
+	media := strings.Join([]string{
+		"#EXTM3U",
+		"#EXT-X-VERSION:7",
+		`#EXT-X-MAP:URI="init.mp4"`,
+		"#EXTINF:6.0,",
+		"seg001.ts",
+		"#EXTINF:6.0,",
+		"/abs/seg002.ts",
+		"#EXTINF:6.0,",
+		"https://full.example.com/seg003.ts",
+		"",
+	}, "\n")
+	// Init map first (it is needed before any media), then segments in order.
+	want := []string{
+		"https://cdn.example.com/tv/ch1/init.mp4",
+		"https://cdn.example.com/tv/ch1/seg001.ts",
+		"https://cdn.example.com/abs/seg002.ts",
+		"https://full.example.com/seg003.ts",
+	}
+	if got := mediaSegments(media, target); !reflect.DeepEqual(got, want) {
+		t.Errorf("mediaSegments:\n got  %v\n want %v", got, want)
+	}
+
+	// A master playlist lists renditions, not segments — nothing to prefetch.
+	master := strings.Join([]string{
+		"#EXTM3U",
+		`#EXT-X-STREAM-INF:BANDWIDTH=1280000,RESOLUTION=1280x720`,
+		"v720/index.m3u8",
+		`#EXT-X-STREAM-INF:BANDWIDTH=480000,RESOLUTION=640x360`,
+		"v360/index.m3u8",
+		"",
+	}, "\n")
+	if got := mediaSegments(master, target); got != nil {
+		t.Errorf("master playlist should yield no prefetch targets, got %v", got)
+	}
+}
+
+func TestProxyPrefetchWarmsSegments(t *testing.T) {
+	var segHits int32
+	seg := func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&segHits, 1)
+		w.Header().Set("Content-Type", "video/MP2T")
+		fmt.Fprint(w, "SEGDATA") // small body → Content-Length set (finite, cacheable)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/live/index.m3u8", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+		fmt.Fprint(w, "#EXTM3U\n#EXTINF:6.0,\nseg1.ts\n#EXTINF:6.0,\nseg2.ts\n")
+	})
+	mux.HandleFunc("/live/seg1.ts", seg)
+	mux.HandleFunc("/live/seg2.ts", seg)
+	upstream := httptest.NewServer(mux)
+	defer upstream.Close()
+
+	h := New(10 << 20)
+	h.SetAllowPrivateUpstreams(true) // httptest binds loopback
+
+	// Serving the media playlist must schedule prefetch of both segments.
+	plReq := httptest.NewRequest(http.MethodGet, "/api/proxy?url="+url.QueryEscape(upstream.URL+"/live/index.m3u8"), nil)
+	h.ServeHTTP(httptest.NewRecorder(), plReq)
+
+	seg1 := upstream.URL + "/live/seg1.ts"
+	seg2 := upstream.URL + "/live/seg2.ts"
+	if !waitCached(h, seg1) || !waitCached(h, seg2) {
+		t.Fatalf("segments not warmed by prefetch within timeout (upstream hits=%d)", atomic.LoadInt32(&segHits))
+	}
+	if got := atomic.LoadInt32(&segHits); got != 2 {
+		t.Fatalf("expected 2 prefetch fetches, got %d", got)
+	}
+
+	// The player's own request now hits the warm cache — no extra upstream fetch.
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/proxy?url="+url.QueryEscape(seg1), nil))
+	if rec.Header().Get("X-Cache") != "HIT" || rec.Body.String() != "SEGDATA" {
+		t.Errorf("expected warm cache HIT, got X-Cache=%q body=%q", rec.Header().Get("X-Cache"), rec.Body.String())
+	}
+	if got := atomic.LoadInt32(&segHits); got != 2 {
+		t.Errorf("cache HIT reached upstream: %d hits, want 2", got)
+	}
+}
+
+// waitCached polls the segment cache until target is present or a short
+// deadline passes (prefetch is asynchronous).
+func waitCached(h *Handler, target string) bool {
+	for i := 0; i < 100; i++ {
+		if _, _, ok := h.segments.get(target); ok {
+			return true
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return false
+}
+
 func TestProxyRejectsBadURLs(t *testing.T) {
 	h := New(1 << 20)
 	for _, bad := range []string{"", "ftp://x/y", "file:///etc/passwd", "javascript:alert(1)"} {
@@ -280,6 +381,100 @@ func TestProxyRejectsBadURLs(t *testing.T) {
 	}
 }
 
+func TestProxyAppliesUpstreamHeaders(t *testing.T) {
+	var mu sync.Mutex
+	var ua, ref, origin string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		ua, ref, origin = r.Header.Get("User-Agent"), r.Header.Get("Referer"), r.Header.Get("Origin")
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/octet-stream")
+		fmt.Fprint(w, "SEG")
+	}))
+	defer srv.Close()
+	host := func() string { u, _ := url.Parse(srv.URL); return u.Host }()
+
+	h := New(10 << 20)
+	h.SetAllowPrivateUpstreams(true) // httptest binds loopback
+
+	// With an override for this host: the channel's UA + referer win, and Origin
+	// is realigned to the referer's origin (not the stream host).
+	h.SetUpstreamHeaders(map[string]UpstreamHeader{
+		host: {UserAgent: "CustomUA/9.9", Referer: "https://embed.example.com/p?x=1"},
+	})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/proxy?url="+url.QueryEscape(srv.URL+"/seg.bin"), nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d", rec.Code)
+	}
+	mu.Lock()
+	if ua != "CustomUA/9.9" {
+		t.Errorf("UA override not applied: %q", ua)
+	}
+	if ref != "https://embed.example.com/p?x=1" {
+		t.Errorf("referer override not applied: %q", ref)
+	}
+	if origin != "https://embed.example.com" {
+		t.Errorf("Origin not realigned to referer origin: %q", origin)
+	}
+	mu.Unlock()
+
+	// No override → default browser UA and same-origin referer (fresh path to dodge cache).
+	h.SetUpstreamHeaders(nil)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/proxy?url="+url.QueryEscape(srv.URL+"/seg2.bin"), nil))
+	mu.Lock()
+	defer mu.Unlock()
+	if !strings.Contains(ua, "Mozilla/") {
+		t.Errorf("default UA not applied: %q", ua)
+	}
+	if ref != srv.URL+"/" {
+		t.Errorf("default same-origin referer not applied: %q", ref)
+	}
+}
+
+func TestProxyBlocksPrivateUpstreams(t *testing.T) {
+	h := New(1 << 20)
+	// Loopback, private, and link-local (cloud metadata) must be refused with 403.
+	blocked := []string{
+		"http://127.0.0.1:6379/",
+		"http://localhost/x.m3u8",
+		"http://169.254.169.254/latest/meta-data/",
+		"http://10.0.0.5/seg.ts",
+		"http://192.168.1.1/admin",
+		"http://[::1]/x.ts",
+		"http://0.0.0.0/x.ts",
+	}
+	for _, u := range blocked {
+		req := httptest.NewRequest(http.MethodGet, "/api/proxy?url="+url.QueryEscape(u), nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Errorf("url %q: expected 403, got %d", u, rec.Code)
+		}
+		if strings.Contains(rec.Body.String(), u) {
+			t.Errorf("url %q: error body echoed the address", u)
+		}
+	}
+
+	// A public hostname passes the guard (it then fails at fetch, but not 403/400).
+	req := httptest.NewRequest(http.MethodGet, "/api/proxy?url="+url.QueryEscape("https://cdn.example.com/live/index.m3u8"), nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code == http.StatusForbidden || rec.Code == http.StatusBadRequest {
+		t.Errorf("public host wrongly blocked: got %d", rec.Code)
+	}
+
+	// With the opt-out, a private address is allowed past the guard.
+	h.SetAllowPrivateUpstreams(true)
+	req = httptest.NewRequest(http.MethodGet, "/api/proxy?url="+url.QueryEscape("http://127.0.0.1:1/x.ts"), nil)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code == http.StatusForbidden {
+		t.Errorf("opt-out should allow private upstream, still got 403")
+	}
+}
+
 func TestProxyUpstreamErrorPassthrough(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusForbidden)
@@ -287,6 +482,7 @@ func TestProxyUpstreamErrorPassthrough(t *testing.T) {
 	defer upstream.Close()
 
 	h := New(1 << 20)
+	h.SetAllowPrivateUpstreams(true) // httptest binds loopback
 	req := httptest.NewRequest(http.MethodGet, "/api/proxy?url="+url.QueryEscape(upstream.URL+"/x.ts"), nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)

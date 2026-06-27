@@ -296,6 +296,50 @@ https://example.com/plain/index.m3u8
 	}
 }
 
+func TestParseHeaderHints(t *testing.T) {
+	const m3u = `#EXTM3U
+#EXTINF:-1 tvg-id="A",America TV (720p)
+#EXTVLCOPT:http-user-agent=Mozilla/5.0 (Android 13; Pixel 7)
+https://cdn.example.com/america/playlist_720p.m3u8
+#EXTINF:-1 tvg-id="X",Xtrema Cartoons
+#EXTVLCOPT:http-referrer=https://xtrematv.com/?p=1390
+https://cdn2.example.com/xtrema/playlist.m3u8
+#EXTINF:-1 tvg-id="P",Plain Channel
+https://cdn3.example.com/plain/index.m3u8
+`
+	byName := map[string]Entry{}
+	for _, e := range ParseEntries(m3u) {
+		byName[e.Name] = e
+	}
+	if got := byName["America TV (720p)"].UserAgent; got != "Mozilla/5.0 (Android 13; Pixel 7)" {
+		t.Errorf("user-agent not captured: %q", got)
+	}
+	if byName["America TV (720p)"].Referer != "" {
+		t.Errorf("UA-only entry should have no referer: %q", byName["America TV (720p)"].Referer)
+	}
+	if got := byName["Xtrema Cartoons"].Referer; got != "https://xtrematv.com/?p=1390" {
+		t.Errorf("referer not captured: %q", got)
+	}
+	if e := byName["Plain Channel"]; e.UserAgent != "" || e.Referer != "" {
+		t.Errorf("plain entry should have no hints: %+v", e)
+	}
+
+	// Merge carries the hints onto the channel (the "(720p)" suffix strips to "America TV").
+	byCh := map[string]Channel{}
+	for _, c := range Parse(m3u) {
+		byCh[c.Name] = c
+	}
+	if got := byCh["America TV"].UserAgent; got != "Mozilla/5.0 (Android 13; Pixel 7)" {
+		t.Errorf("merged channel UA lost: %q", got)
+	}
+	if got := byCh["Xtrema Cartoons"].Referer; got != "https://xtrematv.com/?p=1390" {
+		t.Errorf("merged channel referer lost: %q", got)
+	}
+	if byCh["Plain Channel"].UserAgent != "" || byCh["Plain Channel"].Referer != "" {
+		t.Errorf("plain channel should have no hints: %+v", byCh["Plain Channel"])
+	}
+}
+
 func TestParseEmpty(t *testing.T) {
 	if got := Parse(""); len(got) != 0 {
 		t.Errorf("expected no channels from empty input, got %d", len(got))

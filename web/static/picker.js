@@ -15,6 +15,12 @@ export function openPicker(cellIdx) {
 export function closePicker() {
   els.picker.hidden = true;
   state.pickerTarget = -1;
+  // Cancel a queued debounced render and reset the query so it can't fire
+  // against the hidden modal, and the next open starts clean.
+  if (state.pickerDebounce) { clearTimeout(state.pickerDebounce); state.pickerDebounce = null; }
+  els.pickerSearch.value = '';
+  els.pickerSearchClear.hidden = true;
+  state.pickerSearch = '';
   maybeHideScrim();
 }
 

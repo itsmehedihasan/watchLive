@@ -12,6 +12,8 @@ function maybeHideScrim() {
 function closeDrawers() {
   els.categorySidebar.classList.remove('open');
   els.sidebar.classList.remove('open');
+  // Cancel a queued search render so it can't fire against the closed drawer.
+  if (state.searchDebounce) { clearTimeout(state.searchDebounce); state.searchDebounce = null; }
   maybeHideScrim();
 }
 

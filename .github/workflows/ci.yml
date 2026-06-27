@@ -1,0 +1,35 @@
+name: ci
+
+# Fast safety net on every push / PR: formatting, vet, and the test suite with
+# the race detector. The release workflow only builds, so this is the only gate
+# that actually runs the tests.
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Read the toolchain version straight from go.mod so CI never drifts from
+      # the module's required version.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::these files need gofmt:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: vet
+        run: go vet ./...
+
+      # Ubuntu runners ship gcc, so the race detector works here even though the
+      # local Windows dev box has no cgo toolchain.
+      - name: test (race)
+        run: go test -race -count=1 ./...

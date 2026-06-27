@@ -177,3 +177,39 @@ func TestProberOnFinishAndSeed(t *testing.T) {
 		t.Errorf("seeded reuse re-probed: hits = %d, want 1", hits)
 	}
 }
+
+// A probe for a channel carrying #EXTVLCOPT hints sends that exact UA/referer
+// (with Origin realigned), so a strict-CDN channel is judged with the same
+// headers playback will use — not the defaults.
+func TestProbeAppliesHeaderHints(t *testing.T) {
+	var ua, ref, origin string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ua, ref, origin = r.Header.Get("User-Agent"), r.Header.Get("Referer"), r.Header.Get("Origin")
+		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+		w.Write([]byte("#EXTM3U"))
+	}))
+	defer srv.Close()
+
+	targets := []Target{{
+		ID:        "a",
+		URLs:      []string{srv.URL + "/a.m3u8"},
+		UserAgent: "CustomUA/Pixel7",
+		Referer:   "https://embed.example.com/watch",
+	}}
+	p := New()
+	p.Start(targets, "v1", false)
+	waitFinished(t, p)
+
+	if ua != "CustomUA/Pixel7" {
+		t.Errorf("probe UA override not applied: %q", ua)
+	}
+	if ref != "https://embed.example.com/watch" {
+		t.Errorf("probe referer override not applied: %q", ref)
+	}
+	if origin != "https://embed.example.com" {
+		t.Errorf("probe Origin not realigned to referer origin: %q", origin)
+	}
+	if !p.Snapshot().Status["a"] {
+		t.Error("channel should be judged alive")
+	}
+}

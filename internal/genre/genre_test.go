@@ -70,8 +70,8 @@ func TestInjectReplacesExisting(t *testing.T) {
 
 func TestEnrich(t *testing.T) {
 	db := DB{
-		"1TV.ge":   {Category: News, Country: "GE"},
-		"ESPN.us":  {Category: Sports, Country: "US"},
+		"1TV.ge":    {Category: News, Country: "GE"},
+		"ESPN.us":   {Category: Sports, Country: "US"},
 		"NoCtry.xx": {Category: Movies, Country: ""}, // resolvable id but no country
 	}
 	in := []byte("#EXTM3U\n" +

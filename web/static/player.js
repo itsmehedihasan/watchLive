@@ -4,6 +4,10 @@ import { setDead } from './channels.js';
 
 export function destroyCellPlayer(cell) {
   cell.token++;
+  // Stop the buffering monitor first: removeCell/failover route through here
+  // without going via clearCell, so without this the per-cell setInterval would
+  // keep firing against a detached <video>.
+  if (cell.hideBuffering) cell.hideBuffering();
   if (cell.hls) { cell.hls.destroy(); cell.hls = null; }
   if (cell.shaka) { try { cell.shaka.destroy(); } catch (e) { /* ignore */ } cell.shaka = null; }
   if (cell.mpegts) { try { cell.mpegts.destroy(); } catch (e) { /* ignore */ } cell.mpegts = null; }
@@ -87,8 +91,21 @@ export function playHls(cell, server, token) {
       capLevelToPlayerSize: false,
       startLevel: -1,
       startFragPrefetch: true,
-      maxMaxBufferLength: 60,
-      backBufferLength: 0,
+      // Keep a real buffer cushion. Every segment crosses an extra
+      // browser→proxy→upstream hop, so sitting a few segments behind the live
+      // edge (liveSyncDurationCount) and holding a deep forward buffer absorbs
+      // that latency instead of stalling at the edge.
+      maxBufferLength: 30,
+      maxMaxBufferLength: 600,
+      backBufferLength: 30,
+      liveSyncDurationCount: 4,
+      liveMaxLatencyDurationCount: 20,
+      // Retry hard before giving up — live CDNs blip constantly.
+      fragLoadingMaxRetry: 6,
+      fragLoadingMaxRetryTimeout: 8000,
+      fragLoadingRetryDelay: 500,
+      manifestLoadingMaxRetry: 4,
+      levelLoadingMaxRetry: 6,
       abrEwmaDefaultEstimate: 5000000,
     });
     const h = cell.hls;
@@ -97,11 +114,15 @@ export function playHls(cell, server, token) {
 
     h.once(Hls.Events.MANIFEST_PARSED, function () { onCellPlaying(cell, token); refreshCellSettings(cell); });
     h.on(Hls.Events.LEVEL_SWITCHED, function () { if (token === cell.token) refreshCellSettings(cell); });
+    // A clean fragment resets the blip budget, so only CONSECUTIVE failures
+    // count toward failover — a stream that recovers gets its retries back.
+    h.on(Hls.Events.FRAG_BUFFERED, function () { netRecoveries = 0; mediaRecoveries = 0; });
     h.on(Hls.Events.ERROR, function (_, data) {
       if (!data.fatal || token !== cell.token) return;
-      if (data.type === Hls.ErrorTypes.NETWORK_ERROR && netRecoveries < 1) {
-        netRecoveries++; h.startLoad();
-      } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR && mediaRecoveries < 1) {
+      if (data.type === Hls.ErrorTypes.NETWORK_ERROR && netRecoveries < 4) {
+        netRecoveries++;
+        setTimeout(function () { if (token === cell.token && cell.hls) h.startLoad(); }, 400 * netRecoveries);
+      } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR && mediaRecoveries < 2) {
         mediaRecoveries++; h.recoverMediaError();
       } else {
         failover(cell);

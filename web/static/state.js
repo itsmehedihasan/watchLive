@@ -54,7 +54,7 @@ export const els = {
   search: $('search'), searchClear: $('searchClear'),
   channelList: $('channelList'), listLoading: $('listLoading'),
   emptyState: $('emptyState'), emptyClear: $('emptyClear'),
-  channelCount: $('channelCount'), syncBtn: $('syncBtn'),
+  channelCount: $('channelCount'),
   categoryList: $('categoryList'), catLoading: $('catLoading'),
   healthToggle: $('healthToggle'), healthStatus: $('healthStatus'),
   picker: $('picker'), pickerTitle: $('pickerTitle'), pickerClose: $('pickerClose'),

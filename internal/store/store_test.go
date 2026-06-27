@@ -356,7 +356,7 @@ func TestImportManual(t *testing.T) {
 	}
 	n2, _ := s.ImportManual([]ImportEntry{
 		{Name: "Dup Of Feed", URL: "http://feed/1"}, // collides with feed → skipped
-		{Name: "Brand New", URL: "http://new/1"},     // unique → added
+		{Name: "Brand New", URL: "http://new/1"},    // unique → added
 	})
 	if n2 != 1 {
 		t.Errorf("import vs feed link: added = %d, want 1", n2)
@@ -419,6 +419,90 @@ func TestClearKeysRoundTrip(t *testing.T) {
 	got, _ := s.getChannel("manual:" + manualHash("Clear", "https://c/stream.m3u8"))
 	if got.ClearKeys != nil {
 		t.Errorf("clear channel should have nil ClearKeys, got %+v", got.ClearKeys)
+	}
+}
+
+func TestHeaderHintsRoundTrip(t *testing.T) {
+	s := open(t)
+
+	feed := ch("tvg:ua", "UA Feed", "https://z/index.m3u8")
+	feed.UserAgent = "Mozilla/5.0 (Pixel 7)"
+	feed.Referer = "https://site.example/?p=1"
+	if _, _, _, err := s.UpsertCatalog([]playlist.Channel{feed}); err != nil {
+		t.Fatalf("UpsertCatalog: %v", err)
+	}
+	got, _ := s.getChannel("tvg:ua")
+	if got.UserAgent != "Mozilla/5.0 (Pixel 7)" || got.Referer != "https://site.example/?p=1" {
+		t.Errorf("header hints not persisted: ua=%q ref=%q", got.UserAgent, got.Referer)
+	}
+
+	// A re-sync (upsert with changed/cleared headers) updates them — DB tracks source.
+	feed.UserAgent = "Mozilla/5.0 (Changed)"
+	feed.Referer = ""
+	if _, _, _, err := s.UpsertCatalog([]playlist.Channel{feed}); err != nil {
+		t.Fatalf("UpsertCatalog 2: %v", err)
+	}
+	got, _ = s.getChannel("tvg:ua")
+	if got.UserAgent != "Mozilla/5.0 (Changed)" || got.Referer != "" {
+		t.Errorf("re-sync did not update headers: ua=%q ref=%q", got.UserAgent, got.Referer)
+	}
+
+	// A channel with no hints round-trips as empty strings.
+	if _, _, _, err := s.UpsertCatalog([]playlist.Channel{ch("tvg:plain", "Plain", "https://p/index.m3u8")}); err != nil {
+		t.Fatalf("UpsertCatalog plain: %v", err)
+	}
+	got, _ = s.getChannel("tvg:plain")
+	if got.UserAgent != "" || got.Referer != "" {
+		t.Errorf("plain channel should have empty hints: %+v", got)
+	}
+}
+
+func TestBackfillHeaders(t *testing.T) {
+	s := open(t)
+	// Catalog: three feed channels, no headers (as a pre-columns catalog would be).
+	if _, _, _, err := s.UpsertCatalog([]playlist.Channel{
+		ch("tvg:a", "A", "https://cdn.a/x.m3u8"),
+		ch("tvg:b", "B", "https://cdn.b/y.m3u8"),
+		ch("tvg:c", "C", "https://cdn.c/z.m3u8"),
+	}); err != nil {
+		t.Fatalf("UpsertCatalog: %v", err)
+	}
+
+	// Seed: A has UA+referer, B has UA only, Ghost's URL isn't in the catalog.
+	seed := []playlist.Channel{
+		{Name: "A", UserAgent: "UA-A", Referer: "https://site.a/p", Servers: []playlist.Server{{URL: "https://cdn.a/x.m3u8"}}},
+		{Name: "B", UserAgent: "UA-B", Servers: []playlist.Server{{URL: "https://cdn.b/y.m3u8"}}},
+		{Name: "Ghost", UserAgent: "UA-G", Servers: []playlist.Server{{URL: "https://not.in.catalog/q.m3u8"}}},
+	}
+	n, err := s.BackfillHeaders(seed)
+	if err != nil {
+		t.Fatalf("BackfillHeaders: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("updated = %d, want 2 (Ghost has no catalog match)", n)
+	}
+
+	if a, _ := s.getChannel("tvg:a"); a.UserAgent != "UA-A" || a.Referer != "https://site.a/p" {
+		t.Errorf("A not filled: ua=%q ref=%q", a.UserAgent, a.Referer)
+	}
+	if b, _ := s.getChannel("tvg:b"); b.UserAgent != "UA-B" || b.Referer != "" {
+		t.Errorf("B (UA-only) wrong: ua=%q ref=%q", b.UserAgent, b.Referer)
+	}
+	if c, _ := s.getChannel("tvg:c"); c.UserAgent != "" || c.Referer != "" {
+		t.Errorf("C (no seed hint) should stay blank: ua=%q ref=%q", c.UserAgent, c.Referer)
+	}
+	if cnt, _ := s.Count(); cnt != 3 {
+		t.Errorf("channel count = %d, want 3 (no adds/removes)", cnt)
+	}
+
+	// Fill-only: adding a referer to B must NOT clear its existing UA.
+	if _, err := s.BackfillHeaders([]playlist.Channel{
+		{Name: "B", Referer: "https://site.b/r", Servers: []playlist.Server{{URL: "https://cdn.b/y.m3u8"}}},
+	}); err != nil {
+		t.Fatalf("BackfillHeaders fill-only: %v", err)
+	}
+	if b, _ := s.getChannel("tvg:b"); b.UserAgent != "UA-B" || b.Referer != "https://site.b/r" {
+		t.Errorf("fill-only failed: ua=%q ref=%q (want UA-B + referer)", b.UserAgent, b.Referer)
 	}
 }
 

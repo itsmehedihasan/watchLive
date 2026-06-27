@@ -1,7 +1,7 @@
 import { state, els, MAX_CELLS } from './state.js';
 import { addCell, updatePickLabels } from './grid.js';
 import { renderCategorySidebar, renderChannelList, beat } from './channels.js';
-import { updateHealthStatus, observeHealth, stopHealthPolling, startHealthProbe } from './health.js';
+import { updateHealthStatus, observeHealth, stopHealthPolling } from './health.js';
 import { updateRecordButton, restoreAudioPrefs } from './audio.js';
 import { renderPicker } from './picker.js';
 
@@ -38,46 +38,16 @@ export function loadChannels() {
     .catch(function () { state.channelsLoading = false; renderChannelList(); });
 }
 
-function setLoadingText(text) {
-  const a = els.listLoading.querySelector('span');
-  const b = els.catLoading.querySelector('span');
-  if (a) a.textContent = text;
-  if (b) b.textContent = text;
-}
-
+// Live sync is disabled (seed.m3u is the source of truth); this only reads the
+// server's recording capability so the record button can show/hide.
 function pollSource() {
   fetch('/api/source')
     .then(function (r) { return r.json(); })
     .then(function (d) {
       if (d.recordingAvailable != null) { state.recordingAvailable = !!d.recordingAvailable; updateRecordButton(); }
-      const was = state.sourceRefreshing;
-      state.sourceRefreshing = !!d.refreshing;
-      if (state.sourceRefreshing && state.channels.length === 0) {
-        setLoadingText('Fetching channels from iptv-org…');
-        renderChannelList(); renderCategorySidebar();
-        if (!els.picker.hidden) renderPicker();
-      }
-      if (was && !state.sourceRefreshing) loadChannels();
-      if (state.sourceRefreshing) setTimeout(pollSource, 2500);
     })
     .catch(function () { /* old build — ignore */ });
 }
-
-els.syncBtn.addEventListener('click', function () {
-  const btn = els.syncBtn;
-  btn.disabled = true; btn.textContent = 'Syncing…';
-  fetch('/api/sync', { method: 'POST' })
-    .then(function (r) { if (!r.ok) throw new Error('sync failed: ' + r.status); return r.json(); })
-    .then(function () {
-      btn.textContent = '⟳ Sync'; btn.disabled = false;
-      loadChannels();
-      if (state.healthOn) startHealthProbe(true);
-    })
-    .catch(function () {
-      btn.textContent = 'Sync failed';
-      setTimeout(function () { btn.textContent = '⟳ Sync'; btn.disabled = false; }, 3000);
-    });
-});
 
 export function init() {
   restoreAudioPrefs();

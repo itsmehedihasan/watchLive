@@ -35,6 +35,13 @@ type Channel struct {
 	// drm.clearKeys config. Omitted when the stream is clear.
 	ClearKeys map[string]string `json:"clear_keys,omitempty"`
 
+	// UserAgent / Referer are per-channel HTTP header hints from a #EXTVLCOPT
+	// directive (http-user-agent / http-referrer): the exact values a picky CDN
+	// requires, which the proxy applies to the upstream fetch instead of its
+	// defaults. Empty when the channel specified none. Not secrets.
+	UserAgent string `json:"http_user_agent,omitempty"`
+	Referer   string `json:"http_referer,omitempty"`
+
 	// TvgID is the upstream tvg-id (when present); it seeds the stable channel
 	// ID. mergeKey is the (group, normalized-name) key the channel was merged
 	// under and is the fallback basis for the stable ID. Neither is serialized.
@@ -52,6 +59,10 @@ var (
 	// (KID:KEY[,KID:KEY…]) for CENC streams; a Widevine license-server URL also
 	// lands here but is rejected by ParseClearKeys (not KID:KEY hex form).
 	licenseKeyRe = regexp.MustCompile(`(?i)license_key=(.+)$`)
+	// #EXTVLCOPT header hints: the UA / referer a picky CDN demands. "referrer"
+	// (M3U spelling) and "referer" (HTTP header spelling) both match.
+	userAgentRe = regexp.MustCompile(`(?i)http-user-agent=(.+)$`)
+	refererRe   = regexp.MustCompile(`(?i)http-referr?er=(.+)$`)
 	// A ClearKey KID or key is 16 bytes = 32 hex chars (dashes stripped).
 	hexKeyRe = regexp.MustCompile(`^[0-9a-f]{32}$`)
 	// Quality suffixes like "(720p)", "(1080p)", "(2160p)" and resolution
@@ -109,6 +120,9 @@ type Entry struct {
 	// ClearKeys holds any ClearKey pairs parsed from a #KODIPROP/#EXTVLCOPT
 	// license_key directive between this #EXTINF and its URL. Nil when clear.
 	ClearKeys map[string]string
+	// UserAgent / Referer are #EXTVLCOPT http-user-agent / http-referrer hints
+	// from the same #EXTINF→URL block. Empty when absent.
+	UserAgent, Referer string
 }
 
 // ParseClearKeys parses a ClearKey license string of the form
@@ -202,9 +216,12 @@ func ParseEntries(content string) []Entry {
 		}
 
 		// Take the first valid HTTP URL after this #EXTINF line, capturing any
-		// ClearKey license_key directive that precedes it in the same block.
+		// ClearKey license_key and #EXTVLCOPT header hints that precede it in the
+		// same block.
 		url := ""
 		clearRaw := ""
+		ua := ""
+		ref := ""
 		for j := i + 1; j < len(lines); j++ {
 			next := lines[j]
 			if strings.HasPrefix(next, "#EXTINF") {
@@ -213,6 +230,12 @@ func ParseEntries(content string) []Entry {
 			if strings.HasPrefix(next, "#") {
 				if m := licenseKeyRe.FindStringSubmatch(next); m != nil {
 					clearRaw = m[1]
+				}
+				if m := userAgentRe.FindStringSubmatch(next); m != nil {
+					ua = strings.TrimSpace(m[1])
+				}
+				if m := refererRe.FindStringSubmatch(next); m != nil {
+					ref = strings.TrimSpace(m[1])
 				}
 				continue
 			}
@@ -230,7 +253,7 @@ func ParseEntries(content string) []Entry {
 			continue
 		}
 		seen[key] = struct{}{}
-		entries = append(entries, Entry{Name: name, Logo: logo, Group: group, URL: url, Genre: genre, TvgID: tvgID, ClearKeys: ParseClearKeys(clearRaw)})
+		entries = append(entries, Entry{Name: name, Logo: logo, Group: group, URL: url, Genre: genre, TvgID: tvgID, ClearKeys: ParseClearKeys(clearRaw), UserAgent: ua, Referer: ref})
 	}
 	return entries
 }
@@ -309,6 +332,13 @@ func Parse(content string) []Channel {
 		// First entry carrying ClearKey pairs wins for the merged channel.
 		if len(ch.ClearKeys) == 0 && len(e.ClearKeys) > 0 {
 			ch.ClearKeys = e.ClearKeys
+		}
+		// First entry carrying header hints wins, mirroring the backfills above.
+		if ch.UserAgent == "" && e.UserAgent != "" {
+			ch.UserAgent = e.UserAgent
+		}
+		if ch.Referer == "" && e.Referer != "" {
+			ch.Referer = e.Referer
 		}
 
 		dup := false

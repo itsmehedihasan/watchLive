@@ -132,12 +132,16 @@ export function makeCell(idx) {
   // player keep downloading into the buffer, and show how full it is getting
   // toward FILL_TARGET seconds. With the playhead frozen the buffer actually
   // grows, so the % climbs 0→100, then we resume — exactly like PotPlayer.
-  const FILL_TARGET = 4; // seconds to queue up before resuming after a stall
+  const FILL_TARGET = 3;    // seconds to queue up before resuming after a stall
+  const MAX_WAIT = 7000;    // never hold the playhead frozen longer than this
+  const PLATEAU_MS = 2500;  // if the buffer stops growing, stop waiting for more
   const bufText = buffering.querySelector('.buf-text');
   let bufTimer = 0;
   let filling = false;   // currently buffering with the playhead frozen
   let autoPaused = false; // the pause was ours (a refill), not the user's
+  let fillStart = 0, bestAhead = 0, lastGrowAt = 0;
 
+  function nowMs() { return (window.performance && performance.now) ? performance.now() : 0; }
   function bufferedAhead() {
     const b = video.buffered, t = video.currentTime;
     for (let i = 0; i < b.length; i++) {
@@ -150,12 +154,23 @@ export function makeCell(idx) {
     const ahead = bufferedAhead();
     const pct = Math.max(0, Math.min(100, Math.round((ahead / FILL_TARGET) * 100)));
     bufText.textContent = 'Buffering : ' + pct + '% complete';
-    if (filling && (ahead >= FILL_TARGET || video.readyState >= 4)) resumeFromBuffering();
+    if (!filling) return;
+    const t = nowMs();
+    if (ahead > bestAhead + 0.05) { bestAhead = ahead; lastGrowAt = t; }
+    // Resume the moment we have enough — OR bail out so we can NEVER freeze
+    // forever: a hard timeout, or the buffer plateauing (upstream can't get
+    // ahead of realtime). Whatever we have, we resume and let playback / the
+    // player's own error handling take over.
+    const enough = ahead >= FILL_TARGET || video.readyState >= 4;
+    const timedOut = (t - fillStart) > MAX_WAIT;
+    const plateaued = ahead > 0.3 && (t - lastGrowAt) > PLATEAU_MS;
+    if (enough || timedOut || plateaued) resumeFromBuffering();
   }
   function startFilling() {
     if (filling || !cell.channel || !loading.hidden || video.ended) return;
     filling = true;
     autoPaused = true;
+    fillStart = nowMs(); bestAhead = bufferedAhead(); lastGrowAt = fillStart;
     try { video.pause(); } catch (e) { /* ignore */ }
     buffering.hidden = false;
     paintBuf();
@@ -337,7 +352,6 @@ export function assignChannel(cellIdx, ch) {
   const cell = cells[cellIdx];
   if (!cell) return;
   if (state.recId && cellIdx === state.recCellIdx) stopRecording();
-  if (cell.hideBuffering) cell.hideBuffering();
   cell.channel = ch;
   cell.serverIdx = 0;
   cell.failedServers = {};
@@ -354,7 +368,6 @@ export function assignChannel(cellIdx, ch) {
 export function clearCell(cell) {
   if (state.openSettingsCell === cell) closeCellSettings();
   if (state.recId && cell.idx === state.recCellIdx) stopRecording();
-  if (cell.hideBuffering) cell.hideBuffering();
   destroyCellPlayer(cell);
   cell.channel = null;
   cell.root.classList.remove('filled');

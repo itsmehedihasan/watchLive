@@ -6,9 +6,18 @@ list.txt.bak
 list.m3u.bak
 health.json
 health.json.tmp
+# Stray dev artifacts: a scratch playlist copy and captured stdout/stderr.
+# (seed.m3u is intentionally tracked — it is //go:embed-ed into the binary.)
+wc.m3u
+run.err
+run.out
 catalog.db
 catalog.db-wal
 catalog.db-shm
+# Throwaway -playlist session DB (reset on every run).
+playlist.db
+playlist.db-wal
+playlist.db-shm
 recordings/
 # ClearKey DRM pairs — local convenience cache, never committed.
 keys.json
