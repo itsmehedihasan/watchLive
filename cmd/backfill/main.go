@@ -27,6 +27,8 @@ func main() {
 	dbPath := flag.String("db", "store/catalog.db", "path to the SQLite catalog")
 	seedPath := flag.String("seed", "seed.m3u", "path to the seed .m3u carrying header hints")
 	dryRun := flag.Bool("dry-run", false, "report what would change without writing")
+	updateLinks := flag.Bool("update-links", false, "refresh stale stream URLs in place from the seed by exact host match (resets health on changed channels); does not stamp headers or import")
+	syncLinks := flag.Bool("sync-links", false, "make every shared channel's servers match the seed exactly (links-only: keeps names/logos/categories/membership; resets health on changed channels)")
 	flag.Parse()
 
 	seed, err := os.ReadFile(*seedPath)
@@ -50,6 +52,37 @@ func main() {
 		log.Fatalf("open catalog %s: %v", *dbPath, err)
 	}
 	defer st.Close()
+
+	// -sync-links makes shared channels' servers match the seed exactly
+	// (links-only; membership, names, logos, categories, headers preserved).
+	if *syncLinks {
+		n, err := st.SyncLinksFromSeed(chs, *dryRun)
+		if err != nil {
+			log.Fatalf("sync links: %v", err)
+		}
+		verb := "synced"
+		if *dryRun {
+			verb = "would sync"
+		}
+		log.Printf("%s links on %d channel(s) to match seed (health reset on changed)", verb, n)
+		return
+	}
+
+	// -update-links is a separate, narrow mode: refresh stale stream URLs in
+	// place by exact host match. It does not stamp headers or import channels.
+	if *updateLinks {
+		chCh, links, skipped, err := st.RefreshLinksByHost(chs, *dryRun)
+		if err != nil {
+			log.Fatalf("update links: %v", err)
+		}
+		verb := "updated"
+		if *dryRun {
+			verb = "would update"
+		}
+		log.Printf("%s %d channel(s), %d link(s) refreshed by host; %d ambiguous server(s) skipped",
+			verb, chCh, links, skipped)
+		return
+	}
 
 	existing, err := st.ListChannels()
 	if err != nil {

@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 
@@ -611,6 +612,259 @@ func (s *Store) StaleTargets(ttl time.Duration, force bool) ([]health.Target, er
 		targets = append(targets, health.Target{ID: id, URLs: urls, UserAgent: ua, Referer: referer})
 	}
 	return targets, rows.Err()
+}
+
+// urlHost returns the lowercase host[:port] of a URL, or "" if unparseable.
+func urlHost(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	return strings.ToLower(u.Host)
+}
+
+// RefreshLinksByHost updates stale stream URLs in place from a seed playlist,
+// matched per channel (by stable ID) and per server (by exact host). For a
+// catalog server whose URL is absent from the seed channel but whose host
+// matches exactly one seed URL not already in the catalog, the URL is swapped to
+// that seed URL. It is deliberately narrow and mismatch-safe:
+//
+//   - the channel join is by stable ID, so a shared CDN host can never pull in a
+//     different channel's stream;
+//   - the host is unchanged, so any http_user_agent / http_referer hint still
+//     applies;
+//   - a changed channel's health verdict is reset (is_working / last_checked_at
+//     → NULL) so the prober re-checks the new URL instead of trusting the old.
+//
+// Servers whose old host maps to MORE THAN ONE candidate seed path are skipped
+// (ambiguous) and counted in skipped. Host changes (no host match) are out of
+// scope and left untouched. With dryRun the work is computed and rolled back.
+// Returns channels changed, links replaced, and ambiguous servers skipped.
+func (s *Store) RefreshLinksByHost(chs []playlist.Channel, dryRun bool) (chChanged, linksReplaced, skipped int, err error) {
+	seed := make(map[string][]string, len(chs))
+	for _, ch := range chs {
+		urls := make([]string, 0, len(ch.Servers))
+		for _, sv := range ch.Servers {
+			if sv.URL != "" {
+				urls = append(urls, sv.URL)
+			}
+		}
+		seed[ch.ID] = urls
+	}
+
+	// Read every catalog channel first (single connection: no updates mid-query).
+	type row struct {
+		id      string
+		servers []playlist.Server
+	}
+	rows, err := s.db.Query(`SELECT id, servers FROM channels`)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	var all []row
+	for rows.Next() {
+		var id, sj string
+		if err := rows.Scan(&id, &sj); err != nil {
+			rows.Close()
+			return 0, 0, 0, err
+		}
+		var servers []playlist.Server
+		if sj != "" {
+			if err := json.Unmarshal([]byte(sj), &servers); err != nil {
+				rows.Close()
+				return 0, 0, 0, err
+			}
+		}
+		all = append(all, row{id: id, servers: servers})
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, 0, 0, err
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	defer func() {
+		if err != nil {
+			tx.Rollback()
+		}
+	}()
+	stmt, err := tx.Prepare(`UPDATE channels SET servers=?, is_working=NULL, last_checked_at=NULL WHERE id=?`)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	defer stmt.Close()
+
+	for _, r := range all {
+		seedURLs, ok := seed[r.id]
+		if !ok || len(r.servers) == 0 {
+			continue
+		}
+		seedSet := make(map[string]bool, len(seedURLs))
+		for _, u := range seedURLs {
+			seedSet[u] = true
+		}
+		dbSet := make(map[string]bool, len(r.servers))
+		for _, sv := range r.servers {
+			dbSet[sv.URL] = true
+		}
+
+		changed := false
+		for i, sv := range r.servers {
+			if seedSet[sv.URL] {
+				continue // still current
+			}
+			h := urlHost(sv.URL)
+			if h == "" {
+				continue
+			}
+			var cands []string
+			for _, su := range seedURLs {
+				if !dbSet[su] && urlHost(su) == h {
+					cands = append(cands, su)
+				}
+			}
+			switch {
+			case len(cands) == 1:
+				r.servers[i].URL = cands[0]
+				linksReplaced++
+				changed = true
+			case len(cands) > 1:
+				skipped++
+			}
+		}
+		if !changed {
+			continue
+		}
+		chChanged++
+		js, merr := json.Marshal(r.servers)
+		if merr != nil {
+			err = merr
+			return 0, 0, 0, err
+		}
+		if _, err = stmt.Exec(string(js), r.id); err != nil {
+			return 0, 0, 0, err
+		}
+	}
+
+	if dryRun {
+		err = tx.Rollback()
+		return chChanged, linksReplaced, skipped, nil
+	}
+	if err = tx.Commit(); err != nil {
+		return 0, 0, 0, err
+	}
+	return chChanged, linksReplaced, skipped, nil
+}
+
+// SyncLinksFromSeed makes each shared channel's stream links match the seed
+// exactly: for a catalog channel whose ID is also in the seed and whose server
+// URL set differs, its servers are replaced wholesale with the seed channel's
+// servers (URLs + quality labels). It is links-only and membership-safe:
+//
+//   - matched by stable ID, so only channels already in the catalog change;
+//   - name, logo, group, category, favourite, manual flag and the backfilled
+//     header hints are left untouched — only the servers column is rewritten;
+//   - no channel is inserted or deleted;
+//   - a changed channel's health verdict is reset (is_working / last_checked_at
+//     → NULL) so the prober re-checks the new links.
+//
+// With dryRun the work is computed and rolled back. Returns the number of
+// channels whose links changed.
+func (s *Store) SyncLinksFromSeed(chs []playlist.Channel, dryRun bool) (changed int, err error) {
+	seed := make(map[string][]playlist.Server, len(chs))
+	for _, ch := range chs {
+		seed[ch.ID] = ch.Servers
+	}
+
+	rows, err := s.db.Query(`SELECT id, servers FROM channels`)
+	if err != nil {
+		return 0, err
+	}
+	type row struct {
+		id     string
+		urlSet map[string]bool
+	}
+	var all []row
+	for rows.Next() {
+		var id, sj string
+		if err := rows.Scan(&id, &sj); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		var servers []playlist.Server
+		if sj != "" {
+			if err := json.Unmarshal([]byte(sj), &servers); err != nil {
+				rows.Close()
+				return 0, err
+			}
+		}
+		set := make(map[string]bool, len(servers))
+		for _, sv := range servers {
+			set[sv.URL] = true
+		}
+		all = append(all, row{id: id, urlSet: set})
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer func() {
+		if err != nil {
+			tx.Rollback()
+		}
+	}()
+	stmt, err := tx.Prepare(`UPDATE channels SET servers=?, is_working=NULL, last_checked_at=NULL WHERE id=?`)
+	if err != nil {
+		return 0, err
+	}
+	defer stmt.Close()
+
+	for _, r := range all {
+		seedServers, ok := seed[r.id]
+		if !ok {
+			continue
+		}
+		// Differ only when the URL sets are not equal (order/label-only changes
+		// are ignored to avoid needless health resets).
+		same := len(seedServers) == len(r.urlSet)
+		if same {
+			for _, sv := range seedServers {
+				if !r.urlSet[sv.URL] {
+					same = false
+					break
+				}
+			}
+		}
+		if same {
+			continue
+		}
+		js, merr := json.Marshal(seedServers)
+		if merr != nil {
+			err = merr
+			return 0, err
+		}
+		if _, err = stmt.Exec(string(js), r.id); err != nil {
+			return 0, err
+		}
+		changed++
+	}
+
+	if dryRun {
+		err = tx.Rollback()
+		return changed, nil
+	}
+	if err = tx.Commit(); err != nil {
+		return 0, err
+	}
+	return changed, nil
 }
 
 // PruneOrphans deletes channels that are no longer in the latest feed (not in
