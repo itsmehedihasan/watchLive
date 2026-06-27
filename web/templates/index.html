@@ -235,12 +235,20 @@
           <span>Stream link</span>
           <div class="add-link-row">
             <input id="addChannelUrl" type="url" placeholder="https://…/stream.m3u8" autocomplete="off" required>
-            <button type="button" id="addChannelLicToggle" class="dots-btn" title="DRM license key" aria-expanded="false">
+            <button type="button" id="addChannelLicToggle" class="dots-btn" title="Advanced — headers & DRM" aria-expanded="false">
               <svg viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="5" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="12" cy="19" r="2"/></svg>
             </button>
           </div>
         </label>
         <label class="add-field add-license" id="addChannelLicWrap">
+          <span>Referer <span class="add-hint">optional · for embed/CDN-gated streams</span></span>
+          <input id="addChannelReferer" type="text" placeholder="https://embed.example.com/" autocomplete="off">
+        </label>
+        <label class="add-field add-license" id="addChannelUaWrap">
+          <span>User-Agent <span class="add-hint">optional</span></span>
+          <input id="addChannelUserAgent" type="text" placeholder="custom User-Agent header" autocomplete="off">
+        </label>
+        <label class="add-field add-license" id="addChannelLicWrap2">
           <span>License key <span class="add-hint">optional · ClearKey</span></span>
           <input id="addChannelLicense" type="text" placeholder="KID:KEY (hex) — for DRM .mpd streams" autocomplete="off">
         </label>

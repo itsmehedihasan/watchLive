@@ -32,6 +32,8 @@ function setLicenseOpen(on) {
   els.addChannelLicToggle.classList.toggle('open', on);
   els.addChannelLicToggle.setAttribute('aria-expanded', on ? 'true' : 'false');
   els.addChannelLicWrap.classList.toggle('show', on);
+  els.addChannelUaWrap.classList.toggle('show', on);
+  els.addChannelLicWrap2.classList.toggle('show', on);
 }
 
 export function openChannelModal(mode, ch) {
@@ -48,6 +50,11 @@ export function openChannelModal(mode, ch) {
   if (editing) {
     els.addChannelName.value = ch.name || '';
     els.addChannelUrl.value = (ch.servers && ch.servers[0] && ch.servers[0].url) || '';
+    els.addChannelReferer.value = ch.http_referer || '';
+    els.addChannelUserAgent.value = ch.http_user_agent || '';
+    // Reveal the advanced area when the channel already carries headers, so the
+    // user sees what's there instead of silently editing hidden fields.
+    if (ch.http_referer || ch.http_user_agent) setLicenseOpen(true);
   }
   els.addChannel.hidden = false;
   els.scrim.hidden = false;
@@ -190,6 +197,8 @@ els.addChannelForm.addEventListener('submit', function (e) {
   const name = els.addChannelName.value.trim();
   const url = els.addChannelUrl.value.trim();
   const license = els.addChannelLicense.value.trim();
+  const referer = els.addChannelReferer.value.trim();
+  const userAgent = els.addChannelUserAgent.value.trim();
   if (!name || !/^https?:\/\//i.test(url)) {
     els.addChannelError.textContent = 'Enter a name and an http(s) stream link.';
     els.addChannelError.hidden = false;
@@ -198,8 +207,8 @@ els.addChannelForm.addEventListener('submit', function (e) {
   const editing = state.channelModalMode === 'edit';
   const endpoint = editing ? '/api/channels/update' : '/api/channels/add';
   const payload = editing
-    ? { id: state.channelModalId, name: name, url: url, license: license }
-    : { name: name, url: url, license: license };
+    ? { id: state.channelModalId, name: name, url: url, license: license, referer: referer, userAgent: userAgent }
+    : { name: name, url: url, license: license, referer: referer, userAgent: userAgent };
   els.addChannelSave.disabled = true;
   els.addChannelSave.textContent = editing ? 'Updating…' : 'Saving…';
   fetch(endpoint, {

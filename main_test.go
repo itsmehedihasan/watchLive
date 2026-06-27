@@ -86,7 +86,7 @@ func seedFeed(t *testing.T, st *store.Store, id, name, url string) {
 
 func TestFavouriteHandler(t *testing.T) {
 	mux, _, st := testMux(t)
-	ch, err := st.AddManual("Fav Me", "https://cdn.example.com/fav.m3u8", nil)
+	ch, err := st.AddManual("Fav Me", "https://cdn.example.com/fav.m3u8", nil, "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,6 +130,20 @@ func TestChannelsAddHandler(t *testing.T) {
 		t.Errorf("manual defaults wrong: group=%q fav=%v", ch.Group, ch.IsFavourite)
 	}
 
+	// Optional Referer/User-Agent are persisted (CDN-gated streams need them).
+	rec = do(t, mux, http.MethodPost, "/api/channels/add",
+		`{"Name":"Gated","URL":"https://cdn9.example.com/g.m3u8","Referer":"https://exposestrat.com/","UserAgent":"CustomUA/1.0"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("add gated: got %d, body %q", rec.Code, rec.Body.String())
+	}
+	var gated store.Channel
+	if err := json.Unmarshal(rec.Body.Bytes(), &gated); err != nil {
+		t.Fatalf("decode gated channel: %v", err)
+	}
+	if gated.Referer != "https://exposestrat.com/" || gated.UserAgent != "CustomUA/1.0" {
+		t.Errorf("headers not persisted: ref=%q ua=%q", gated.Referer, gated.UserAgent)
+	}
+
 	// Missing/invalid URL → 400.
 	if rec := do(t, mux, http.MethodPost, "/api/channels/add", `{"Name":"x","URL":"not-a-url"}`); rec.Code != http.StatusBadRequest {
 		t.Errorf("bad url: got %d, want 400", rec.Code)
@@ -141,7 +155,7 @@ func TestChannelsAddHandler(t *testing.T) {
 
 func TestChannelsDeleteHandler(t *testing.T) {
 	mux, _, st := testMux(t)
-	ch, _ := st.AddManual("Temp", "https://cdn.example.com/t.m3u8", nil)
+	ch, _ := st.AddManual("Temp", "https://cdn.example.com/t.m3u8", nil, "", "")
 
 	if rec := do(t, mux, http.MethodDelete, "/api/channels/add", `{"ID":"`+ch.ID+`"}`); rec.Code != http.StatusOK {
 		t.Fatalf("delete manual: got %d", rec.Code)

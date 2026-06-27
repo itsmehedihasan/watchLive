@@ -703,7 +703,7 @@ func newMux(proxyHandler *proxy.Handler, viewerStore *viewers.Store, staticSub f
 	})
 
 	mux.HandleFunc("POST /api/channels/add", func(w http.ResponseWriter, r *http.Request) {
-		var body struct{ Name, URL, License string }
+		var body struct{ Name, URL, License, Referer, UserAgent string }
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
@@ -713,7 +713,7 @@ func newMux(proxyHandler *proxy.Handler, viewerStore *viewers.Store, staticSub f
 			http.Error(w, "channel name and an http(s) stream link are required", http.StatusBadRequest)
 			return
 		}
-		ch, err := st.AddManual(name, url, nil)
+		ch, err := st.AddManual(name, url, nil, body.Referer, body.UserAgent)
 		if err != nil {
 			serverError(w, "api", err)
 			return
@@ -735,7 +735,7 @@ func newMux(proxyHandler *proxy.Handler, viewerStore *viewers.Store, staticSub f
 	})
 
 	mux.HandleFunc("POST /api/channels/update", func(w http.ResponseWriter, r *http.Request) {
-		var body struct{ ID, Name, URL, License string }
+		var body struct{ ID, Name, URL, License, Referer, UserAgent string }
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
@@ -745,7 +745,7 @@ func newMux(proxyHandler *proxy.Handler, viewerStore *viewers.Store, staticSub f
 			http.Error(w, "channel id, name and an http(s) stream link are required", http.StatusBadRequest)
 			return
 		}
-		ch, err := st.UpdateManual(body.ID, name, url)
+		ch, err := st.UpdateManual(body.ID, name, url, body.Referer, body.UserAgent)
 		switch {
 		case errors.Is(err, store.ErrNotFound):
 			http.Error(w, "channel not found", http.StatusNotFound)

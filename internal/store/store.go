@@ -301,18 +301,20 @@ func (s *Store) SetFavourite(id string, on bool) (ok bool, err error) {
 // AddManual inserts a user-provided channel. It is favourited and marked working
 // by default (the user just gave us a URL they want), and idempotent on the same
 // name+url so a re-add doesn't duplicate.
-func (s *Store) AddManual(name, url string, clearKeys map[string]string) (Channel, error) {
+func (s *Store) AddManual(name, url string, clearKeys map[string]string, referer, userAgent string) (Channel, error) {
 	name, url = strings.TrimSpace(name), strings.TrimSpace(url)
+	referer, userAgent = strings.TrimSpace(referer), strings.TrimSpace(userAgent)
 	id := "manual:" + manualHash(name, url)
 	serversJS, _ := json.Marshal([]playlist.Server{{URL: url}})
 
 	_, err := s.db.Exec(`
 		INSERT INTO channels
-			(id, name, logo, grp, typ, servers, clear_keys, is_working, last_checked_at, is_favourite, is_manual, sort_name)
-		VALUES (?, ?, '', ?, ?, ?, ?, 1, ?, 1, 1, ?)
+			(id, name, logo, grp, typ, servers, clear_keys, http_referer, http_user_agent, is_working, last_checked_at, is_favourite, is_manual, sort_name)
+		VALUES (?, ?, '', ?, ?, ?, ?, ?, ?, 1, ?, 1, 1, ?)
 		ON CONFLICT(id) DO UPDATE SET
-			name=excluded.name, servers=excluded.servers, clear_keys=excluded.clear_keys, sort_name=excluded.sort_name`,
-		id, name, manualGroup, manualType, string(serversJS), marshalKeys(clearKeys), now().Unix(), strings.ToLower(name))
+			name=excluded.name, servers=excluded.servers, clear_keys=excluded.clear_keys,
+			http_referer=excluded.http_referer, http_user_agent=excluded.http_user_agent, sort_name=excluded.sort_name`,
+		id, name, manualGroup, manualType, string(serversJS), marshalKeys(clearKeys), referer, userAgent, now().Unix(), strings.ToLower(name))
 	if err != nil {
 		return Channel{}, err
 	}
@@ -493,8 +495,9 @@ func (s *Store) ImportManual(entries []ImportEntry) (added int, err error) {
 // name/url hash). It refuses feed channels (their fields are overwritten on the
 // next sync anyway), mirroring DeleteManual's errors: ErrNotFound when the id is
 // unknown, ErrNotManual when it exists but isn't a manual entry.
-func (s *Store) UpdateManual(id, name, url string) (Channel, error) {
+func (s *Store) UpdateManual(id, name, url, referer, userAgent string) (Channel, error) {
 	name, url = strings.TrimSpace(name), strings.TrimSpace(url)
+	referer, userAgent = strings.TrimSpace(referer), strings.TrimSpace(userAgent)
 	var isManual int
 	err := s.db.QueryRow(`SELECT is_manual FROM channels WHERE id=?`, id).Scan(&isManual)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -508,8 +511,8 @@ func (s *Store) UpdateManual(id, name, url string) (Channel, error) {
 	}
 	serversJS, _ := json.Marshal([]playlist.Server{{URL: url}})
 	if _, err := s.db.Exec(
-		`UPDATE channels SET name=?, sort_name=?, servers=? WHERE id=? AND is_manual=1`,
-		name, strings.ToLower(name), string(serversJS), id); err != nil {
+		`UPDATE channels SET name=?, sort_name=?, servers=?, http_referer=?, http_user_agent=? WHERE id=? AND is_manual=1`,
+		name, strings.ToLower(name), string(serversJS), referer, userAgent, id); err != nil {
 		return Channel{}, err
 	}
 	return s.getChannel(id)
