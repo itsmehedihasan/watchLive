@@ -294,8 +294,9 @@ func (h *Handler) warmSegment(target string) {
 	if err != nil {
 		return
 	}
+	body, ct := decodeImageWrappedTS(body, resp.Header.Get("Content-Type"))
 	if int64(len(body)) <= h.segments.maxItem {
-		h.segments.set(target, body, resp.Header.Get("Content-Type"), segmentTTL)
+		h.segments.set(target, body, ct, segmentTTL)
 	}
 }
 
@@ -418,6 +419,9 @@ func (h *Handler) fetchUpstream(target string) fetchResult {
 	if err != nil {
 		return fetchResult{err: err}
 	}
+	// Unwrap MPEG-TS hidden inside a fake PNG (image-CDN smuggling); a no-op for
+	// ordinary segments. Done before caching so the cache holds the bare TS.
+	body, contentType = decodeImageWrappedTS(body, contentType)
 	if int64(len(body)) <= h.segments.maxItem {
 		h.segments.set(target, body, contentType, segmentTTL)
 	}
