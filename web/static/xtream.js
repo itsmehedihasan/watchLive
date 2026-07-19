@@ -108,7 +108,8 @@ function importPlaylist(id, busyBtn) {
       if (!r.ok) return r.text().then(function (t) { throw new Error(t || ('refresh failed: ' + r.status)); });
       return r.json();
     })
-    .then(function () {
+    .then(function (d) {
+      logXtreamDebug(d);
       setBusy(busyBtn, false);
       loadChannels();
       // Reflect the now-imported state in the dropdown labels.
@@ -141,6 +142,7 @@ els.xtreamSave.addEventListener('click', function () {
       return r.json();
     })
     .then(function (d) {
+      logXtreamDebug(d);
       setBusy(els.xtreamSave, false);
       resetXtreamTab();
       loadChannels();
@@ -188,6 +190,16 @@ function patchSettings(notify) {
 
 els.xtreamUpdateFreq.addEventListener('change', function () { patchSettings(false); });
 els.xtreamStreamType.addEventListener('change', function () { patchSettings(true); });
+
+// logXtreamDebug prints the raw, unmodified panel responses the server relayed
+// (login/categories/streams) to the browser console. Fires only on manual
+// refresh/import — the startup sweep never returns a debug block.
+function logXtreamDebug(d) {
+  if (!d || !d.debug) return;
+  console.log('[xtream] raw login', d.debug.login);
+  console.log('[xtream] raw categories', d.debug.categories);
+  console.log('[xtream] raw streams', d.debug.streams);
+}
 
 // friendly turns a raw fetch error into a short user-facing message.
 function friendly(err) {
