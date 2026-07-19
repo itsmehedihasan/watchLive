@@ -562,16 +562,28 @@ func upstreamHeadersFromCatalog(chs []store.Channel) map[string]proxy.UpstreamHe
 
 // importXtreamStreams turns a panel's live-stream list into catalog rows for the
 // given saved playlist: it builds each stream's playable URL from the playlist
-// credentials, then upserts by the stable xtream:<playlist>:<stream> id (so a
-// re-import updates in place). Returns added/updated counts.
-func importXtreamStreams(st *store.Store, p store.XtreamPlaylist, streams []xtream.Stream) (added, updated int, err error) {
+// credentials, resolves each stream's category_id to its panel category name and
+// order (cats, in panel order), then upserts by the stable
+// xtream:<playlist>:<stream> id. Returns added/updated counts.
+func importXtreamStreams(st *store.Store, p store.XtreamPlaylist, streams []xtream.Stream, cats []xtream.Category) (added, updated int, err error) {
+	type catInfo struct {
+		name  string
+		order int
+	}
+	byID := make(map[string]catInfo, len(cats))
+	for i, c := range cats {
+		byID[c.ID] = catInfo{name: c.Name, order: i}
+	}
 	rows := make([]store.XtreamStream, 0, len(streams))
 	for _, s := range streams {
+		ci := byID[s.CategoryID] // zero value (empty name, order 0) when unknown
 		rows = append(rows, store.XtreamStream{
 			StreamID: s.StreamID,
 			Name:     s.Name,
 			Logo:     s.Icon,
 			URL:      xtream.StreamURL(p.Server, p.Username, p.Password, s.StreamID, s.Extension),
+			Group:    ci.name,
+			CatOrder: ci.order,
 		})
 	}
 	return st.UpsertXtreamChannels(p.ID, rows)
@@ -1015,7 +1027,12 @@ func newMux(proxyHandler *proxy.Handler, viewerStore *viewers.Store, staticSub f
 			serverError(w, "api", err)
 			return
 		}
-		added, _, err := importXtreamStreams(st, p, streams)
+		cats, err := xtream.LiveCategories(server, username, password)
+		if err != nil {
+			log.Printf("xtream: categories %q: %v (importing without groups)", name, err)
+			cats = nil
+		}
+		added, _, err := importXtreamStreams(st, p, streams, cats)
 		if err != nil {
 			serverError(w, "api", err)
 			return
@@ -1058,7 +1075,12 @@ func newMux(proxyHandler *proxy.Handler, viewerStore *viewers.Store, staticSub f
 			http.Error(w, "could not reach the panel or the credentials were rejected", http.StatusBadGateway)
 			return
 		}
-		added, updated, err := importXtreamStreams(st, p, streams)
+		cats, err := xtream.LiveCategories(p.Server, p.Username, p.Password)
+		if err != nil {
+			log.Printf("xtream: categories %q: %v (refreshing without groups)", p.Name, err)
+			cats = nil
+		}
+		added, updated, err := importXtreamStreams(st, p, streams, cats)
 		if err != nil {
 			serverError(w, "api", err)
 			return

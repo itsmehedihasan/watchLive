@@ -19,6 +19,7 @@ import (
 	"watchlive/internal/resolver"
 	"watchlive/internal/store"
 	"watchlive/internal/viewers"
+	"watchlive/internal/xtream"
 )
 
 // testMux wires newMux against a real temp SQLite store + keystore so the HTTP
@@ -425,5 +426,47 @@ func TestXtreamCreateRejectsBadInput(t *testing.T) {
 	}
 	if rec := do(t, mux, http.MethodPost, "/api/xtream/playlists", `{bad`); rec.Code != http.StatusBadRequest {
 		t.Errorf("bad json: got %d, want 400", rec.Code)
+	}
+}
+
+func TestImportXtreamStreamsMapsCategories(t *testing.T) {
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer st.Close()
+	p := store.XtreamPlaylist{ID: "pl1", Server: "http://p:8080", Username: "u", Password: "pw"}
+
+	// Categories in panel order; stream 2 references an unknown category id.
+	cats := []xtream.Category{
+		{ID: "10", Name: "US - Movies"},
+		{ID: "11", Name: "US - Sports"},
+	}
+	streams := []xtream.Stream{
+		{StreamID: 1, Name: "Film", CategoryID: "10", Extension: "ts"},
+		{StreamID: 2, Name: "Orphan", CategoryID: "999", Extension: "ts"},
+		{StreamID: 3, Name: "Match", CategoryID: "11", Extension: "ts"},
+	}
+	added, _, err := importXtreamStreams(st, p, streams, cats)
+	if err != nil {
+		t.Fatalf("importXtreamStreams: %v", err)
+	}
+	if added != 3 {
+		t.Fatalf("added = %d, want 3", added)
+	}
+	chans, _ := st.ListChannels()
+	byID := map[string]store.Channel{}
+	for _, c := range chans {
+		byID[c.ID] = c
+	}
+	if got := byID["xtream:pl1:1"]; got.Type != "US - Movies" || got.CatOrder != 0 {
+		t.Errorf("stream 1 = {Type:%q CatOrder:%d}, want {US - Movies 0}", got.Type, got.CatOrder)
+	}
+	if got := byID["xtream:pl1:3"]; got.Type != "US - Sports" || got.CatOrder != 1 {
+		t.Errorf("stream 3 = {Type:%q CatOrder:%d}, want {US - Sports 1}", got.Type, got.CatOrder)
+	}
+	// Unknown category id falls back to Uncategorized (store applies the default).
+	if got := byID["xtream:pl1:2"]; got.Type != "Uncategorized" {
+		t.Errorf("stream 2 Type = %q, want Uncategorized", got.Type)
 	}
 }
