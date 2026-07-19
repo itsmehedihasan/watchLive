@@ -769,6 +769,25 @@ input { font-family: inherit; }
   &:hover { background: #38435a; }
 }
 
+/* ── Playlist filter + sidebar tabs (above search in the browse drawer) ─ */
+.playlist-filter-wrap { padding: 8px 10px 0; }
+.playlist-filter {
+  width: 100%; padding: 8px 10px; border-radius: 8px;
+  background: var(--input-bg); color: var(--fg); border: 1px solid var(--border);
+  font-size: 14px;
+}
+.sidebar-tabs {
+  display: flex; gap: 4px; padding: 8px 10px 0;
+  border-bottom: 1px solid var(--border-dim);
+}
+.sidebar-tab {
+  flex: 1; padding: 10px 8px; background: transparent; border: none;
+  color: var(--muted); font-size: 14px; font-weight: 600; cursor: pointer;
+  border-bottom: 2px solid transparent;
+}
+.sidebar-tab.active { color: #e7c14b; border-bottom-color: #e7c14b; }
+.tab-placeholder { padding: 24px 16px; color: var(--muted); text-align: center; }
+
 /* ── Small screens ──────────────────────────────────────────── */
 @media (max-width: 640px) {
   :root { --rail-w: 60px; }
