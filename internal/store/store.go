@@ -113,6 +113,10 @@ type Channel struct {
 	// CatOrder is the category's position in its source Xtream panel, used to
 	// render Xtream groups in panel order. 0 for non-Xtream channels.
 	CatOrder int `json:"cat_order"`
+	// XtreamPlaylistID ties an Xtream-imported channel to its saved playlist so
+	// the browse sidebar can scope the list to one playlist. Empty for manual
+	// and .m3u-imported channels.
+	XtreamPlaylistID string `json:"xtream_playlist_id"`
 }
 
 // Store wraps the SQLite database. A single connection serializes all access
@@ -199,7 +203,7 @@ func (s *Store) IsEmpty() (bool, error) {
 // carrying its favourite and working state.
 func (s *Store) ListChannels() ([]Channel, error) {
 	rows, err := s.db.Query(`
-		SELECT id, name, logo, grp, typ, servers, clear_keys, http_user_agent, http_referer, resolver, resolver_arg, is_favourite, is_working, cat_order
+		SELECT id, name, logo, grp, typ, servers, clear_keys, http_user_agent, http_referer, resolver, resolver_arg, is_favourite, is_working, cat_order, xtream_playlist_id
 		FROM channels ORDER BY sort_name, name`)
 	if err != nil {
 		return nil, err
@@ -229,7 +233,7 @@ func scanChannel(row scanner) (Channel, error) {
 		fav       int
 		working   sql.NullInt64
 	)
-	if err := row.Scan(&ch.ID, &ch.Name, &ch.Logo, &ch.Group, &ch.Type, &serversJS, &clearJS, &ch.UserAgent, &ch.Referer, &ch.Resolver, &ch.ResolverArg, &fav, &working, &ch.CatOrder); err != nil {
+	if err := row.Scan(&ch.ID, &ch.Name, &ch.Logo, &ch.Group, &ch.Type, &serversJS, &clearJS, &ch.UserAgent, &ch.Referer, &ch.Resolver, &ch.ResolverArg, &fav, &working, &ch.CatOrder, &ch.XtreamPlaylistID); err != nil {
 		return Channel{}, err
 	}
 	if serversJS != "" {
@@ -634,7 +638,7 @@ func (s *Store) Get(id string) (Channel, error) {
 
 func (s *Store) getChannel(id string) (Channel, error) {
 	row := s.db.QueryRow(`
-		SELECT id, name, logo, grp, typ, servers, clear_keys, http_user_agent, http_referer, resolver, resolver_arg, is_favourite, is_working, cat_order
+		SELECT id, name, logo, grp, typ, servers, clear_keys, http_user_agent, http_referer, resolver, resolver_arg, is_favourite, is_working, cat_order, xtream_playlist_id
 		FROM channels WHERE id=?`, id)
 	return scanChannel(row)
 }

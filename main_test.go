@@ -513,3 +513,41 @@ func TestImportXtreamStreamsAppliesStreamType(t *testing.T) {
 		t.Errorf("stream 1 CatOrder = %d, want 1 (1-based order for first panel category)", got.CatOrder)
 	}
 }
+
+func TestChannelsPayloadCarriesPlaylistID(t *testing.T) {
+	mux, _, _ := testMux(t)
+	panel := xtreamPanel(t, `[{"stream_id":10,"name":"Alpha"}]`)
+
+	rec := do(t, mux, http.MethodPost, "/api/xtream/playlists",
+		`{"name":"P","server":"`+panel.URL+`","username":"u","password":"p"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("save: got %d body %s", rec.Code, rec.Body.String())
+	}
+	var saved struct {
+		Playlist store.XtreamPlaylist `json:"playlist"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &saved); err != nil {
+		t.Fatalf("decode save: %v", err)
+	}
+
+	rec = do(t, mux, http.MethodGet, "/api/channels", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("channels: got %d", rec.Code)
+	}
+	var chans []map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &chans); err != nil {
+		t.Fatalf("decode channels: %v", err)
+	}
+	found := false
+	for _, ch := range chans {
+		id, _ := ch["id"].(string)
+		if strings.HasPrefix(id, "xtream:"+saved.Playlist.ID+":") {
+			if pid, _ := ch["xtream_playlist_id"].(string); pid == saved.Playlist.ID {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("no imported channel carried xtream_playlist_id=%q", saved.Playlist.ID)
+	}
+}
