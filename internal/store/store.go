@@ -104,6 +104,9 @@ type Channel struct {
 	// IsWorking is null until the channel has been probed, then true/false. The
 	// frontend treats only an explicit false as "hide when working-only".
 	IsWorking *bool `json:"is_working"`
+	// CatOrder is the category's position in its source Xtream panel, used to
+	// render Xtream groups in panel order. 0 for non-Xtream channels.
+	CatOrder int `json:"cat_order"`
 }
 
 // Store wraps the SQLite database. A single connection serializes all access
@@ -147,6 +150,13 @@ func Open(path string) (*Store, error) {
 			return nil, fmt.Errorf("store: migrate %s: %w", col, err)
 		}
 	}
+	// cat_order is INTEGER (category position from the Xtream panel), so it
+	// can't ride the string-column loop above. Same duplicate-column tolerance.
+	if _, err := db.Exec(`ALTER TABLE channels ADD COLUMN cat_order INTEGER NOT NULL DEFAULT 0`); err != nil &&
+		!strings.Contains(err.Error(), "duplicate column") {
+		db.Close()
+		return nil, fmt.Errorf("store: migrate cat_order: %w", err)
+	}
 	return &Store{db: db}, nil
 }
 
@@ -170,7 +180,7 @@ func (s *Store) IsEmpty() (bool, error) {
 // carrying its favourite and working state.
 func (s *Store) ListChannels() ([]Channel, error) {
 	rows, err := s.db.Query(`
-		SELECT id, name, logo, grp, typ, servers, clear_keys, http_user_agent, http_referer, resolver, resolver_arg, is_favourite, is_working
+		SELECT id, name, logo, grp, typ, servers, clear_keys, http_user_agent, http_referer, resolver, resolver_arg, is_favourite, is_working, cat_order
 		FROM channels ORDER BY sort_name, name`)
 	if err != nil {
 		return nil, err
@@ -200,7 +210,7 @@ func scanChannel(row scanner) (Channel, error) {
 		fav       int
 		working   sql.NullInt64
 	)
-	if err := row.Scan(&ch.ID, &ch.Name, &ch.Logo, &ch.Group, &ch.Type, &serversJS, &clearJS, &ch.UserAgent, &ch.Referer, &ch.Resolver, &ch.ResolverArg, &fav, &working); err != nil {
+	if err := row.Scan(&ch.ID, &ch.Name, &ch.Logo, &ch.Group, &ch.Type, &serversJS, &clearJS, &ch.UserAgent, &ch.Referer, &ch.Resolver, &ch.ResolverArg, &fav, &working, &ch.CatOrder); err != nil {
 		return Channel{}, err
 	}
 	if serversJS != "" {
@@ -605,7 +615,7 @@ func (s *Store) Get(id string) (Channel, error) {
 
 func (s *Store) getChannel(id string) (Channel, error) {
 	row := s.db.QueryRow(`
-		SELECT id, name, logo, grp, typ, servers, clear_keys, http_user_agent, http_referer, resolver, resolver_arg, is_favourite, is_working
+		SELECT id, name, logo, grp, typ, servers, clear_keys, http_user_agent, http_referer, resolver, resolver_arg, is_favourite, is_working, cat_order
 		FROM channels WHERE id=?`, id)
 	return scanChannel(row)
 }
@@ -1076,6 +1086,12 @@ type XtreamStream struct {
 	Logo     string
 	// URL is the fully-built playable stream URL (server/live/user/pass/id.ext).
 	URL string
+	// Group is the channel's category name (from the panel), stored as the
+	// channel's typ so the browse UI groups by it. Empty → "Uncategorized".
+	Group string
+	// CatOrder is the category's index in the panel's category list, used to
+	// order groups in the browse UI.
+	CatOrder int
 }
 
 // SaveXtreamPlaylist inserts a new saved playlist with a freshly-minted opaque
@@ -1185,12 +1201,12 @@ func (s *Store) UpsertXtreamChannels(playlistID string, streams []XtreamStream) 
 	// a refresh preserves the user's favourite and the prober's verdict.
 	stmt, err := tx.Prepare(`
 		INSERT INTO channels
-			(id, name, logo, grp, typ, servers, is_working, last_checked_at, is_favourite, is_manual, sort_name, xtream_playlist_id)
-		VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, 0, 1, ?, ?)
+			(id, name, logo, grp, typ, servers, is_working, last_checked_at, is_favourite, is_manual, sort_name, xtream_playlist_id, cat_order)
+		VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, 0, 1, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			name=excluded.name, logo=excluded.logo, grp=excluded.grp, typ=excluded.typ,
 			servers=excluded.servers, sort_name=excluded.sort_name,
-			xtream_playlist_id=excluded.xtream_playlist_id`)
+			xtream_playlist_id=excluded.xtream_playlist_id, cat_order=excluded.cat_order`)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -1208,11 +1224,13 @@ func (s *Store) UpsertXtreamChannels(playlistID string, streams []XtreamStream) 
 		}
 		seen[id] = true
 		serversJS, _ := json.Marshal([]playlist.Server{{URL: u}})
-		// Xtream panels group by opaque numeric category_id, which is meaningless
-		// as a country and would pollute the country dropdown. Land these in the
-		// neutral "Custom" country group (same as manual channels) and the neutral
-		// category, matching manual-channel semantics.
-		if _, err = stmt.Exec(id, name, st.Logo, manualGroup, manualType, string(serversJS), strings.ToLower(name), playlistID); err != nil {
+		grp := strings.TrimSpace(st.Group)
+		if grp == "" {
+			grp = "Uncategorized"
+		}
+		// grp column (country) stays neutral — categories are not countries and
+		// must not pollute the country dropdown. The category name is the typ.
+		if _, err = stmt.Exec(id, name, st.Logo, manualGroup, grp, string(serversJS), strings.ToLower(name), playlistID, st.CatOrder); err != nil {
 			return 0, 0, err
 		}
 		if existing[id] {

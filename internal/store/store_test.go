@@ -731,6 +731,40 @@ func TestUpsertXtreamChannels(t *testing.T) {
 	}
 }
 
+func TestUpsertXtreamChannelsGrouping(t *testing.T) {
+	s := open(t)
+	_, err := s.SaveXtreamPlaylist("KS", "http://p:8080", "u", "pw")
+	if err != nil {
+		t.Fatalf("SaveXtreamPlaylist: %v", err)
+	}
+	added, _, err := s.UpsertXtreamChannels("pl1", []XtreamStream{
+		{StreamID: 1, Name: "Movie One", URL: "http://p/live/u/pw/1.ts", Group: "US - Movies", CatOrder: 5},
+		{StreamID: 2, Name: "Sport One", URL: "http://p/live/u/pw/2.ts", Group: "US - Sports", CatOrder: 6},
+		{StreamID: 3, Name: "Loose", URL: "http://p/live/u/pw/3.ts", Group: "", CatOrder: 0},
+	})
+	if err != nil {
+		t.Fatalf("UpsertXtreamChannels: %v", err)
+	}
+	if added != 3 {
+		t.Fatalf("added = %d, want 3", added)
+	}
+	chans, err := s.ListChannels()
+	if err != nil {
+		t.Fatalf("ListChannels: %v", err)
+	}
+	byID := map[string]Channel{}
+	for _, c := range chans {
+		byID[c.ID] = c
+	}
+	if got := byID["xtream:pl1:1"]; got.Type != "US - Movies" || got.CatOrder != 5 {
+		t.Errorf("channel 1 = {Type:%q CatOrder:%d}, want {US - Movies 5}", got.Type, got.CatOrder)
+	}
+	// Empty category name falls back to "Uncategorized".
+	if got := byID["xtream:pl1:3"]; got.Type != "Uncategorized" {
+		t.Errorf("channel 3 Type = %q, want Uncategorized", got.Type)
+	}
+}
+
 // An xtream-imported channel is is_manual=1, so it survives PruneOrphans even
 // though its id never appears in the iptv-org feed.
 func TestXtreamChannelsSurvivePrune(t *testing.T) {
