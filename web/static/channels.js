@@ -208,11 +208,35 @@ export function renderChannelList() {
   const frag = document.createDocumentFragment();
   frag.appendChild(buildFavSection(searching));
 
-  // Known categories first (in CATEGORY_ORDER), then any stragglers alphabetically.
+  // Known categories first (in CATEGORY_ORDER). Then "straggler" groups: Xtream
+  // category groups (channels carry a panel index in cat_order) sorted by that
+  // index to preserve the panel's order, followed by any remaining groups
+  // (cat_order 0 — non-Xtream) alphabetically.
   const known = {};
   CATEGORY_ORDER.forEach(function (c) { known[c] = true; });
+  // Group's ordering key = the smallest cat_order among its channels.
+  const groupOrder = {};
+  Object.keys(byCat).forEach(function (c) {
+    let min = 0;
+    byCat[c].forEach(function (ch) {
+      const o = ch.cat_order || 0;
+      if (o > 0 && (min === 0 || o < min)) min = o;
+    });
+    groupOrder[c] = min; // 0 = no panel ordering signal
+  });
   const extra = Object.keys(byCat).filter(function (c) { return !known[c]; })
-    .sort(function (a, b) { a = a.toLowerCase(); b = b.toLowerCase(); return a < b ? -1 : a > b ? 1 : 0; });
+    .sort(function (a, b) {
+      const oa = groupOrder[a], ob = groupOrder[b];
+      if (oa !== ob) {
+        // Ordered (non-zero) groups come before unordered (zero) ones; among
+        // ordered groups, ascending panel index.
+        if (oa === 0) return 1;
+        if (ob === 0) return -1;
+        return oa - ob;
+      }
+      a = a.toLowerCase(); b = b.toLowerCase();
+      return a < b ? -1 : a > b ? 1 : 0;
+    });
   const cats = CATEGORY_ORDER.concat(extra);
 
   cats.forEach(function (cat) {
