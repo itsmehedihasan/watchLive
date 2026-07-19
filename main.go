@@ -503,6 +503,43 @@ func main() {
 		}
 	}()
 
+	// One-shot startup sweep: auto-refresh any saved Xtream playlist whose
+	// update cadence has elapsed. Runs in the background so a slow/dead panel
+	// never delays startup; failures are logged and skipped.
+	go func() {
+		due, err := st.DueXtreamPlaylists()
+		if err != nil {
+			log.Printf("xtream: startup sweep: %v", err)
+			return
+		}
+		refreshed := false
+		for _, p := range due {
+			streams, err := xtream.LiveStreams(p.Server, p.Username, p.Password)
+			if err != nil {
+				log.Printf("xtream: auto-refresh %q: %v", p.Name, err)
+				continue
+			}
+			cats, err := xtream.LiveCategories(p.Server, p.Username, p.Password)
+			if err != nil {
+				log.Printf("xtream: auto-refresh categories %q: %v", p.Name, err)
+				cats = nil
+			}
+			added, updated, err := importXtreamStreams(st, p, streams, cats)
+			if err != nil {
+				log.Printf("xtream: auto-refresh import %q: %v", p.Name, err)
+				continue
+			}
+			if err := st.StampXtreamRefreshed(p.ID); err != nil {
+				log.Printf("xtream: stamp refresh %q: %v", p.Name, err)
+			}
+			log.Printf("xtream: auto-refreshed %q: +%d new, %d updated", p.Name, added, updated)
+			refreshed = true
+		}
+		if refreshed {
+			channels.rebuild()
+		}
+	}()
+
 	// Bind explicitly before serving so a failure (e.g. the port is already in
 	// use) is reported clearly and we only open the browser once the listener is
 	// actually accepting connections — no "can't connect" race.
@@ -1037,6 +1074,9 @@ func newMux(proxyHandler *proxy.Handler, viewerStore *viewers.Store, staticSub f
 			serverError(w, "api", err)
 			return
 		}
+		if err := st.StampXtreamRefreshed(p.ID); err != nil {
+			log.Printf("xtream: stamp refresh %q: %v", p.Name, err)
+		}
 		channels.rebuild()
 		log.Printf("xtream: saved playlist %q (%s), imported %d channel(s)", name, p.ID, added)
 		writeJSON(w, r, map[string]any{"playlist": p, "imported": added})
@@ -1085,9 +1125,41 @@ func newMux(proxyHandler *proxy.Handler, viewerStore *viewers.Store, staticSub f
 			serverError(w, "api", err)
 			return
 		}
+		if err := st.StampXtreamRefreshed(p.ID); err != nil {
+			log.Printf("xtream: stamp refresh %q: %v", p.Name, err)
+		}
 		channels.rebuild()
 		log.Printf("xtream: refreshed %q (%s): +%d new, %d updated", p.Name, p.ID, added, updated)
 		writeJSON(w, r, map[string]int{"added": added, "updated": updated})
+	})
+
+	// Update a saved playlist's per-playlist settings (auto-refresh cadence and
+	// stream type). Applying a new stream type takes effect on the next refresh;
+	// this endpoint only persists the choice.
+	mux.HandleFunc("PATCH /api/xtream/playlists/{id}", func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("id")
+		var body struct {
+			UpdateFreq string `json:"update_freq"`
+			StreamType string `json:"stream_type"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		p, err := st.UpdateXtreamSettings(id, body.UpdateFreq, body.StreamType)
+		if errors.Is(err, store.ErrNotFound) {
+			http.Error(w, "playlist not found", http.StatusNotFound)
+			return
+		}
+		if errors.Is(err, store.ErrInvalidSetting) {
+			http.Error(w, "update_freq must be manual/daily/3days/weekly and stream_type ts/m3u8", http.StatusBadRequest)
+			return
+		}
+		if err != nil {
+			serverError(w, "api", err)
+			return
+		}
+		writeJSON(w, r, p)
 	})
 
 	mux.HandleFunc("GET /api/keys", func(w http.ResponseWriter, r *http.Request) {

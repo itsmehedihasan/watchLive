@@ -1233,6 +1233,28 @@ func (s *Store) StampXtreamRefreshed(id string) error {
 	return err
 }
 
+// DueXtreamPlaylists returns saved playlists whose auto-refresh cadence has
+// elapsed as of now, for the startup sweep. Each returned playlist carries its
+// credentials so the caller can refresh it.
+func (s *Store) DueXtreamPlaylists() ([]XtreamPlaylist, error) {
+	all, err := s.ListXtreamPlaylists()
+	if err != nil {
+		return nil, err
+	}
+	dueIDs := playlistsDueForRefresh(all, now().Unix())
+	dueSet := make(map[string]bool, len(dueIDs))
+	for _, id := range dueIDs {
+		dueSet[id] = true
+	}
+	var due []XtreamPlaylist
+	for _, p := range all {
+		if dueSet[p.ID] {
+			due = append(due, p)
+		}
+	}
+	return due, nil
+}
+
 // UpsertXtreamChannels imports (or refreshes) a playlist's live channels in one
 // transaction. Each channel's ID is "xtream:<playlistID>:<streamID>", stable
 // across refreshes so re-importing updates name/logo/servers in place instead of
