@@ -4,6 +4,7 @@ import { renderChannelList, beat } from './channels.js';
 import { updateHealthStatus, observeHealth, stopHealthPolling } from './health.js';
 import { updateRecordButton, restoreAudioPrefs } from './audio.js';
 import { renderPicker } from './picker.js';
+import { initPlaylistFilter, initSidebarTabs } from './playlists.js';
 
 export function loadKeys() {
   fetch('/api/keys')
@@ -63,6 +64,8 @@ export function init() {
   updateHealthStatus();
   loadKeys();
   loadChannels();
+  initPlaylistFilter();
+  initSidebarTabs();
   pollSource();
   beat();
   setInterval(beat, 30000);
