@@ -7,7 +7,6 @@ export const state = {
   selectedPlaylist: '',
   activeTab: 'channels',
   countryOptionsKey: '',
-  topChannelIds: [],
   clearKeys: {},
   audioCell: -1,
   recordingAvailable: false,
@@ -33,7 +32,6 @@ export const state = {
   expandedCats: {},
   favOpen: true,
   pendingImportNew: [],
-  sessionId: null,
   searchDebounce: null,
   pickerDebounce: null,
 };
@@ -93,10 +91,3 @@ export const els = {
 
 try { state.deadMarks = JSON.parse(localStorage.getItem('livetv_dead')) || {}; } catch(e) {}
 state.healthOn = localStorage.getItem('livetv_health_on') !== '0';
-
-// Session ID
-state.sessionId = sessionStorage.getItem('livetv_sid');
-if (!state.sessionId) {
-  state.sessionId = Math.random().toString(36).slice(2) + Date.now().toString(36);
-  sessionStorage.setItem('livetv_sid', state.sessionId);
-}
