@@ -457,6 +457,22 @@ input { font-family: inherit; }
   &:hover { color: #fff; }
 }
 
+/* Country facet dropdown, below the search box in the browse drawer. */
+.country-wrap { margin-top: 8px; }
+.country-select {
+  width: 100%;
+  background: var(--input-bg);
+  border: 1px solid var(--border); border-radius: 9px;
+  padding: 9px 12px; font-size: 13px; color: #fff; outline: none;
+  cursor: pointer; appearance: none;
+
+  &:focus { border-color: var(--blue-light); }
+}
+
+/* Footer variant that carries only the health-probe status line. */
+.drawer-foot-status { padding-top: 0; border-top: none; }
+.drawer-foot-status:empty, .drawer-foot-status:has(.health-status[hidden]) { display: none; }
+
 /* ── Channel list ───────────────────────────────────────────── */
 .channel-list { flex: 1; overflow-y: auto; min-height: 0; padding-bottom: 12px; }
 .channel-item {
@@ -576,6 +592,23 @@ input { font-family: inherit; }
 /* ── Add-channel modal ──────────────────────────────────────── */
 .add-panel { width: 400px; }
 .add-form { display: flex; flex-direction: column; gap: 14px; padding: 18px 16px; }
+
+/* Tab bar at the top of the add modal (Manual / Xtream Codes). */
+.add-tabs { display: flex; gap: 4px; padding: 10px 16px 0; border-bottom: 1px solid var(--border-dim); }
+.add-tab {
+  padding: 8px 14px; font-size: 13px; font-weight: 600; color: var(--muted);
+  background: none; border: none; border-bottom: 2px solid transparent; cursor: pointer;
+  transition: color .15s, border-color .15s;
+
+  &:hover { color: #fff; }
+  &.active { color: #fff; border-bottom-color: #4b6bdc; }
+}
+.add-tab-panel[hidden] { display: none; }
+
+/* Xtream sub-form: a small header separating saved playlists from the add form,
+   and a compact Refresh button that sits inline with the saved-playlist select. */
+.xtream-subhead { font-size: 12px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+.xtream-refresh { flex-shrink: 0; padding: 0 14px; }
 .add-field { display: flex; flex-direction: column; gap: 6px; font-size: 12px; font-weight: 600; color: var(--muted); }
 .add-field input {
   width: 100%; padding: 9px 11px;

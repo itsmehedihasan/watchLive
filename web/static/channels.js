@@ -31,7 +31,7 @@ export function setFav(ch, on) {
 }
 
 export function onFavChanged() {
-  renderCategorySidebar();
+  renderChannelList();
   const favById = {};
   state.channels.forEach(function (ch) { if (ch.is_favourite) favById[ch.id] = true; });
   Array.prototype.slice.call(document.querySelectorAll('.pin-btn')).forEach(function (pin) {
@@ -105,88 +105,72 @@ export function refreshHighlights() {
   });
 }
 
-function filteredChannels() {
+// workingSet applies the browse filter pipeline in order: country facet →
+// health → text search. Category grouping happens in the renderer. The country
+// facet matches ch.group (which holds the country code) against state.country.
+function workingSet() {
   let base = state.channels;
+  if (state.country) {
+    const c = state.country.toLowerCase();
+    base = base.filter(function (ch) { return (ch.group || '').toLowerCase() === c; });
+  }
+  if (state.healthOn) base = base.filter(passesHealth);
   if (state.search) {
     const q = state.search.toLowerCase();
-    base = state.channels.filter(function (ch) {
+    base = base.filter(function (ch) {
       return ch.name.toLowerCase().indexOf(q) !== -1 || ch.group.toLowerCase().indexOf(q) !== -1;
     });
   }
-  if (state.healthOn) base = base.filter(passesHealth);
   return base;
 }
 
-export function renderChannelList() {
-  const matches = filteredChannels();
-  const keepScroll = els.channelList.scrollTop;
-  Array.prototype.slice.call(els.channelList.querySelectorAll('.channel-item, .group-section')).forEach(function (n) { n.remove(); });
-
-  const awaitingFirstList = state.sourceRefreshing && state.channels.length === 0;
-  els.listLoading.hidden = !(state.channelsLoading || awaitingFirstList);
-  els.emptyState.hidden = state.channelsLoading || awaitingFirstList || matches.length !== 0;
-
-  const frag = document.createDocumentFragment();
-
-  if (state.search) {
-    matches.slice(0, RENDER_CAP).forEach(function (ch) { frag.appendChild(makeChannelButton(ch, browseSelect)); });
-    els.channelList.appendChild(frag);
-    els.channelList.scrollTop = (state.search === state.lastRenderedSearch) ? keepScroll : 0;
-    state.lastRenderedSearch = state.search;
-    els.channelCount.textContent = state.channelsLoading ? ''
-      : matches.length > RENDER_CAP
-        ? 'Showing first ' + RENDER_CAP + ' of ' + matches.length + ' matches — search to narrow'
-        : matches.length + ' match' + (matches.length === 1 ? '' : 'es');
-    return;
-  }
-
-  const byGroup = {};
-  const groupNames = [];
-  matches.forEach(function (ch) {
-    const g = ch.group || 'Other';
-    if (!byGroup[g]) { byGroup[g] = []; groupNames.push(g); }
-    byGroup[g].push(ch);
+// populateCountryFilter (re)builds the dropdown from the country codes present in
+// the catalog, keeping the current selection. It rebuilds only when the set of
+// countries actually changed, so it doesn't stomp the user's open dropdown.
+export function populateCountryFilter() {
+  const sel = els.countryFilter;
+  if (!sel) return;
+  const seen = {};
+  state.channels.forEach(function (ch) { const g = ch.group; if (g) seen[g] = true; });
+  const codes = Object.keys(seen).sort(function (a, b) {
+    a = countryLabel(a).toLowerCase(); b = countryLabel(b).toLowerCase();
+    return a < b ? -1 : a > b ? 1 : 0;
   });
-  groupNames.sort(function (a, b) { a = a.toLowerCase(); b = b.toLowerCase(); return a < b ? -1 : a > b ? 1 : 0; });
-
-  groupNames.forEach(function (g) {
-    const section = document.createElement('div');
-    section.className = 'group-section';
-    const head = document.createElement('button');
-    head.className = 'group-header' + (state.expandedGroups[g] ? ' open' : '');
-    const caret = document.createElement('span'); caret.className = 'group-caret'; caret.textContent = '▸';
-    const title = document.createElement('span'); title.className = 'group-title'; title.textContent = countryLabel(g);
-    const count = document.createElement('span'); count.className = 'group-count'; count.textContent = String(byGroup[g].length);
-    head.appendChild(caret); head.appendChild(title); head.appendChild(count);
-    head.addEventListener('click', function () { state.expandedGroups[g] = !state.expandedGroups[g]; renderChannelList(); });
-    section.appendChild(head);
-    if (state.expandedGroups[g]) byGroup[g].forEach(function (ch) { section.appendChild(makeChannelButton(ch, browseSelect)); });
-    frag.appendChild(section);
+  const key = codes.join(',');
+  if (key === state.countryOptionsKey) return;
+  state.countryOptionsKey = key;
+  const current = state.country;
+  sel.innerHTML = '';
+  const all = document.createElement('option');
+  all.value = ''; all.textContent = 'All countries';
+  sel.appendChild(all);
+  codes.forEach(function (code) {
+    const opt = document.createElement('option');
+    opt.value = code; opt.textContent = countryLabel(code);
+    sel.appendChild(opt);
   });
-
-  els.channelList.appendChild(frag);
-  els.channelList.scrollTop = keepScroll;
-  state.lastRenderedSearch = '';
-  const shown = state.healthOn ? matches.length : state.channels.length;
-  els.channelCount.textContent = state.channelsLoading ? ''
-    : shown + (state.healthOn ? ' working' : ' channels') + ' · ' + groupNames.length + ' countries';
+  // Restore selection if it still exists; otherwise fall back to "All".
+  if (current && seen[current]) sel.value = current;
+  else { state.country = ''; sel.value = ''; }
 }
 
-function buildFavSection() {
-  const favList = state.channels.filter(isFav);
+function buildFavSection(searching) {
+  let favList = state.channels.filter(isFav);
+  if (state.healthOn) favList = favList.filter(passesHealth);
+  const open = state.favOpen || searching;
   const section = document.createElement('div');
   section.className = 'group-section fav-section';
 
   const head = document.createElement('button');
-  head.className = 'group-header' + (state.favOpen ? ' open' : '');
+  head.className = 'group-header' + (open ? ' open' : '');
   const caret = document.createElement('span'); caret.className = 'group-caret'; caret.textContent = '▸';
   const title = document.createElement('span'); title.className = 'group-title'; title.textContent = '★ Favourites';
   const count = document.createElement('span'); count.className = 'group-count'; count.textContent = String(favList.length);
   head.appendChild(caret); head.appendChild(title); head.appendChild(count);
-  head.addEventListener('click', function () { state.favOpen = !state.favOpen; renderCategorySidebar(); });
+  head.addEventListener('click', function () { state.favOpen = !state.favOpen; renderChannelList(); });
   section.appendChild(head);
 
-  if (state.favOpen) {
+  if (open) {
     if (favList.length === 0) {
       const hint = document.createElement('div');
       hint.className = 'group-more';
@@ -199,49 +183,73 @@ function buildFavSection() {
   return section;
 }
 
-export function renderCategorySidebar() {
-  const keepScroll = els.categoryList.scrollTop;
-  Array.prototype.slice.call(els.categoryList.querySelectorAll('.channel-item, .group-section')).forEach(function (n) { n.remove(); });
+// renderChannelList is the single browse renderer: it applies the country +
+// health + search pipeline, then lays the results out as category-grouped
+// sections with a Favourites section on top. While a search is active the
+// category sections auto-expand so matches are visible without a click.
+export function renderChannelList() {
+  populateCountryFilter();
+  const matches = workingSet();
+  const searching = !!state.search;
+  const keepScroll = els.channelList.scrollTop;
+  Array.prototype.slice.call(els.channelList.querySelectorAll('.channel-item, .group-section')).forEach(function (n) { n.remove(); });
+
   const awaitingFirstList = state.sourceRefreshing && state.channels.length === 0;
-  els.catLoading.hidden = !(state.channelsLoading || awaitingFirstList);
-  if (state.channelsLoading || awaitingFirstList) return;
+  els.listLoading.hidden = !(state.channelsLoading || awaitingFirstList);
+  els.emptyState.hidden = state.channelsLoading || awaitingFirstList || matches.length !== 0;
+  if (state.channelsLoading || awaitingFirstList) { els.channelCount.textContent = ''; return; }
 
   const byCat = {};
-  state.channels.forEach(function (ch) {
-    if (!passesHealth(ch)) return;
+  matches.forEach(function (ch) {
     const t = ch.type || 'Entertainment';
     (byCat[t] || (byCat[t] = [])).push(ch);
   });
 
   const frag = document.createDocumentFragment();
-  frag.appendChild(buildFavSection());
-  CATEGORY_ORDER.forEach(function (cat) {
+  frag.appendChild(buildFavSection(searching));
+
+  // Known categories first (in CATEGORY_ORDER), then any stragglers alphabetically.
+  const known = {};
+  CATEGORY_ORDER.forEach(function (c) { known[c] = true; });
+  const extra = Object.keys(byCat).filter(function (c) { return !known[c]; })
+    .sort(function (a, b) { a = a.toLowerCase(); b = b.toLowerCase(); return a < b ? -1 : a > b ? 1 : 0; });
+  const cats = CATEGORY_ORDER.concat(extra);
+
+  cats.forEach(function (cat) {
     const list = byCat[cat];
     if (!list || list.length === 0) return;
+    const open = searching || state.expandedCats[cat];
     const section = document.createElement('div');
     section.className = 'group-section';
     const head = document.createElement('button');
-    head.className = 'group-header' + (state.expandedCats[cat] ? ' open' : '');
+    head.className = 'group-header' + (open ? ' open' : '');
     const caret = document.createElement('span'); caret.className = 'group-caret'; caret.textContent = '▸';
     const title = document.createElement('span'); title.className = 'group-title'; title.textContent = cat;
     const count = document.createElement('span'); count.className = 'group-count'; count.textContent = String(list.length);
     head.appendChild(caret); head.appendChild(title); head.appendChild(count);
-    head.addEventListener('click', function () { state.expandedCats[cat] = !state.expandedCats[cat]; renderCategorySidebar(); });
+    head.addEventListener('click', function () { state.expandedCats[cat] = !state.expandedCats[cat]; renderChannelList(); });
     section.appendChild(head);
-    if (state.expandedCats[cat]) {
+    if (open) {
       list.slice(0, RENDER_CAP).forEach(function (ch) { section.appendChild(makeChannelButton(ch, browseSelect)); });
       if (list.length > RENDER_CAP) {
         const more = document.createElement('div');
         more.className = 'group-more';
-        more.textContent = 'Showing first ' + RENDER_CAP + ' of ' + list.length + ' — search on the right to narrow';
+        more.textContent = 'Showing first ' + RENDER_CAP + ' of ' + list.length + ' — search to narrow';
         section.appendChild(more);
       }
     }
     frag.appendChild(section);
   });
 
-  els.categoryList.appendChild(frag);
-  els.categoryList.scrollTop = keepScroll;
+  els.channelList.appendChild(frag);
+  // Reset scroll when the search term changes so matches aren't scrolled past.
+  els.channelList.scrollTop = (state.search === state.lastRenderedSearch) ? keepScroll : 0;
+  state.lastRenderedSearch = state.search;
+
+  const shown = matches.length;
+  els.channelCount.textContent = searching
+    ? shown + ' match' + (shown === 1 ? '' : 'es')
+    : shown + (state.healthOn ? ' working' : ' channels');
 }
 
 function browseSelect(ch) {
@@ -289,6 +297,13 @@ els.search.addEventListener('input', function () {
 });
 els.searchClear.addEventListener('click', function () { setSearch(''); });
 els.emptyClear.addEventListener('click', function () { setSearch(''); });
+
+if (els.countryFilter) {
+  els.countryFilter.addEventListener('change', function () {
+    state.country = els.countryFilter.value;
+    renderChannelList();
+  });
+}
 
 // forward ref
 function assignChannel(cellIdx, ch) {

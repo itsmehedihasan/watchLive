@@ -11,6 +11,7 @@
 package store
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -66,6 +67,15 @@ CREATE INDEX IF NOT EXISTS idx_channels_sort    ON channels(sort_name);
 CREATE INDEX IF NOT EXISTS idx_channels_checked ON channels(last_checked_at);
 
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+
+CREATE TABLE IF NOT EXISTS xtream_playlists (
+    id         TEXT PRIMARY KEY,
+    name       TEXT NOT NULL,
+    server     TEXT NOT NULL,
+    username   TEXT NOT NULL,
+    password   TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
 `
 
 // Channel is a catalog row as served to the UI. It mirrors playlist.Channel and
@@ -130,7 +140,7 @@ func Open(path string) (*Store, error) {
 	}
 	// Columns added after the initial schema. SQLite has no "ADD COLUMN IF NOT
 	// EXISTS", so a duplicate-column error on an already-migrated DB is benign.
-	for _, col := range []string{"clear_keys", "http_user_agent", "http_referer", "resolver", "resolver_arg"} {
+	for _, col := range []string{"clear_keys", "http_user_agent", "http_referer", "resolver", "resolver_arg", "xtream_playlist_id"} {
 		if _, err := db.Exec(`ALTER TABLE channels ADD COLUMN ` + col + ` TEXT NOT NULL DEFAULT ''`); err != nil &&
 			!strings.Contains(err.Error(), "duplicate column") {
 			db.Close()
@@ -976,6 +986,29 @@ func (s *Store) PruneOrphans(seen map[string]bool) (int, error) {
 	return len(orphans), nil
 }
 
+// CountUnkept returns how many channels PruneUnkept would delete (not
+// favourited, not manual), for a dry-run preview.
+func (s *Store) CountUnkept() (int, error) {
+	var n int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM channels WHERE is_favourite=0 AND is_manual=0`).Scan(&n)
+	return n, err
+}
+
+// PruneUnkept deletes every channel the user has no stake in — not favourited
+// and not manual (is_favourite=0 AND is_manual=0) — regardless of any feed. It
+// is the unconditional form of PruneOrphans (which restricts to channels absent
+// from the latest feed), intended for a one-off catalog cleanup. Favourites,
+// manual channels, imported .m3u entries and Xtream-imported channels (all
+// is_manual=1) are kept. Returns the number of rows deleted.
+func (s *Store) PruneUnkept() (int, error) {
+	res, err := s.db.Exec(`DELETE FROM channels WHERE is_favourite=0 AND is_manual=0`)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
+}
+
 // HealthVerdicts returns the persisted reachable/unreachable verdict for every
 // channel that has been probed (is_working not null). It seeds the in-memory
 // prober at startup so a fresh process reports health without re-probing.
@@ -1015,6 +1048,194 @@ func (s *Store) SetMeta(key, value string) error {
 		INSERT INTO meta (key, value) VALUES (?, ?)
 		ON CONFLICT(key) DO UPDATE SET value=excluded.value`, key, value)
 	return err
+}
+
+// XtreamPlaylist is a saved Xtream Codes panel the user imports live channels
+// from. Password is stored plaintext, consistent with the app's local-only
+// single-user model (channel URLs and ClearKeys are plaintext too), and is
+// omitted from any response served to the UI.
+type XtreamPlaylist struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Server    string `json:"server"`
+	Username  string `json:"username"`
+	Password  string `json:"-"`
+	CreatedAt int64  `json:"created_at"`
+	// Imported reports whether any channel row already references this playlist;
+	// populated by ListXtreamPlaylists, false elsewhere.
+	Imported bool `json:"imported"`
+}
+
+// XtreamStream is one live channel to import, as distilled from the panel's
+// get_live_streams response by the caller (package xtream). StreamID +
+// PlaylistID form the stable catalog ID, so a refresh upserts instead of
+// duplicating.
+type XtreamStream struct {
+	StreamID int
+	Name     string
+	Logo     string
+	// URL is the fully-built playable stream URL (server/live/user/pass/id.ext).
+	URL string
+}
+
+// SaveXtreamPlaylist inserts a new saved playlist with a freshly-minted opaque
+// ID and returns it. Server is stored as-given (the caller normalizes it).
+func (s *Store) SaveXtreamPlaylist(name, server, username, password string) (XtreamPlaylist, error) {
+	p := XtreamPlaylist{
+		ID:        "xt_" + randHex(8),
+		Name:      strings.TrimSpace(name),
+		Server:    strings.TrimSpace(server),
+		Username:  strings.TrimSpace(username),
+		Password:  password,
+		CreatedAt: now().Unix(),
+	}
+	_, err := s.db.Exec(`
+		INSERT INTO xtream_playlists (id, name, server, username, password, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)`,
+		p.ID, p.Name, p.Server, p.Username, p.Password, p.CreatedAt)
+	if err != nil {
+		return XtreamPlaylist{}, err
+	}
+	return p, nil
+}
+
+// ListXtreamPlaylists returns saved playlists (newest first) with Imported set
+// per playlist by a single scan of channel.xtream_playlist_id. Passwords are
+// loaded (callers need them to refresh) but are omitted from JSON via the tag.
+func (s *Store) ListXtreamPlaylists() ([]XtreamPlaylist, error) {
+	imported, err := s.importedPlaylistIDs()
+	if err != nil {
+		return nil, err
+	}
+	rows, err := s.db.Query(`
+		SELECT id, name, server, username, password, created_at
+		FROM xtream_playlists ORDER BY created_at DESC, name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []XtreamPlaylist
+	for rows.Next() {
+		var p XtreamPlaylist
+		if err := rows.Scan(&p.ID, &p.Name, &p.Server, &p.Username, &p.Password, &p.CreatedAt); err != nil {
+			return nil, err
+		}
+		p.Imported = imported[p.ID]
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// importedPlaylistIDs is the set of playlist ids that have at least one channel
+// row, used to compute XtreamPlaylist.Imported without an N+1 query.
+func (s *Store) importedPlaylistIDs() (map[string]bool, error) {
+	rows, err := s.db.Query(`SELECT DISTINCT xtream_playlist_id FROM channels WHERE xtream_playlist_id <> ''`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	set := make(map[string]bool)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		set[id] = true
+	}
+	return set, rows.Err()
+}
+
+// GetXtreamPlaylist returns a saved playlist by id (with its password, for
+// refresh), or ErrNotFound if absent.
+func (s *Store) GetXtreamPlaylist(id string) (XtreamPlaylist, error) {
+	var p XtreamPlaylist
+	err := s.db.QueryRow(`
+		SELECT id, name, server, username, password, created_at
+		FROM xtream_playlists WHERE id=?`, id).
+		Scan(&p.ID, &p.Name, &p.Server, &p.Username, &p.Password, &p.CreatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return XtreamPlaylist{}, ErrNotFound
+	}
+	return p, err
+}
+
+// UpsertXtreamChannels imports (or refreshes) a playlist's live channels in one
+// transaction. Each channel's ID is "xtream:<playlistID>:<streamID>", stable
+// across refreshes so re-importing updates name/logo/servers in place instead of
+// duplicating. Imported rows are is_manual=1 (survive pruning/re-sync, like an
+// .m3u import) and is_favourite=0 (bulk imports must not flood Favourites).
+//
+// Returns how many rows were newly inserted vs updated. A row with an empty name
+// or a non-http(s) URL is skipped.
+func (s *Store) UpsertXtreamChannels(playlistID string, streams []XtreamStream) (added, updated int, err error) {
+	existing, err := s.idSet()
+	if err != nil {
+		return 0, 0, err
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, 0, err
+	}
+	defer func() {
+		if err != nil {
+			tx.Rollback()
+		}
+	}()
+	// is_favourite / is_working / last_checked_at are absent from the SET list so
+	// a refresh preserves the user's favourite and the prober's verdict.
+	stmt, err := tx.Prepare(`
+		INSERT INTO channels
+			(id, name, logo, grp, typ, servers, is_working, last_checked_at, is_favourite, is_manual, sort_name, xtream_playlist_id)
+		VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, 0, 1, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			name=excluded.name, logo=excluded.logo, grp=excluded.grp, typ=excluded.typ,
+			servers=excluded.servers, sort_name=excluded.sort_name,
+			xtream_playlist_id=excluded.xtream_playlist_id`)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer stmt.Close()
+
+	seen := make(map[string]bool, len(streams))
+	for _, st := range streams {
+		name, u := strings.TrimSpace(st.Name), strings.TrimSpace(st.URL)
+		if name == "" || !(strings.HasPrefix(u, "http://") || strings.HasPrefix(u, "https://")) {
+			continue
+		}
+		id := fmt.Sprintf("xtream:%s:%d", playlistID, st.StreamID)
+		if seen[id] {
+			continue // duplicate stream_id within this batch
+		}
+		seen[id] = true
+		serversJS, _ := json.Marshal([]playlist.Server{{URL: u}})
+		// Xtream panels group by opaque numeric category_id, which is meaningless
+		// as a country and would pollute the country dropdown. Land these in the
+		// neutral "Custom" country group (same as manual channels) and the neutral
+		// category, matching manual-channel semantics.
+		if _, err = stmt.Exec(id, name, st.Logo, manualGroup, manualType, string(serversJS), strings.ToLower(name), playlistID); err != nil {
+			return 0, 0, err
+		}
+		if existing[id] {
+			updated++
+		} else {
+			added++
+		}
+	}
+	if err = tx.Commit(); err != nil {
+		return 0, 0, err
+	}
+	return added, updated, nil
+}
+
+// randHex returns n random bytes as a lowercase hex string, for opaque IDs.
+func randHex(n int) string {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		// crypto/rand failing is catastrophic and near-impossible; fall back to a
+		// time-derived value so we never mint an empty (colliding) ID.
+		return hex.EncodeToString([]byte(fmt.Sprintf("%d", now().UnixNano())))
+	}
+	return hex.EncodeToString(b)
 }
 
 // marshalKeys serializes a ClearKey map to JSON for the clear_keys column,

@@ -1,5 +1,5 @@
 import { state, els } from './state.js';
-import { renderCategorySidebar, renderChannelList } from './channels.js';
+import { renderChannelList } from './channels.js';
 import { renderPicker } from './picker.js';
 
 export function countAlive() {
@@ -9,7 +9,6 @@ export function countAlive() {
 }
 
 export function renderHealthLists() {
-  renderCategorySidebar();
   renderChannelList();
   if (!els.picker.hidden) renderPicker();
 }

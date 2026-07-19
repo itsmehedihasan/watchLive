@@ -47,6 +47,7 @@ import (
 	"watchlive/internal/resolver"
 	"watchlive/internal/store"
 	"watchlive/internal/viewers"
+	"watchlive/internal/xtream"
 )
 
 //go:embed web/templates/index.html
@@ -559,6 +560,23 @@ func upstreamHeadersFromCatalog(chs []store.Channel) map[string]proxy.UpstreamHe
 	return m
 }
 
+// importXtreamStreams turns a panel's live-stream list into catalog rows for the
+// given saved playlist: it builds each stream's playable URL from the playlist
+// credentials, then upserts by the stable xtream:<playlist>:<stream> id (so a
+// re-import updates in place). Returns added/updated counts.
+func importXtreamStreams(st *store.Store, p store.XtreamPlaylist, streams []xtream.Stream) (added, updated int, err error) {
+	rows := make([]store.XtreamStream, 0, len(streams))
+	for _, s := range streams {
+		rows = append(rows, store.XtreamStream{
+			StreamID: s.StreamID,
+			Name:     s.Name,
+			Logo:     s.Icon,
+			URL:      xtream.StreamURL(p.Server, p.Username, p.Password, s.StreamID, s.Extension),
+		})
+	}
+	return st.UpsertXtreamChannels(p.ID, rows)
+}
+
 // seedClearKeys are ClearKey pairs (KID→KEY, lowercase hex) we've already
 // captured and want available regardless of catalog wipes. They're merged into
 // keys.json on startup; the merge is idempotent, so editing keys.json by hand
@@ -964,6 +982,90 @@ func newMux(proxyHandler *proxy.Handler, viewerStore *viewers.Store, staticSub f
 		channels.rebuild()
 		log.Printf("channels: imported %d manual channel(s)", added)
 		writeJSON(w, r, map[string]int{"added": added})
+	})
+
+	// ── Xtream Codes playlists ──────────────────────────────────────────────
+	// Save a panel's credentials and immediately import its live channels. The
+	// fetch is synchronous (the UI shows a spinner): the request returns the saved
+	// playlist plus how many channels were imported.
+	mux.HandleFunc("POST /api/xtream/playlists", func(w http.ResponseWriter, r *http.Request) {
+		var body struct{ Name, Server, Username, Password string }
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		name := strings.TrimSpace(body.Name)
+		server := xtream.NormalizeServer(body.Server)
+		username := strings.TrimSpace(body.Username)
+		password := body.Password
+		if name == "" || username == "" || password == "" || !isStreamURL(server) {
+			http.Error(w, "name, server (http/https), username and password are required", http.StatusBadRequest)
+			return
+		}
+		// Verify credentials before persisting anything, so a typo doesn't leave a
+		// dead playlist behind.
+		streams, err := xtream.LiveStreams(server, username, password)
+		if err != nil {
+			log.Printf("xtream: import %q: %v", name, err)
+			http.Error(w, "could not reach the panel or the credentials were rejected", http.StatusBadGateway)
+			return
+		}
+		p, err := st.SaveXtreamPlaylist(name, server, username, password)
+		if err != nil {
+			serverError(w, "api", err)
+			return
+		}
+		added, _, err := importXtreamStreams(st, p, streams)
+		if err != nil {
+			serverError(w, "api", err)
+			return
+		}
+		channels.rebuild()
+		log.Printf("xtream: saved playlist %q (%s), imported %d channel(s)", name, p.ID, added)
+		writeJSON(w, r, map[string]any{"playlist": p, "imported": added})
+	})
+
+	// List saved playlists (password omitted from the response), each carrying an
+	// imported flag so the UI knows whether selecting it needs a fetch.
+	mux.HandleFunc("GET /api/xtream/playlists", func(w http.ResponseWriter, r *http.Request) {
+		list, err := st.ListXtreamPlaylists()
+		if err != nil {
+			serverError(w, "api", err)
+			return
+		}
+		if list == nil {
+			list = []store.XtreamPlaylist{}
+		}
+		writeJSON(w, r, list)
+	})
+
+	// Re-fetch an existing playlist's live channels and upsert them by the stable
+	// xtream:<playlist>:<stream> id (updates existing rows, adds new ones).
+	mux.HandleFunc("POST /api/xtream/playlists/{id}/refresh", func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("id")
+		p, err := st.GetXtreamPlaylist(id)
+		if errors.Is(err, store.ErrNotFound) {
+			http.Error(w, "playlist not found", http.StatusNotFound)
+			return
+		}
+		if err != nil {
+			serverError(w, "api", err)
+			return
+		}
+		streams, err := xtream.LiveStreams(p.Server, p.Username, p.Password)
+		if err != nil {
+			log.Printf("xtream: refresh %q: %v", p.Name, err)
+			http.Error(w, "could not reach the panel or the credentials were rejected", http.StatusBadGateway)
+			return
+		}
+		added, updated, err := importXtreamStreams(st, p, streams)
+		if err != nil {
+			serverError(w, "api", err)
+			return
+		}
+		channels.rebuild()
+		log.Printf("xtream: refreshed %q (%s): +%d new, %d updated", p.Name, p.ID, added, updated)
+		writeJSON(w, r, map[string]int{"added": added, "updated": updated})
 	})
 
 	mux.HandleFunc("GET /api/keys", func(w http.ResponseWriter, r *http.Request) {

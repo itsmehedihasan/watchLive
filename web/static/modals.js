@@ -1,29 +1,27 @@
 import { state, els } from './state.js';
 import { loadKeys, loadChannels } from './init.js';
+import { initXtreamTab, resetXtreamTab } from './xtream.js';
 
 function maybeHideScrim() {
-  const anyOpen = els.categorySidebar.classList.contains('open') ||
-                els.sidebar.classList.contains('open') || !els.picker.hidden ||
+  const anyOpen = els.sidebar.classList.contains('open') || !els.picker.hidden ||
                 !els.addChannel.hidden ||
                 !els.importModal.hidden || !els.importConflict.hidden;
   els.scrim.hidden = !anyOpen;
 }
 
 function closeDrawers() {
-  els.categorySidebar.classList.remove('open');
   els.sidebar.classList.remove('open');
   // Cancel a queued search render so it can't fire against the closed drawer.
   if (state.searchDebounce) { clearTimeout(state.searchDebounce); state.searchDebounce = null; }
   maybeHideScrim();
 }
 
-function openDrawer(which) {
-  const drawer = which === 'left' ? els.categorySidebar : els.sidebar;
-  const other = which === 'left' ? els.sidebar : els.categorySidebar;
-  other.classList.remove('open');
-  drawer.hidden = false;
+// openDrawer opens the single browse sidebar. The `which` argument is retained
+// for call-site compatibility but the left drawer no longer exists.
+function openDrawer() {
+  els.sidebar.hidden = false;
   els.scrim.hidden = false;
-  requestAnimationFrame(function () { drawer.classList.add('open'); });
+  requestAnimationFrame(function () { els.sidebar.classList.add('open'); });
 }
 
 export { openDrawer, closeDrawers, maybeHideScrim };
@@ -36,6 +34,20 @@ function setLicenseOpen(on) {
   els.addChannelLicWrap2.classList.toggle('show', on);
 }
 
+// setAddTab switches between the Manual and Xtream Codes tabs of the add modal.
+function setAddTab(tab) {
+  const xtream = tab === 'xtream';
+  els.addTabManual.classList.toggle('active', !xtream);
+  els.addTabXtream.classList.toggle('active', xtream);
+  els.addChannelForm.hidden = xtream;
+  els.xtreamPanel.hidden = !xtream;
+  els.addChannelTitle.textContent = xtream ? 'Add from Xtream Codes' : 'Add a channel';
+  if (xtream) initXtreamTab();
+}
+
+els.addTabManual.addEventListener('click', function () { setAddTab('manual'); });
+els.addTabXtream.addEventListener('click', function () { setAddTab('xtream'); });
+
 export function openChannelModal(mode, ch) {
   closeDrawers();
   state.channelModalMode = mode;
@@ -44,6 +56,10 @@ export function openChannelModal(mode, ch) {
   els.addChannelForm.reset();
   setLicenseOpen(false);
   const editing = mode === 'edit' && ch;
+  // Tabs only make sense for adding; editing an existing channel is Manual-only.
+  els.addTabs.hidden = !!editing;
+  setAddTab('manual');
+  resetXtreamTab();
   els.addChannelTitle.textContent = editing ? 'Update stream link' : 'Add a channel';
   els.addChannelSave.textContent = editing ? 'Update' : 'Save';
   els.addChannelSave.disabled = false;
@@ -189,6 +205,7 @@ export function closeImportConflict() {
 els.addChannelBtn.addEventListener('click', openAddChannel);
 els.addChannelClose.addEventListener('click', closeAddChannel);
 els.addChannelCancel.addEventListener('click', closeAddChannel);
+els.xtreamCancel.addEventListener('click', closeAddChannel);
 els.addChannelLicToggle.addEventListener('click', function () {
   setLicenseOpen(!els.addChannelLicWrap.classList.contains('show'));
 });
@@ -296,8 +313,7 @@ els.importConflictAdd.addEventListener('click', function () {
   commitImport(state.pendingImportNew, restore);
 });
 
-els.leftDrawerToggle.addEventListener('click', function () { openDrawer('left'); });
-els.rightDrawerToggle.addEventListener('click', function () { openDrawer('right'); });
+els.rightDrawerToggle.addEventListener('click', function () { openDrawer(); });
 els.scrim.addEventListener('click', function () { closeDrawers(); closePicker(); closeAddChannel(); closeImport(); closeImportConflict(); });
 Array.prototype.slice.call(document.querySelectorAll('[data-close-drawer]')).forEach(function (b) {
   b.addEventListener('click', closeDrawers);
@@ -306,7 +322,7 @@ Array.prototype.slice.call(document.querySelectorAll('[data-close-drawer]')).for
 window.addEventListener('keydown', function (e) {
   const inInput = document.activeElement && document.activeElement.tagName === 'INPUT';
   if (e.key === 'Escape') { closeDrawers(); closePicker(); closeAddChannel(); closeImport(); closeImportConflict(); }
-  if (e.key === '/' && !inInput) { e.preventDefault(); openDrawer('right'); setTimeout(function () { els.search.focus(); }, 0); }
+  if (e.key === '/' && !inInput) { e.preventDefault(); openDrawer(); setTimeout(function () { els.search.focus(); }, 0); }
 });
 
 // forward refs

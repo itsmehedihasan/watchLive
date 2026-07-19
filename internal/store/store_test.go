@@ -1,6 +1,7 @@
 package store
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -573,5 +574,175 @@ func TestMeta(t *testing.T) {
 	s.SetMeta("k", "v2")
 	if v, _ := s.GetMeta("k"); v != "v2" {
 		t.Errorf("GetMeta = %q, want v2", v)
+	}
+}
+
+func TestPruneUnkept(t *testing.T) {
+	s := open(t)
+	s.UpsertCatalog([]playlist.Channel{
+		ch("feed-a", "Feed A", "http://a"),
+		ch("feed-b", "Feed B", "http://b"),
+		ch("feed-fav", "Feed Fav", "http://c"),
+	})
+	s.SetFavourite("feed-fav", true)
+	man, _ := s.AddManual("Man", "http://m", nil, "", "")
+
+	// Unconditional: both non-fav, non-manual feed rows go, even though they are
+	// still "in the feed" (PruneUnkept ignores any feed).
+	n, err := s.PruneUnkept()
+	if err != nil {
+		t.Fatalf("PruneUnkept: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("deleted = %d, want 2", n)
+	}
+
+	ids := map[string]bool{}
+	chans, _ := s.ListChannels()
+	for _, c := range chans {
+		ids[c.ID] = true
+	}
+	if ids["feed-a"] || ids["feed-b"] {
+		t.Error("plain feed channels should be deleted")
+	}
+	if !ids["feed-fav"] {
+		t.Error("favourited channel must be kept")
+	}
+	if !ids[man.ID] {
+		t.Error("manual channel must be kept")
+	}
+}
+
+func TestXtreamPlaylistCRUD(t *testing.T) {
+	s := open(t)
+
+	p, err := s.SaveXtreamPlaylist("My Panel", "http://p:8080", "user", "pass")
+	if err != nil {
+		t.Fatalf("SaveXtreamPlaylist: %v", err)
+	}
+	if p.ID == "" {
+		t.Fatal("saved playlist should have an id")
+	}
+	if p.Name != "My Panel" || p.Server != "http://p:8080" || p.Username != "user" || p.Password != "pass" {
+		t.Errorf("saved playlist = %+v", p)
+	}
+
+	got, err := s.GetXtreamPlaylist(p.ID)
+	if err != nil {
+		t.Fatalf("GetXtreamPlaylist: %v", err)
+	}
+	// Password must round-trip in-process (refresh needs it) even though it is
+	// omitted from JSON.
+	if got.Password != "pass" {
+		t.Errorf("password not persisted: %q", got.Password)
+	}
+
+	if _, err := s.GetXtreamPlaylist("nope"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("missing playlist err = %v, want ErrNotFound", err)
+	}
+
+	list, err := s.ListXtreamPlaylists()
+	if err != nil {
+		t.Fatalf("ListXtreamPlaylists: %v", err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("want 1 playlist, got %d", len(list))
+	}
+	// No channels reference it yet.
+	if list[0].Imported {
+		t.Error("playlist with no channels should report Imported=false")
+	}
+}
+
+func TestUpsertXtreamChannels(t *testing.T) {
+	s := open(t)
+	p, _ := s.SaveXtreamPlaylist("Panel", "http://p", "u", "pw")
+
+	streams := []XtreamStream{
+		{StreamID: 101, Name: "Alpha", Logo: "http://l/a.png", URL: "http://p/live/u/pw/101.ts"},
+		{StreamID: 202, Name: "Beta", URL: "http://p/live/u/pw/202.ts"},
+		{StreamID: 303, Name: "", URL: "http://p/live/u/pw/303.ts"},   // skipped: no name
+		{StreamID: 404, Name: "Bad", URL: "ftp://nope"},               // skipped: not http(s)
+		{StreamID: 101, Name: "Alpha Dup", URL: "http://p/live/x.ts"}, // dup stream_id in batch
+	}
+	added, updated, err := s.UpsertXtreamChannels(p.ID, streams)
+	if err != nil {
+		t.Fatalf("UpsertXtreamChannels: %v", err)
+	}
+	if added != 2 || updated != 0 {
+		t.Fatalf("first import added=%d updated=%d, want 2/0", added, updated)
+	}
+
+	chans, _ := s.ListChannels()
+	if len(chans) != 2 {
+		t.Fatalf("want 2 channels, got %d", len(chans))
+	}
+	var alpha Channel
+	for _, c := range chans {
+		if c.ID == "xtream:"+p.ID+":101" {
+			alpha = c
+		}
+		// Imported rows survive pruning (is_manual) but are not favourited.
+		if c.IsFavourite {
+			t.Errorf("xtream channels must not be auto-favourited: %+v", c)
+		}
+	}
+	if alpha.ID == "" {
+		t.Fatal("expected stable id xtream:<pid>:101")
+	}
+	if alpha.Name != "Alpha" || alpha.Logo != "http://l/a.png" {
+		t.Errorf("alpha = %+v", alpha)
+	}
+
+	// The playlist now reports Imported.
+	list, _ := s.ListXtreamPlaylists()
+	if !list[0].Imported {
+		t.Error("playlist with channels should report Imported=true")
+	}
+
+	// User favourites Alpha and the prober marks it working; a refresh with a
+	// changed name/URL must UPDATE in place, preserving that user state.
+	s.SetFavourite(alpha.ID, true)
+	s.SetHealth(map[string]bool{alpha.ID: true}, time.Unix(1000, 0))
+
+	added2, updated2, err := s.UpsertXtreamChannels(p.ID, []XtreamStream{
+		{StreamID: 101, Name: "Alpha HD", URL: "http://p/live/u/pw/101.m3u8"},
+		{StreamID: 999, Name: "Gamma", URL: "http://p/live/u/pw/999.ts"},
+	})
+	if err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	if added2 != 1 || updated2 != 1 {
+		t.Fatalf("refresh added=%d updated=%d, want 1/1", added2, updated2)
+	}
+
+	got, _ := s.Get(alpha.ID)
+	if got.Name != "Alpha HD" {
+		t.Errorf("refresh should update name, got %q", got.Name)
+	}
+	if !got.IsFavourite {
+		t.Error("refresh must preserve favourite")
+	}
+	if got.IsWorking == nil || !*got.IsWorking {
+		t.Error("refresh must preserve health verdict")
+	}
+	if len(got.Servers) != 1 || got.Servers[0].URL != "http://p/live/u/pw/101.m3u8" {
+		t.Errorf("refresh should update servers, got %+v", got.Servers)
+	}
+}
+
+// An xtream-imported channel is is_manual=1, so it survives PruneOrphans even
+// though its id never appears in the iptv-org feed.
+func TestXtreamChannelsSurvivePrune(t *testing.T) {
+	s := open(t)
+	p, _ := s.SaveXtreamPlaylist("Panel", "http://p", "u", "pw")
+	s.UpsertXtreamChannels(p.ID, []XtreamStream{{StreamID: 1, Name: "X", URL: "http://p/live/u/pw/1.ts"}})
+
+	_, _, seen, _ := s.UpsertCatalog([]playlist.Channel{ch("tvg:feed", "Feed", "http://feed/1")})
+	if _, err := s.PruneOrphans(seen); err != nil {
+		t.Fatalf("PruneOrphans: %v", err)
+	}
+	if _, err := s.Get("xtream:" + p.ID + ":1"); err != nil {
+		t.Errorf("xtream channel must survive prune, got %v", err)
 	}
 }

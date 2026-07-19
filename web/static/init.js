@@ -1,6 +1,6 @@
 import { state, els, MAX_CELLS } from './state.js';
 import { addCell, updatePickLabels } from './grid.js';
-import { renderCategorySidebar, renderChannelList, beat } from './channels.js';
+import { renderChannelList, beat } from './channels.js';
 import { updateHealthStatus, observeHealth, stopHealthPolling } from './health.js';
 import { updateRecordButton, restoreAudioPrefs } from './audio.js';
 import { renderPicker } from './picker.js';
@@ -29,7 +29,6 @@ export function loadChannels() {
       });
       state.healthDone = state.healthTotal = probed;
       stopHealthPolling();
-      renderCategorySidebar();
       renderChannelList();
       if (!els.picker.hidden) renderPicker();
       updateHealthStatus();
@@ -60,7 +59,6 @@ export function init() {
   els.healthToggle.classList.toggle('on', state.healthOn);
   els.healthToggle.setAttribute('aria-checked', state.healthOn ? 'true' : 'false');
 
-  renderCategorySidebar();
   renderChannelList();
   updateHealthStatus();
   loadKeys();

@@ -335,3 +335,95 @@ func TestSyncDisabled(t *testing.T) {
 		t.Errorf("POST /api/sync: got %d, want 403 (sync disabled)", rec.Code)
 	}
 }
+
+// xtreamPanel stubs a player_api.php serving a fixed login + live-stream list.
+func xtreamPanel(t *testing.T, streams string) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("action") == "get_live_streams" {
+			w.Write([]byte(streams))
+			return
+		}
+		w.Write([]byte(`{"user_info":{"username":"u","auth":1}}`))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestXtreamPlaylistHandlers(t *testing.T) {
+	mux, _, st := testMux(t)
+	panel := xtreamPanel(t, `[{"stream_id":10,"name":"Alpha","stream_icon":"http://l/a.png"},{"stream_id":20,"name":"Beta"}]`)
+
+	// Save + import.
+	body := `{"name":"Panel","server":"` + panel.URL + `","username":"u","password":"p"}`
+	rec := do(t, mux, http.MethodPost, "/api/xtream/playlists", body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("create: got %d, body %s", rec.Code, rec.Body.String())
+	}
+	var created struct {
+		Playlist store.XtreamPlaylist `json:"playlist"`
+		Imported int                  `json:"imported"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode create: %v", err)
+	}
+	if created.Imported != 2 {
+		t.Errorf("imported = %d, want 2", created.Imported)
+	}
+	if created.Playlist.ID == "" {
+		t.Fatal("created playlist missing id")
+	}
+
+	// The two channels landed in the catalog under stable xtream ids.
+	findChannel(t, st, "xtream:"+created.Playlist.ID+":10")
+	findChannel(t, st, "xtream:"+created.Playlist.ID+":20")
+
+	// List returns the playlist with imported=true and no password.
+	rec = do(t, mux, http.MethodGet, "/api/xtream/playlists", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list: got %d", rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), `"p"`) || strings.Contains(strings.ToLower(rec.Body.String()), "password") {
+		t.Errorf("password leaked in list response: %s", rec.Body.String())
+	}
+	var list []store.XtreamPlaylist
+	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil {
+		t.Fatalf("decode list: %v", err)
+	}
+	if len(list) != 1 || !list[0].Imported {
+		t.Fatalf("list = %+v, want 1 imported playlist", list)
+	}
+
+	// Refresh upserts (no new ids here) → 0 added, 2 updated.
+	rec = do(t, mux, http.MethodPost, "/api/xtream/playlists/"+created.Playlist.ID+"/refresh", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("refresh: got %d, body %s", rec.Code, rec.Body.String())
+	}
+	var refreshed struct{ Added, Updated int }
+	json.Unmarshal(rec.Body.Bytes(), &refreshed)
+	if refreshed.Updated != 2 || refreshed.Added != 0 {
+		t.Errorf("refresh added=%d updated=%d, want 0/2", refreshed.Added, refreshed.Updated)
+	}
+
+	// Refresh of an unknown playlist is 404.
+	if rec := do(t, mux, http.MethodPost, "/api/xtream/playlists/nope/refresh", ""); rec.Code != http.StatusNotFound {
+		t.Errorf("refresh unknown: got %d, want 404", rec.Code)
+	}
+}
+
+func TestXtreamCreateRejectsBadInput(t *testing.T) {
+	mux, _, _ := testMux(t)
+	// Missing scheme on server.
+	if rec := do(t, mux, http.MethodPost, "/api/xtream/playlists",
+		`{"name":"P","server":"panel.example","username":"u","password":"p"}`); rec.Code != http.StatusBadRequest {
+		t.Errorf("no-scheme server: got %d, want 400", rec.Code)
+	}
+	// Missing password.
+	if rec := do(t, mux, http.MethodPost, "/api/xtream/playlists",
+		`{"name":"P","server":"http://p","username":"u"}`); rec.Code != http.StatusBadRequest {
+		t.Errorf("no password: got %d, want 400", rec.Code)
+	}
+	if rec := do(t, mux, http.MethodPost, "/api/xtream/playlists", `{bad`); rec.Code != http.StatusBadRequest {
+		t.Errorf("bad json: got %d, want 400", rec.Code)
+	}
+}

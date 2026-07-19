@@ -56,8 +56,7 @@ export function renderPicker() {
 }
 
 function maybeHideScrim() {
-  const anyOpen = els.categorySidebar.classList.contains('open') ||
-                els.sidebar.classList.contains('open') || !els.picker.hidden ||
+  const anyOpen = els.sidebar.classList.contains('open') || !els.picker.hidden ||
                 !els.addChannel.hidden ||
                 !els.importModal.hidden || !els.importConflict.hidden;
   els.scrim.hidden = !anyOpen;
