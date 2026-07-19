@@ -159,46 +159,53 @@ func playerAPI(server, username, password string, extra url.Values) string {
 	return NormalizeServer(server) + "/player_api.php?" + q.Encode()
 }
 
+// LoginRaw is Login but also returns the exact response body bytes for debug
+// logging. Login delegates to it and discards the raw.
+func LoginRaw(server, username, password string) (UserInfo, ServerInfo, json.RawMessage, error) {
+	body, status, err := get(playerAPI(server, username, password, nil))
+	if err != nil {
+		return UserInfo{}, ServerInfo{}, nil, fmt.Errorf("xtream: login: %w", err)
+	}
+	if status < 200 || status >= 300 {
+		return UserInfo{}, ServerInfo{}, json.RawMessage(body), fmt.Errorf("%w: panel returned status %d", ErrAuth, status)
+	}
+	var lr loginResponse
+	if err := json.Unmarshal(body, &lr); err != nil {
+		return UserInfo{}, ServerInfo{}, json.RawMessage(body), fmt.Errorf("%w: unexpected response body", ErrAuth)
+	}
+	if lr.UserInfo.Auth != 1 {
+		return UserInfo{}, ServerInfo{}, json.RawMessage(body), ErrAuth
+	}
+	return lr.UserInfo, lr.ServerInfo, json.RawMessage(body), nil
+}
+
 // Login authenticates credentials against a panel. A decodable response whose
 // user_info.auth != 1, a non-2xx status, or a body that isn't the expected JSON
 // are all reported as ErrAuth (wrapped) rather than panicking, so a bad
 // server/username/password can never take down the caller.
 func Login(server, username, password string) (UserInfo, ServerInfo, error) {
-	body, status, err := get(playerAPI(server, username, password, nil))
-	if err != nil {
-		return UserInfo{}, ServerInfo{}, fmt.Errorf("xtream: login: %w", err)
-	}
-	if status < 200 || status >= 300 {
-		return UserInfo{}, ServerInfo{}, fmt.Errorf("%w: panel returned status %d", ErrAuth, status)
-	}
-	var lr loginResponse
-	if err := json.Unmarshal(body, &lr); err != nil {
-		return UserInfo{}, ServerInfo{}, fmt.Errorf("%w: unexpected response body", ErrAuth)
-	}
-	if lr.UserInfo.Auth != 1 {
-		return UserInfo{}, ServerInfo{}, ErrAuth
-	}
-	return lr.UserInfo, lr.ServerInfo, nil
+	ui, si, _, err := LoginRaw(server, username, password)
+	return ui, si, err
 }
 
-// LiveStreams authenticates and returns the panel's live-channel list. It
-// verifies auth first (so bad credentials surface as ErrAuth, not an empty
-// list), then fetches get_live_streams. Missing/extra fields are tolerated.
-func LiveStreams(server, username, password string) ([]Stream, error) {
-	if _, _, err := Login(server, username, password); err != nil {
-		return nil, err
+// LiveStreamsRaw is LiveStreams but also returns the exact get_live_streams
+// response body bytes for debug logging. LiveStreams delegates to it and
+// discards the raw.
+func LiveStreamsRaw(server, username, password string) ([]Stream, json.RawMessage, error) {
+	if _, _, _, err := LoginRaw(server, username, password); err != nil {
+		return nil, nil, err
 	}
 	u := playerAPI(server, username, password, url.Values{"action": {"get_live_streams"}})
 	body, status, err := get(u)
 	if err != nil {
-		return nil, fmt.Errorf("xtream: live streams: %w", err)
+		return nil, nil, fmt.Errorf("xtream: live streams: %w", err)
 	}
 	if status < 200 || status >= 300 {
-		return nil, fmt.Errorf("xtream: live streams: panel returned status %d", status)
+		return nil, json.RawMessage(body), fmt.Errorf("xtream: live streams: panel returned status %d", status)
 	}
 	var raw []rawStream
 	if err := json.Unmarshal(body, &raw); err != nil {
-		return nil, fmt.Errorf("xtream: live streams: decode: %w", err)
+		return nil, json.RawMessage(body), fmt.Errorf("xtream: live streams: decode: %w", err)
 	}
 	out := make([]Stream, 0, len(raw))
 	for _, r := range raw {
@@ -210,7 +217,41 @@ func LiveStreams(server, username, password string) ([]Stream, error) {
 			Extension:  r.Extension,
 		})
 	}
-	return out, nil
+	return out, json.RawMessage(body), nil
+}
+
+// LiveStreams authenticates and returns the panel's live-channel list. It
+// verifies auth first (so bad credentials surface as ErrAuth, not an empty
+// list), then fetches get_live_streams. Missing/extra fields are tolerated.
+func LiveStreams(server, username, password string) ([]Stream, error) {
+	s, _, err := LiveStreamsRaw(server, username, password)
+	return s, err
+}
+
+// LiveCategoriesRaw is LiveCategories but also returns the exact
+// get_live_categories response body bytes for debug logging. LiveCategories
+// delegates to it and discards the raw.
+func LiveCategoriesRaw(server, username, password string) ([]Category, json.RawMessage, error) {
+	if _, _, _, err := LoginRaw(server, username, password); err != nil {
+		return nil, nil, err
+	}
+	u := playerAPI(server, username, password, url.Values{"action": {"get_live_categories"}})
+	body, status, err := get(u)
+	if err != nil {
+		return nil, nil, fmt.Errorf("xtream: live categories: %w", err)
+	}
+	if status < 200 || status >= 300 {
+		return nil, json.RawMessage(body), fmt.Errorf("xtream: live categories: panel returned status %d", status)
+	}
+	var raw []rawCategory
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, json.RawMessage(body), fmt.Errorf("xtream: live categories: decode: %w", err)
+	}
+	out := make([]Category, 0, len(raw))
+	for _, r := range raw {
+		out = append(out, Category{ID: string(r.ID), Name: strings.TrimSpace(r.Name)})
+	}
+	return out, json.RawMessage(body), nil
 }
 
 // LiveCategories authenticates and returns the panel's live-stream categories in
@@ -218,26 +259,8 @@ func LiveStreams(server, username, password string) ([]Stream, error) {
 // Auth is verified first so bad credentials surface as ErrAuth, not an empty
 // list. Missing/extra fields are tolerated.
 func LiveCategories(server, username, password string) ([]Category, error) {
-	if _, _, err := Login(server, username, password); err != nil {
-		return nil, err
-	}
-	u := playerAPI(server, username, password, url.Values{"action": {"get_live_categories"}})
-	body, status, err := get(u)
-	if err != nil {
-		return nil, fmt.Errorf("xtream: live categories: %w", err)
-	}
-	if status < 200 || status >= 300 {
-		return nil, fmt.Errorf("xtream: live categories: panel returned status %d", status)
-	}
-	var raw []rawCategory
-	if err := json.Unmarshal(body, &raw); err != nil {
-		return nil, fmt.Errorf("xtream: live categories: decode: %w", err)
-	}
-	out := make([]Category, 0, len(raw))
-	for _, r := range raw {
-		out = append(out, Category{ID: string(r.ID), Name: strings.TrimSpace(r.Name)})
-	}
-	return out, nil
+	c, _, err := LiveCategoriesRaw(server, username, password)
+	return c, err
 }
 
 // StreamURL builds the playable live URL for a stream:

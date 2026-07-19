@@ -195,3 +195,19 @@ func TestLiveCategoriesMalformed(t *testing.T) {
 		t.Fatal("LiveCategories with malformed body should error")
 	}
 }
+
+func TestLiveStreamsRawReturnsExactBody(t *testing.T) {
+	const streamsBody = `[{"stream_id":7,"name":"Chan","category_id":"1","container_extension":"ts"}]`
+	srv := stubPanel(t, okLogin, streamsBody, "[]")
+
+	streams, raw, err := LiveStreamsRaw(srv.URL, "u", "p")
+	if err != nil {
+		t.Fatalf("LiveStreamsRaw: %v", err)
+	}
+	if len(streams) != 1 || streams[0].StreamID != 7 {
+		t.Fatalf("parsed streams wrong: %+v", streams)
+	}
+	if string(raw) != streamsBody {
+		t.Fatalf("raw body not verbatim:\n got %s\nwant %s", raw, streamsBody)
+	}
+}
