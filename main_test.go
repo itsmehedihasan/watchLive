@@ -459,14 +459,57 @@ func TestImportXtreamStreamsMapsCategories(t *testing.T) {
 	for _, c := range chans {
 		byID[c.ID] = c
 	}
-	if got := byID["xtream:pl1:1"]; got.Type != "US - Movies" || got.CatOrder != 0 {
-		t.Errorf("stream 1 = {Type:%q CatOrder:%d}, want {US - Movies 0}", got.Type, got.CatOrder)
+	if got := byID["xtream:pl1:1"]; got.Type != "US - Movies" || got.CatOrder != 1 {
+		t.Errorf("stream 1 = {Type:%q CatOrder:%d}, want {US - Movies 1}", got.Type, got.CatOrder)
 	}
-	if got := byID["xtream:pl1:3"]; got.Type != "US - Sports" || got.CatOrder != 1 {
-		t.Errorf("stream 3 = {Type:%q CatOrder:%d}, want {US - Sports 1}", got.Type, got.CatOrder)
+	if got := byID["xtream:pl1:3"]; got.Type != "US - Sports" || got.CatOrder != 2 {
+		t.Errorf("stream 3 = {Type:%q CatOrder:%d}, want {US - Sports 2}", got.Type, got.CatOrder)
 	}
 	// Unknown category id falls back to Uncategorized (store applies the default).
 	if got := byID["xtream:pl1:2"]; got.Type != "Uncategorized" {
 		t.Errorf("stream 2 Type = %q, want Uncategorized", got.Type)
+	}
+}
+
+func TestImportXtreamStreamsAppliesStreamType(t *testing.T) {
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer st.Close()
+	p := store.XtreamPlaylist{ID: "pl1", Server: "http://p:8080", Username: "u", Password: "pw", StreamType: "m3u8"}
+
+	cats := []xtream.Category{
+		{ID: "10", Name: "US - Movies"},
+		{ID: "11", Name: "US - Sports"},
+	}
+	// Extension is deliberately "ts" (the panel's per-stream extension) to prove
+	// the playlist's configured StreamType wins, not the panel's extension.
+	streams := []xtream.Stream{
+		{StreamID: 1, Name: "Film", CategoryID: "10", Extension: "ts"},
+	}
+	added, _, err := importXtreamStreams(st, p, streams, cats)
+	if err != nil {
+		t.Fatalf("importXtreamStreams: %v", err)
+	}
+	if added != 1 {
+		t.Fatalf("added = %d, want 1", added)
+	}
+	chans, _ := st.ListChannels()
+	byID := map[string]store.Channel{}
+	for _, c := range chans {
+		byID[c.ID] = c
+	}
+	got := byID["xtream:pl1:1"]
+	if len(got.Servers) == 0 {
+		t.Fatalf("stream 1 has no servers")
+	}
+	if url := got.Servers[0].URL; !strings.HasSuffix(url, ".m3u8") {
+		t.Errorf("stream 1 URL = %q, want suffix .m3u8 (playlist StreamType), not .ts (panel Extension)", url)
+	}
+	// First category in the panel's cats slice must get a 1-based CatOrder so it
+	// isn't mistaken by the frontend for "no ordering signal" (cat_order == 0).
+	if got.CatOrder != 1 {
+		t.Errorf("stream 1 CatOrder = %d, want 1 (1-based order for first panel category)", got.CatOrder)
 	}
 }

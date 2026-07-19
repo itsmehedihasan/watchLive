@@ -609,16 +609,19 @@ func importXtreamStreams(st *store.Store, p store.XtreamPlaylist, streams []xtre
 	}
 	byID := make(map[string]catInfo, len(cats))
 	for i, c := range cats {
-		byID[c.ID] = catInfo{name: c.Name, order: i}
+		// 1-based so every real Xtream category has a non-zero order; the
+		// frontend treats cat_order == 0 as "no ordering signal" and sorts
+		// those groups alphabetically after all ordered Xtream groups.
+		byID[c.ID] = catInfo{name: c.Name, order: i + 1}
 	}
 	rows := make([]store.XtreamStream, 0, len(streams))
 	for _, s := range streams {
-		ci := byID[s.CategoryID] // zero value (empty name, order 0) when unknown
+		ci := byID[s.CategoryID] // zero value (empty name, order 0) when unknown/uncategorized
 		rows = append(rows, store.XtreamStream{
 			StreamID: s.StreamID,
 			Name:     s.Name,
 			Logo:     s.Icon,
-			URL:      xtream.StreamURL(p.Server, p.Username, p.Password, s.StreamID, s.Extension),
+			URL:      xtream.StreamURL(p.Server, p.Username, p.Password, s.StreamID, p.StreamType),
 			Group:    ci.name,
 			CatOrder: ci.order,
 		})
