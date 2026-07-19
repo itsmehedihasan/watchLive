@@ -39,6 +39,9 @@ const (
 var (
 	ErrNotFound  = errors.New("channel not found")
 	ErrNotManual = errors.New("channel is not a manual entry")
+	// ErrInvalidSetting flags an UpdateXtreamSettings call with an out-of-range
+	// update_freq or stream_type value.
+	ErrInvalidSetting = errors.New("invalid xtream setting")
 )
 
 // now is a seam so tests can drive staleness deterministically.
@@ -69,12 +72,15 @@ CREATE INDEX IF NOT EXISTS idx_channels_checked ON channels(last_checked_at);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 
 CREATE TABLE IF NOT EXISTS xtream_playlists (
-    id         TEXT PRIMARY KEY,
-    name       TEXT NOT NULL,
-    server     TEXT NOT NULL,
-    username   TEXT NOT NULL,
-    password   TEXT NOT NULL,
-    created_at INTEGER NOT NULL
+    id                TEXT PRIMARY KEY,
+    name              TEXT NOT NULL,
+    server            TEXT NOT NULL,
+    username          TEXT NOT NULL,
+    password          TEXT NOT NULL,
+    created_at        INTEGER NOT NULL,
+    update_freq       TEXT NOT NULL DEFAULT 'manual',
+    stream_type       TEXT NOT NULL DEFAULT 'ts',
+    last_refreshed_at INTEGER NOT NULL DEFAULT 0
 );
 `
 
@@ -104,6 +110,13 @@ type Channel struct {
 	// IsWorking is null until the channel has been probed, then true/false. The
 	// frontend treats only an explicit false as "hide when working-only".
 	IsWorking *bool `json:"is_working"`
+	// CatOrder is the category's position in its source Xtream panel, used to
+	// render Xtream groups in panel order. 0 for non-Xtream channels.
+	CatOrder int `json:"cat_order"`
+	// XtreamPlaylistID ties an Xtream-imported channel to its saved playlist so
+	// the browse sidebar can scope the list to one playlist. Empty for manual
+	// and .m3u-imported channels.
+	XtreamPlaylistID string `json:"xtream_playlist_id"`
 }
 
 // Store wraps the SQLite database. A single connection serializes all access
@@ -147,6 +160,26 @@ func Open(path string) (*Store, error) {
 			return nil, fmt.Errorf("store: migrate %s: %w", col, err)
 		}
 	}
+	// cat_order is INTEGER (category position from the Xtream panel), so it
+	// can't ride the string-column loop above. Same duplicate-column tolerance.
+	if _, err := db.Exec(`ALTER TABLE channels ADD COLUMN cat_order INTEGER NOT NULL DEFAULT 0`); err != nil &&
+		!strings.Contains(err.Error(), "duplicate column") {
+		db.Close()
+		return nil, fmt.Errorf("store: migrate cat_order: %w", err)
+	}
+	// Per-playlist settings added after the initial xtream_playlists table, same
+	// duplicate-column tolerance as above.
+	for _, col := range []struct{ name, def string }{
+		{"update_freq", `TEXT NOT NULL DEFAULT 'manual'`},
+		{"stream_type", `TEXT NOT NULL DEFAULT 'ts'`},
+		{"last_refreshed_at", `INTEGER NOT NULL DEFAULT 0`},
+	} {
+		if _, err := db.Exec(`ALTER TABLE xtream_playlists ADD COLUMN ` + col.name + ` ` + col.def); err != nil &&
+			!strings.Contains(err.Error(), "duplicate column") {
+			db.Close()
+			return nil, fmt.Errorf("store: migrate %s: %w", col.name, err)
+		}
+	}
 	return &Store{db: db}, nil
 }
 
@@ -170,7 +203,7 @@ func (s *Store) IsEmpty() (bool, error) {
 // carrying its favourite and working state.
 func (s *Store) ListChannels() ([]Channel, error) {
 	rows, err := s.db.Query(`
-		SELECT id, name, logo, grp, typ, servers, clear_keys, http_user_agent, http_referer, resolver, resolver_arg, is_favourite, is_working
+		SELECT id, name, logo, grp, typ, servers, clear_keys, http_user_agent, http_referer, resolver, resolver_arg, is_favourite, is_working, cat_order, xtream_playlist_id
 		FROM channels ORDER BY sort_name, name`)
 	if err != nil {
 		return nil, err
@@ -200,7 +233,7 @@ func scanChannel(row scanner) (Channel, error) {
 		fav       int
 		working   sql.NullInt64
 	)
-	if err := row.Scan(&ch.ID, &ch.Name, &ch.Logo, &ch.Group, &ch.Type, &serversJS, &clearJS, &ch.UserAgent, &ch.Referer, &ch.Resolver, &ch.ResolverArg, &fav, &working); err != nil {
+	if err := row.Scan(&ch.ID, &ch.Name, &ch.Logo, &ch.Group, &ch.Type, &serversJS, &clearJS, &ch.UserAgent, &ch.Referer, &ch.Resolver, &ch.ResolverArg, &fav, &working, &ch.CatOrder, &ch.XtreamPlaylistID); err != nil {
 		return Channel{}, err
 	}
 	if serversJS != "" {
@@ -605,7 +638,7 @@ func (s *Store) Get(id string) (Channel, error) {
 
 func (s *Store) getChannel(id string) (Channel, error) {
 	row := s.db.QueryRow(`
-		SELECT id, name, logo, grp, typ, servers, clear_keys, http_user_agent, http_referer, resolver, resolver_arg, is_favourite, is_working
+		SELECT id, name, logo, grp, typ, servers, clear_keys, http_user_agent, http_referer, resolver, resolver_arg, is_favourite, is_working, cat_order, xtream_playlist_id
 		FROM channels WHERE id=?`, id)
 	return scanChannel(row)
 }
@@ -1061,6 +1094,12 @@ type XtreamPlaylist struct {
 	Username  string `json:"username"`
 	Password  string `json:"-"`
 	CreatedAt int64  `json:"created_at"`
+	// UpdateFreq is the auto-refresh cadence: "manual" | "daily" | "3days" |
+	// "weekly". StreamType is the extension used to build stream URLs: "ts" |
+	// "m3u8". LastRefreshedAt (unix seconds) drives the startup interval sweep.
+	UpdateFreq      string `json:"update_freq"`
+	StreamType      string `json:"stream_type"`
+	LastRefreshedAt int64  `json:"-"`
 	// Imported reports whether any channel row already references this playlist;
 	// populated by ListXtreamPlaylists, false elsewhere.
 	Imported bool `json:"imported"`
@@ -1076,6 +1115,12 @@ type XtreamStream struct {
 	Logo     string
 	// URL is the fully-built playable stream URL (server/live/user/pass/id.ext).
 	URL string
+	// Group is the channel's category name (from the panel), stored as the
+	// channel's typ so the browse UI groups by it. Empty → "Uncategorized".
+	Group string
+	// CatOrder is the category's index in the panel's category list, used to
+	// order groups in the browse UI.
+	CatOrder int
 }
 
 // SaveXtreamPlaylist inserts a new saved playlist with a freshly-minted opaque
@@ -1096,6 +1141,10 @@ func (s *Store) SaveXtreamPlaylist(name, server, username, password string) (Xtr
 	if err != nil {
 		return XtreamPlaylist{}, err
 	}
+	// Matches the SQL column defaults so the returned value is accurate without
+	// a round-trip read.
+	p.UpdateFreq = "manual"
+	p.StreamType = "ts"
 	return p, nil
 }
 
@@ -1108,7 +1157,7 @@ func (s *Store) ListXtreamPlaylists() ([]XtreamPlaylist, error) {
 		return nil, err
 	}
 	rows, err := s.db.Query(`
-		SELECT id, name, server, username, password, created_at
+		SELECT id, name, server, username, password, created_at, update_freq, stream_type, last_refreshed_at
 		FROM xtream_playlists ORDER BY created_at DESC, name`)
 	if err != nil {
 		return nil, err
@@ -1117,7 +1166,7 @@ func (s *Store) ListXtreamPlaylists() ([]XtreamPlaylist, error) {
 	var out []XtreamPlaylist
 	for rows.Next() {
 		var p XtreamPlaylist
-		if err := rows.Scan(&p.ID, &p.Name, &p.Server, &p.Username, &p.Password, &p.CreatedAt); err != nil {
+		if err := rows.Scan(&p.ID, &p.Name, &p.Server, &p.Username, &p.Password, &p.CreatedAt, &p.UpdateFreq, &p.StreamType, &p.LastRefreshedAt); err != nil {
 			return nil, err
 		}
 		p.Imported = imported[p.ID]
@@ -1150,13 +1199,64 @@ func (s *Store) importedPlaylistIDs() (map[string]bool, error) {
 func (s *Store) GetXtreamPlaylist(id string) (XtreamPlaylist, error) {
 	var p XtreamPlaylist
 	err := s.db.QueryRow(`
-		SELECT id, name, server, username, password, created_at
+		SELECT id, name, server, username, password, created_at, update_freq, stream_type, last_refreshed_at
 		FROM xtream_playlists WHERE id=?`, id).
-		Scan(&p.ID, &p.Name, &p.Server, &p.Username, &p.Password, &p.CreatedAt)
+		Scan(&p.ID, &p.Name, &p.Server, &p.Username, &p.Password, &p.CreatedAt, &p.UpdateFreq, &p.StreamType, &p.LastRefreshedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return XtreamPlaylist{}, ErrNotFound
 	}
 	return p, err
+}
+
+// validUpdateFreq / validStreamType are the accepted setting values.
+var validUpdateFreq = map[string]bool{"manual": true, "daily": true, "3days": true, "weekly": true}
+var validStreamType = map[string]bool{"ts": true, "m3u8": true}
+
+// UpdateXtreamSettings validates and persists a playlist's auto-refresh cadence
+// and stream type, returning the updated playlist. ErrInvalidSetting on a bad
+// value; ErrNotFound if no such playlist.
+func (s *Store) UpdateXtreamSettings(id, updateFreq, streamType string) (XtreamPlaylist, error) {
+	if !validUpdateFreq[updateFreq] || !validStreamType[streamType] {
+		return XtreamPlaylist{}, ErrInvalidSetting
+	}
+	res, err := s.db.Exec(`UPDATE xtream_playlists SET update_freq=?, stream_type=? WHERE id=?`,
+		updateFreq, streamType, id)
+	if err != nil {
+		return XtreamPlaylist{}, err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return XtreamPlaylist{}, ErrNotFound
+	}
+	return s.GetXtreamPlaylist(id)
+}
+
+// StampXtreamRefreshed records that a playlist was just refreshed, so the
+// startup interval sweep can tell when it is next due.
+func (s *Store) StampXtreamRefreshed(id string) error {
+	_, err := s.db.Exec(`UPDATE xtream_playlists SET last_refreshed_at=? WHERE id=?`, now().Unix(), id)
+	return err
+}
+
+// DueXtreamPlaylists returns saved playlists whose auto-refresh cadence has
+// elapsed as of now, for the startup sweep. Each returned playlist carries its
+// credentials so the caller can refresh it.
+func (s *Store) DueXtreamPlaylists() ([]XtreamPlaylist, error) {
+	all, err := s.ListXtreamPlaylists()
+	if err != nil {
+		return nil, err
+	}
+	dueIDs := playlistsDueForRefresh(all, now().Unix())
+	dueSet := make(map[string]bool, len(dueIDs))
+	for _, id := range dueIDs {
+		dueSet[id] = true
+	}
+	var due []XtreamPlaylist
+	for _, p := range all {
+		if dueSet[p.ID] {
+			due = append(due, p)
+		}
+	}
+	return due, nil
 }
 
 // UpsertXtreamChannels imports (or refreshes) a playlist's live channels in one
@@ -1185,12 +1285,12 @@ func (s *Store) UpsertXtreamChannels(playlistID string, streams []XtreamStream) 
 	// a refresh preserves the user's favourite and the prober's verdict.
 	stmt, err := tx.Prepare(`
 		INSERT INTO channels
-			(id, name, logo, grp, typ, servers, is_working, last_checked_at, is_favourite, is_manual, sort_name, xtream_playlist_id)
-		VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, 0, 1, ?, ?)
+			(id, name, logo, grp, typ, servers, is_working, last_checked_at, is_favourite, is_manual, sort_name, xtream_playlist_id, cat_order)
+		VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, 0, 1, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			name=excluded.name, logo=excluded.logo, grp=excluded.grp, typ=excluded.typ,
 			servers=excluded.servers, sort_name=excluded.sort_name,
-			xtream_playlist_id=excluded.xtream_playlist_id`)
+			xtream_playlist_id=excluded.xtream_playlist_id, cat_order=excluded.cat_order`)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -1208,11 +1308,13 @@ func (s *Store) UpsertXtreamChannels(playlistID string, streams []XtreamStream) 
 		}
 		seen[id] = true
 		serversJS, _ := json.Marshal([]playlist.Server{{URL: u}})
-		// Xtream panels group by opaque numeric category_id, which is meaningless
-		// as a country and would pollute the country dropdown. Land these in the
-		// neutral "Custom" country group (same as manual channels) and the neutral
-		// category, matching manual-channel semantics.
-		if _, err = stmt.Exec(id, name, st.Logo, manualGroup, manualType, string(serversJS), strings.ToLower(name), playlistID); err != nil {
+		grp := strings.TrimSpace(st.Group)
+		if grp == "" {
+			grp = "Uncategorized"
+		}
+		// grp column (country) stays neutral — categories are not countries and
+		// must not pollute the country dropdown. The category name is the typ.
+		if _, err = stmt.Exec(id, name, st.Logo, manualGroup, grp, string(serversJS), strings.ToLower(name), playlistID, st.CatOrder); err != nil {
 			return 0, 0, err
 		}
 		if existing[id] {
@@ -1254,4 +1356,37 @@ func marshalKeys(keys map[string]string) string {
 func manualHash(name, url string) string {
 	sum := sha256.Sum256([]byte(name + "||" + url))
 	return hex.EncodeToString(sum[:6]) // 12 hex chars
+}
+
+// refreshInterval maps an update_freq to its cadence in seconds. "manual" (and
+// any unknown value) returns 0, meaning "never auto-refresh".
+func refreshInterval(freq string) int64 {
+	switch freq {
+	case "daily":
+		return 24 * 3600
+	case "3days":
+		return 3 * 24 * 3600
+	case "weekly":
+		return 7 * 24 * 3600
+	default:
+		return 0
+	}
+}
+
+// playlistsDueForRefresh returns the ids of playlists whose auto-refresh cadence
+// has elapsed as of nowUnix. "manual" playlists are never due; a playlist that
+// has never been refreshed (LastRefreshedAt == 0) with a non-manual cadence is
+// always due.
+func playlistsDueForRefresh(playlists []XtreamPlaylist, nowUnix int64) []string {
+	var due []string
+	for _, p := range playlists {
+		interval := refreshInterval(p.UpdateFreq)
+		if interval == 0 {
+			continue
+		}
+		if nowUnix >= p.LastRefreshedAt+interval {
+			due = append(due, p.ID)
+		}
+	}
+	return due
 }

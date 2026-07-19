@@ -8,21 +8,24 @@ import (
 )
 
 // stubPanel returns a test server standing in for player_api.php. login is the
-// body served for a bare login request; streams is served for
-// action=get_live_streams. An empty body for either is served verbatim (used to
-// simulate malformed/HTML responses).
-func stubPanel(t *testing.T, login, streams string) *httptest.Server {
+// body served for a bare login request; streams for action=get_live_streams;
+// cats for action=get_live_categories. An empty body is served verbatim (used
+// to simulate malformed/HTML responses).
+func stubPanel(t *testing.T, login, streams, cats string) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/player_api.php" {
 			http.NotFound(w, r)
 			return
 		}
-		if r.URL.Query().Get("action") == "get_live_streams" {
+		switch r.URL.Query().Get("action") {
+		case "get_live_streams":
 			w.Write([]byte(streams))
-			return
+		case "get_live_categories":
+			w.Write([]byte(cats))
+		default:
+			w.Write([]byte(login))
 		}
-		w.Write([]byte(login))
 	}))
 	t.Cleanup(srv.Close)
 	return srv
@@ -31,7 +34,7 @@ func stubPanel(t *testing.T, login, streams string) *httptest.Server {
 const okLogin = `{"user_info":{"username":"u","auth":1,"status":"Active"},"server_info":{"url":"host","port":"80"}}`
 
 func TestLoginHappyPath(t *testing.T) {
-	srv := stubPanel(t, okLogin, "[]")
+	srv := stubPanel(t, okLogin, "[]", "[]")
 	ui, si, err := Login(srv.URL, "u", "p")
 	if err != nil {
 		t.Fatalf("Login: %v", err)
@@ -48,7 +51,7 @@ func TestLoginHappyPath(t *testing.T) {
 }
 
 func TestLoginAuthZero(t *testing.T) {
-	srv := stubPanel(t, `{"user_info":{"auth":0}}`, "[]")
+	srv := stubPanel(t, `{"user_info":{"auth":0}}`, "[]", "[]")
 	if _, _, err := Login(srv.URL, "u", "bad"); err == nil {
 		t.Fatal("Login with auth:0 should error")
 	}
@@ -56,14 +59,14 @@ func TestLoginAuthZero(t *testing.T) {
 
 // Some panels quote the auth flag as a string; it must still be honoured.
 func TestLoginAuthStringOne(t *testing.T) {
-	srv := stubPanel(t, `{"user_info":{"username":"u","auth":"1"}}`, "[]")
+	srv := stubPanel(t, `{"user_info":{"username":"u","auth":"1"}}`, "[]", "[]")
 	if _, _, err := Login(srv.URL, "u", "p"); err != nil {
 		t.Fatalf("Login with auth:\"1\": %v", err)
 	}
 }
 
 func TestLoginMalformedJSON(t *testing.T) {
-	srv := stubPanel(t, `<html>Access denied</html>`, "[]")
+	srv := stubPanel(t, `<html>Access denied</html>`, "[]", "[]")
 	if _, _, err := Login(srv.URL, "u", "p"); err == nil {
 		t.Fatal("Login with non-JSON body should error")
 	}
@@ -84,7 +87,7 @@ func TestLiveStreamsHappyPath(t *testing.T) {
 		{"stream_id":101,"name":"Alpha","stream_icon":"http://l/a.png","category_id":"1","container_extension":"m3u8"},
 		{"stream_id":"202","name":"Beta"}
 	]`
-	srv := stubPanel(t, okLogin, streams)
+	srv := stubPanel(t, okLogin, streams, "[]")
 	got, err := LiveStreams(srv.URL, "u", "p")
 	if err != nil {
 		t.Fatalf("LiveStreams: %v", err)
@@ -106,14 +109,14 @@ func TestLiveStreamsHappyPath(t *testing.T) {
 }
 
 func TestLiveStreamsAuthFails(t *testing.T) {
-	srv := stubPanel(t, `{"user_info":{"auth":0}}`, `[{"stream_id":1,"name":"X"}]`)
+	srv := stubPanel(t, `{"user_info":{"auth":0}}`, `[{"stream_id":1,"name":"X"}]`, "[]")
 	if _, err := LiveStreams(srv.URL, "u", "bad"); err == nil {
 		t.Fatal("LiveStreams should surface auth failure before listing")
 	}
 }
 
 func TestLiveStreamsMalformed(t *testing.T) {
-	srv := stubPanel(t, okLogin, `not json`)
+	srv := stubPanel(t, okLogin, `not json`, "[]")
 	if _, err := LiveStreams(srv.URL, "u", "p"); err == nil {
 		t.Fatal("LiveStreams with malformed body should error")
 	}
@@ -152,5 +155,59 @@ func TestPlayerAPIQuery(t *testing.T) {
 	}
 	if !strings.HasPrefix(u, "http://p/player_api.php?") {
 		t.Errorf("unexpected login URL: %s", u)
+	}
+}
+
+func TestLiveCategoriesHappyPath(t *testing.T) {
+	cats := `[
+		{"category_id":"1","category_name":"Main Events / PPV"},
+		{"category_id":"2","category_name":"US - Entertainment"},
+		{"category_id":3,"category_name":"US - Movies"}
+	]`
+	srv := stubPanel(t, okLogin, "[]", cats)
+	got, err := LiveCategories(srv.URL, "u", "p")
+	if err != nil {
+		t.Fatalf("LiveCategories: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("got %d categories, want 3", len(got))
+	}
+	// Order must match the panel's returned order.
+	if got[0].Name != "Main Events / PPV" || got[0].ID != "1" {
+		t.Errorf("category[0] = %+v", got[0])
+	}
+	// category_id sent as a number must decode to its string form.
+	if got[2].ID != "3" || got[2].Name != "US - Movies" {
+		t.Errorf("category[2] = %+v", got[2])
+	}
+}
+
+func TestLiveCategoriesAuthFails(t *testing.T) {
+	srv := stubPanel(t, `{"user_info":{"auth":0}}`, "[]", `[{"category_id":"1","category_name":"X"}]`)
+	if _, err := LiveCategories(srv.URL, "u", "bad"); err == nil {
+		t.Fatal("LiveCategories should surface auth failure before listing")
+	}
+}
+
+func TestLiveCategoriesMalformed(t *testing.T) {
+	srv := stubPanel(t, okLogin, "[]", `not json`)
+	if _, err := LiveCategories(srv.URL, "u", "p"); err == nil {
+		t.Fatal("LiveCategories with malformed body should error")
+	}
+}
+
+func TestLiveStreamsRawReturnsExactBody(t *testing.T) {
+	const streamsBody = `[{"stream_id":7,"name":"Chan","category_id":"1","container_extension":"ts"}]`
+	srv := stubPanel(t, okLogin, streamsBody, "[]")
+
+	streams, raw, err := LiveStreamsRaw(srv.URL, "u", "p")
+	if err != nil {
+		t.Fatalf("LiveStreamsRaw: %v", err)
+	}
+	if len(streams) != 1 || streams[0].StreamID != 7 {
+		t.Fatalf("parsed streams wrong: %+v", streams)
+	}
+	if string(raw) != streamsBody {
+		t.Fatalf("raw body not verbatim:\n got %s\nwant %s", raw, streamsBody)
 	}
 }

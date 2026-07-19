@@ -19,6 +19,7 @@ import (
 	"watchlive/internal/resolver"
 	"watchlive/internal/store"
 	"watchlive/internal/viewers"
+	"watchlive/internal/xtream"
 )
 
 // testMux wires newMux against a real temp SQLite store + keystore so the HTTP
@@ -411,6 +412,43 @@ func TestXtreamPlaylistHandlers(t *testing.T) {
 	}
 }
 
+func TestRefreshResponseIncludesDebugRaw(t *testing.T) {
+	mux, _, _ := testMux(t)
+	panel := xtreamPanel(t, `[{"stream_id":10,"name":"Alpha"}]`)
+
+	rec := do(t, mux, http.MethodPost, "/api/xtream/playlists",
+		`{"name":"P","server":"`+panel.URL+`","username":"u","password":"p"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("save: got %d body %s", rec.Code, rec.Body.String())
+	}
+	var saved struct {
+		Playlist store.XtreamPlaylist `json:"playlist"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &saved); err != nil {
+		t.Fatalf("decode save: %v", err)
+	}
+
+	rec = do(t, mux, http.MethodPost, "/api/xtream/playlists/"+saved.Playlist.ID+"/refresh", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("refresh: got %d body %s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Added   int `json:"added"`
+		Updated int `json:"updated"`
+		Debug   struct {
+			Login      json.RawMessage `json:"login"`
+			Categories json.RawMessage `json:"categories"`
+			Streams    json.RawMessage `json:"streams"`
+		} `json:"debug"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Debug.Streams) == 0 || string(resp.Debug.Streams) == "null" {
+		t.Fatalf("expected non-null debug.streams, got %q", resp.Debug.Streams)
+	}
+}
+
 func TestXtreamCreateRejectsBadInput(t *testing.T) {
 	mux, _, _ := testMux(t)
 	// Missing scheme on server.
@@ -425,5 +463,128 @@ func TestXtreamCreateRejectsBadInput(t *testing.T) {
 	}
 	if rec := do(t, mux, http.MethodPost, "/api/xtream/playlists", `{bad`); rec.Code != http.StatusBadRequest {
 		t.Errorf("bad json: got %d, want 400", rec.Code)
+	}
+}
+
+func TestImportXtreamStreamsMapsCategories(t *testing.T) {
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer st.Close()
+	p := store.XtreamPlaylist{ID: "pl1", Server: "http://p:8080", Username: "u", Password: "pw"}
+
+	// Categories in panel order; stream 2 references an unknown category id.
+	cats := []xtream.Category{
+		{ID: "10", Name: "US - Movies"},
+		{ID: "11", Name: "US - Sports"},
+	}
+	streams := []xtream.Stream{
+		{StreamID: 1, Name: "Film", CategoryID: "10", Extension: "ts"},
+		{StreamID: 2, Name: "Orphan", CategoryID: "999", Extension: "ts"},
+		{StreamID: 3, Name: "Match", CategoryID: "11", Extension: "ts"},
+	}
+	added, _, err := importXtreamStreams(st, p, streams, cats)
+	if err != nil {
+		t.Fatalf("importXtreamStreams: %v", err)
+	}
+	if added != 3 {
+		t.Fatalf("added = %d, want 3", added)
+	}
+	chans, _ := st.ListChannels()
+	byID := map[string]store.Channel{}
+	for _, c := range chans {
+		byID[c.ID] = c
+	}
+	if got := byID["xtream:pl1:1"]; got.Type != "US - Movies" || got.CatOrder != 1 {
+		t.Errorf("stream 1 = {Type:%q CatOrder:%d}, want {US - Movies 1}", got.Type, got.CatOrder)
+	}
+	if got := byID["xtream:pl1:3"]; got.Type != "US - Sports" || got.CatOrder != 2 {
+		t.Errorf("stream 3 = {Type:%q CatOrder:%d}, want {US - Sports 2}", got.Type, got.CatOrder)
+	}
+	// Unknown category id falls back to Uncategorized (store applies the default).
+	if got := byID["xtream:pl1:2"]; got.Type != "Uncategorized" {
+		t.Errorf("stream 2 Type = %q, want Uncategorized", got.Type)
+	}
+}
+
+func TestImportXtreamStreamsAppliesStreamType(t *testing.T) {
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer st.Close()
+	p := store.XtreamPlaylist{ID: "pl1", Server: "http://p:8080", Username: "u", Password: "pw", StreamType: "m3u8"}
+
+	cats := []xtream.Category{
+		{ID: "10", Name: "US - Movies"},
+		{ID: "11", Name: "US - Sports"},
+	}
+	// Extension is deliberately "ts" (the panel's per-stream extension) to prove
+	// the playlist's configured StreamType wins, not the panel's extension.
+	streams := []xtream.Stream{
+		{StreamID: 1, Name: "Film", CategoryID: "10", Extension: "ts"},
+	}
+	added, _, err := importXtreamStreams(st, p, streams, cats)
+	if err != nil {
+		t.Fatalf("importXtreamStreams: %v", err)
+	}
+	if added != 1 {
+		t.Fatalf("added = %d, want 1", added)
+	}
+	chans, _ := st.ListChannels()
+	byID := map[string]store.Channel{}
+	for _, c := range chans {
+		byID[c.ID] = c
+	}
+	got := byID["xtream:pl1:1"]
+	if len(got.Servers) == 0 {
+		t.Fatalf("stream 1 has no servers")
+	}
+	if url := got.Servers[0].URL; !strings.HasSuffix(url, ".m3u8") {
+		t.Errorf("stream 1 URL = %q, want suffix .m3u8 (playlist StreamType), not .ts (panel Extension)", url)
+	}
+	// First category in the panel's cats slice must get a 1-based CatOrder so it
+	// isn't mistaken by the frontend for "no ordering signal" (cat_order == 0).
+	if got.CatOrder != 1 {
+		t.Errorf("stream 1 CatOrder = %d, want 1 (1-based order for first panel category)", got.CatOrder)
+	}
+}
+
+func TestChannelsPayloadCarriesPlaylistID(t *testing.T) {
+	mux, _, _ := testMux(t)
+	panel := xtreamPanel(t, `[{"stream_id":10,"name":"Alpha"}]`)
+
+	rec := do(t, mux, http.MethodPost, "/api/xtream/playlists",
+		`{"name":"P","server":"`+panel.URL+`","username":"u","password":"p"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("save: got %d body %s", rec.Code, rec.Body.String())
+	}
+	var saved struct {
+		Playlist store.XtreamPlaylist `json:"playlist"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &saved); err != nil {
+		t.Fatalf("decode save: %v", err)
+	}
+
+	rec = do(t, mux, http.MethodGet, "/api/channels", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("channels: got %d", rec.Code)
+	}
+	var chans []map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &chans); err != nil {
+		t.Fatalf("decode channels: %v", err)
+	}
+	found := false
+	for _, ch := range chans {
+		id, _ := ch["id"].(string)
+		if strings.HasPrefix(id, "xtream:"+saved.Playlist.ID+":") {
+			if pid, _ := ch["xtream_playlist_id"].(string); pid == saved.Playlist.ID {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("no imported channel carried xtream_playlist_id=%q", saved.Playlist.ID)
 	}
 }

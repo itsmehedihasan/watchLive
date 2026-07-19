@@ -654,6 +654,44 @@ func TestXtreamPlaylistCRUD(t *testing.T) {
 	}
 }
 
+func TestUpdateXtreamSettings(t *testing.T) {
+	s := open(t)
+	p, err := s.SaveXtreamPlaylist("KS", "http://p:8080", "u", "pw")
+	if err != nil {
+		t.Fatalf("SaveXtreamPlaylist: %v", err)
+	}
+	// Defaults on a fresh row.
+	if p.UpdateFreq != "manual" || p.StreamType != "ts" {
+		t.Fatalf("defaults = {%q %q}, want {manual ts}", p.UpdateFreq, p.StreamType)
+	}
+	got, err := s.UpdateXtreamSettings(p.ID, "weekly", "m3u8")
+	if err != nil {
+		t.Fatalf("UpdateXtreamSettings: %v", err)
+	}
+	if got.UpdateFreq != "weekly" || got.StreamType != "m3u8" {
+		t.Errorf("updated = {%q %q}, want {weekly m3u8}", got.UpdateFreq, got.StreamType)
+	}
+	// Persisted across a re-read.
+	list, _ := s.ListXtreamPlaylists()
+	if len(list) != 1 || list[0].UpdateFreq != "weekly" || list[0].StreamType != "m3u8" {
+		t.Errorf("reloaded = %+v", list)
+	}
+}
+
+func TestUpdateXtreamSettingsInvalid(t *testing.T) {
+	s := open(t)
+	p, _ := s.SaveXtreamPlaylist("KS", "http://p:8080", "u", "pw")
+	if _, err := s.UpdateXtreamSettings(p.ID, "hourly", "ts"); !errors.Is(err, ErrInvalidSetting) {
+		t.Errorf("bad freq err = %v, want ErrInvalidSetting", err)
+	}
+	if _, err := s.UpdateXtreamSettings(p.ID, "manual", "rtmp"); !errors.Is(err, ErrInvalidSetting) {
+		t.Errorf("bad stream type err = %v, want ErrInvalidSetting", err)
+	}
+	if _, err := s.UpdateXtreamSettings("nope", "manual", "ts"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("unknown id err = %v, want ErrNotFound", err)
+	}
+}
+
 func TestUpsertXtreamChannels(t *testing.T) {
 	s := open(t)
 	p, _ := s.SaveXtreamPlaylist("Panel", "http://p", "u", "pw")
@@ -731,6 +769,40 @@ func TestUpsertXtreamChannels(t *testing.T) {
 	}
 }
 
+func TestUpsertXtreamChannelsGrouping(t *testing.T) {
+	s := open(t)
+	_, err := s.SaveXtreamPlaylist("KS", "http://p:8080", "u", "pw")
+	if err != nil {
+		t.Fatalf("SaveXtreamPlaylist: %v", err)
+	}
+	added, _, err := s.UpsertXtreamChannels("pl1", []XtreamStream{
+		{StreamID: 1, Name: "Movie One", URL: "http://p/live/u/pw/1.ts", Group: "US - Movies", CatOrder: 5},
+		{StreamID: 2, Name: "Sport One", URL: "http://p/live/u/pw/2.ts", Group: "US - Sports", CatOrder: 6},
+		{StreamID: 3, Name: "Loose", URL: "http://p/live/u/pw/3.ts", Group: "", CatOrder: 0},
+	})
+	if err != nil {
+		t.Fatalf("UpsertXtreamChannels: %v", err)
+	}
+	if added != 3 {
+		t.Fatalf("added = %d, want 3", added)
+	}
+	chans, err := s.ListChannels()
+	if err != nil {
+		t.Fatalf("ListChannels: %v", err)
+	}
+	byID := map[string]Channel{}
+	for _, c := range chans {
+		byID[c.ID] = c
+	}
+	if got := byID["xtream:pl1:1"]; got.Type != "US - Movies" || got.CatOrder != 5 {
+		t.Errorf("channel 1 = {Type:%q CatOrder:%d}, want {US - Movies 5}", got.Type, got.CatOrder)
+	}
+	// Empty category name falls back to "Uncategorized".
+	if got := byID["xtream:pl1:3"]; got.Type != "Uncategorized" {
+		t.Errorf("channel 3 Type = %q, want Uncategorized", got.Type)
+	}
+}
+
 // An xtream-imported channel is is_manual=1, so it survives PruneOrphans even
 // though its id never appears in the iptv-org feed.
 func TestXtreamChannelsSurvivePrune(t *testing.T) {
@@ -744,5 +816,30 @@ func TestXtreamChannelsSurvivePrune(t *testing.T) {
 	}
 	if _, err := s.Get("xtream:" + p.ID + ":1"); err != nil {
 		t.Errorf("xtream channel must survive prune, got %v", err)
+	}
+}
+
+func TestPlaylistsDueForRefresh(t *testing.T) {
+	const day = int64(24 * 3600)
+	nowUnix := int64(1_000_000)
+	pls := []XtreamPlaylist{
+		{ID: "manual", UpdateFreq: "manual", LastRefreshedAt: 0},          // never due
+		{ID: "never", UpdateFreq: "daily", LastRefreshedAt: 0},            // due (0 → always)
+		{ID: "fresh", UpdateFreq: "daily", LastRefreshedAt: nowUnix - 1},  // not due
+		{ID: "stale", UpdateFreq: "daily", LastRefreshedAt: nowUnix - 2*day}, // due
+		{ID: "wk-fresh", UpdateFreq: "weekly", LastRefreshedAt: nowUnix - 3*day}, // not due
+		{ID: "wk-due", UpdateFreq: "weekly", LastRefreshedAt: nowUnix - 8*day},   // due
+		{ID: "3d-due", UpdateFreq: "3days", LastRefreshedAt: nowUnix - 4*day},    // due
+		{ID: "exact", UpdateFreq: "daily", LastRefreshedAt: nowUnix - day}, // due at exactly the boundary
+	}
+	got := playlistsDueForRefresh(pls, nowUnix)
+	want := map[string]bool{"never": true, "stale": true, "wk-due": true, "3d-due": true, "exact": true}
+	if len(got) != len(want) {
+		t.Fatalf("due = %v, want keys %v", got, want)
+	}
+	for _, id := range got {
+		if !want[id] {
+			t.Errorf("unexpected due id %q", id)
+		}
 	}
 }

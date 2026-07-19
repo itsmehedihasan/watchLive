@@ -110,6 +110,12 @@ export function refreshHighlights() {
 // facet matches ch.group (which holds the country code) against state.country.
 function workingSet() {
   let base = state.channels;
+  if (state.selectedPlaylist) {
+    const pid = state.selectedPlaylist;
+    base = base.filter(function (ch) {
+      return ch.xtream_playlist_id === pid || isManual(ch);
+    });
+  }
   if (state.country) {
     const c = state.country.toLowerCase();
     base = base.filter(function (ch) { return (ch.group || '').toLowerCase() === c; });
@@ -156,6 +162,12 @@ export function populateCountryFilter() {
 
 function buildFavSection(searching) {
   let favList = state.channels.filter(isFav);
+  if (state.selectedPlaylist) {
+    const pid = state.selectedPlaylist;
+    favList = favList.filter(function (ch) {
+      return ch.xtream_playlist_id === pid || isManual(ch);
+    });
+  }
   if (state.healthOn) favList = favList.filter(passesHealth);
   const open = state.favOpen || searching;
   const section = document.createElement('div');
@@ -189,6 +201,16 @@ function buildFavSection(searching) {
 // category sections auto-expand so matches are visible without a click.
 export function renderChannelList() {
   populateCountryFilter();
+  if (state.activeTab !== 'channels') {
+    // Movies/Sports: hide the list + counts, show the placeholder.
+    Array.prototype.slice.call(els.channelList.querySelectorAll('.channel-item, .group-section')).forEach(function (n) { n.remove(); });
+    els.listLoading.hidden = true;
+    els.emptyState.hidden = true;
+    els.channelCount.textContent = '';
+    if (els.tabPlaceholder) els.tabPlaceholder.hidden = false;
+    return;
+  }
+  if (els.tabPlaceholder) els.tabPlaceholder.hidden = true;
   const matches = workingSet();
   const searching = !!state.search;
   const keepScroll = els.channelList.scrollTop;
@@ -208,11 +230,35 @@ export function renderChannelList() {
   const frag = document.createDocumentFragment();
   frag.appendChild(buildFavSection(searching));
 
-  // Known categories first (in CATEGORY_ORDER), then any stragglers alphabetically.
+  // Known categories first (in CATEGORY_ORDER). Then "straggler" groups: Xtream
+  // category groups (channels carry a panel index in cat_order) sorted by that
+  // index to preserve the panel's order, followed by any remaining groups
+  // (cat_order 0 — non-Xtream) alphabetically.
   const known = {};
   CATEGORY_ORDER.forEach(function (c) { known[c] = true; });
+  // Group's ordering key = the smallest cat_order among its channels.
+  const groupOrder = {};
+  Object.keys(byCat).forEach(function (c) {
+    let min = 0;
+    byCat[c].forEach(function (ch) {
+      const o = ch.cat_order || 0;
+      if (o > 0 && (min === 0 || o < min)) min = o;
+    });
+    groupOrder[c] = min; // 0 = no panel ordering signal
+  });
   const extra = Object.keys(byCat).filter(function (c) { return !known[c]; })
-    .sort(function (a, b) { a = a.toLowerCase(); b = b.toLowerCase(); return a < b ? -1 : a > b ? 1 : 0; });
+    .sort(function (a, b) {
+      const oa = groupOrder[a], ob = groupOrder[b];
+      if (oa !== ob) {
+        // Ordered (non-zero) groups come before unordered (zero) ones; among
+        // ordered groups, ascending panel index.
+        if (oa === 0) return 1;
+        if (ob === 0) return -1;
+        return oa - ob;
+      }
+      a = a.toLowerCase(); b = b.toLowerCase();
+      return a < b ? -1 : a > b ? 1 : 0;
+    });
   const cats = CATEGORY_ORDER.concat(extra);
 
   cats.forEach(function (cat) {
@@ -262,27 +308,9 @@ function targetCellForBrowse() {
   return state.audioCell >= 0 ? state.audioCell : 0;
 }
 
-export function beat() {
-  fetch('/api/viewers', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ sessionId: state.sessionId, channelId: watchedChannelId() }),
-  })
-    .then(function (r) { return r.json(); })
-    .then(function (d) {
-      if (d.top && d.top.length > 0) {
-        const ids = d.top.map(function (x) { return x.id; });
-        if (ids.join(',') !== state.topChannelIds.join(',')) state.topChannelIds = ids;
-      }
-    })
-    .catch(function () {});
-}
-
-function watchedChannelId() {
-  if (state.audioCell >= 0 && cells[state.audioCell] && cells[state.audioCell].channel) return cells[state.audioCell].channel.id;
-  for (let i = 0; i < cells.length; i++) { if (cells[i].channel) return cells[i].channel.id; }
-  return null;
-}
+// beat is retained as a no-op: the live-viewers heartbeat (/api/viewers) was
+// removed from the client. Call sites remain harmless.
+export function beat() {}
 
 function setSearch(value) {
   state.search = value;
