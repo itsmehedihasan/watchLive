@@ -51,6 +51,7 @@ function renderSaved(list) {
   sel.innerHTML = '';
   if (list.length === 0) {
     els.xtreamSavedWrap.hidden = true;
+    els.xtreamSettings.hidden = true;
     return;
   }
   els.xtreamSavedWrap.hidden = false;
@@ -60,6 +61,7 @@ function renderSaved(list) {
     opt.textContent = p.name + (p.imported ? '' : ' (not imported)');
     sel.appendChild(opt);
   });
+  syncSettings();
 }
 
 function selectedPlaylist() {
@@ -70,11 +72,25 @@ function selectedPlaylist() {
   return null;
 }
 
+// syncSettings reflects the selected playlist's settings into the two selects,
+// and shows the settings block only when a playlist is selected.
+function syncSettings() {
+  const p = selectedPlaylist();
+  if (!p) {
+    els.xtreamSettings.hidden = true;
+    return;
+  }
+  els.xtreamSettings.hidden = false;
+  els.xtreamUpdateFreq.value = p.update_freq || 'manual';
+  els.xtreamStreamType.value = p.stream_type || 'ts';
+}
+
 // Selecting a playlist that has never been imported fetches+imports it via a
 // refresh (the server upserts by stable id, so refresh doubles as first import).
 // An already-imported playlist just stays selected — no network call.
 els.xtreamSaved.addEventListener('change', function () {
   const p = selectedPlaylist();
+  syncSettings();
   if (p && !p.imported) importPlaylist(p.id, els.xtreamSaved);
 });
 
@@ -142,6 +158,36 @@ els.xtreamSave.addEventListener('click', function () {
       showError(friendly(err));
     });
 });
+
+// patchSettings persists the selected playlist's current setting values.
+function patchSettings(notify) {
+  const p = selectedPlaylist();
+  if (!p) return;
+  const body = {
+    update_freq: els.xtreamUpdateFreq.value,
+    stream_type: els.xtreamStreamType.value,
+  };
+  showError('');
+  fetch('/api/xtream/playlists/' + encodeURIComponent(p.id), {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+    .then(function (r) {
+      if (!r.ok) return r.text().then(function (t) { throw new Error(t || ('save failed: ' + r.status)); });
+      return r.json();
+    })
+    .then(function (updated) {
+      // Keep the cache in sync so re-selecting shows the saved values.
+      p.update_freq = updated.update_freq;
+      p.stream_type = updated.stream_type;
+      if (notify) showError('Stream type saved — press Refresh to re-import channels with the new type.');
+    })
+    .catch(function (err) { showError(friendly(err)); });
+}
+
+els.xtreamUpdateFreq.addEventListener('change', function () { patchSettings(false); });
+els.xtreamStreamType.addEventListener('change', function () { patchSettings(true); });
 
 // friendly turns a raw fetch error into a short user-facing message.
 function friendly(err) {

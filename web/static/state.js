@@ -74,6 +74,7 @@ export const els = {
   addTabs: $('addTabs'), addTabManual: $('addTabManual'), addTabXtream: $('addTabXtream'),
   xtreamPanel: $('xtreamPanel'),
   xtreamSavedWrap: $('xtreamSavedWrap'), xtreamSaved: $('xtreamSaved'), xtreamRefresh: $('xtreamRefresh'),
+  xtreamSettings: $('xtreamSettings'), xtreamUpdateFreq: $('xtreamUpdateFreq'), xtreamStreamType: $('xtreamStreamType'),
   xtreamName: $('xtreamName'), xtreamUser: $('xtreamUser'), xtreamPass: $('xtreamPass'), xtreamServer: $('xtreamServer'),
   xtreamError: $('xtreamError'), xtreamCancel: $('xtreamCancel'), xtreamSave: $('xtreamSave'),
   importBtn: $('importBtn'), importFile: $('importFile'), importModal: $('importModal'),

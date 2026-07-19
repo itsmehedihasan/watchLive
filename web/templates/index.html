@@ -260,6 +260,24 @@
             <select id="xtreamSaved" class="country-select"></select>
             <button type="button" id="xtreamRefresh" class="add-btn add-btn-ghost xtream-refresh" title="Re-fetch this playlist's live channels">Refresh</button>
           </div>
+          <div id="xtreamSettings" class="add-field xtream-settings" hidden>
+            <label class="xtream-setting-row">
+              <span>How often to update</span>
+              <select id="xtreamUpdateFreq" class="country-select">
+                <option value="manual">Manual</option>
+                <option value="daily">Everyday</option>
+                <option value="3days">Every 3 days</option>
+                <option value="weekly">Weekly</option>
+              </select>
+            </label>
+            <label class="xtream-setting-row">
+              <span>Stream type</span>
+              <select id="xtreamStreamType" class="country-select">
+                <option value="ts">MPEG-TS (ts)</option>
+                <option value="m3u8">HLS (m3u8)</option>
+              </select>
+            </label>
+          </div>
         </div>
 
         <div class="xtream-subhead">Add a playlist</div>
