@@ -1,6 +1,6 @@
 import { state, els, MAX_CELLS } from './state.js';
 import { addCell, updatePickLabels } from './grid.js';
-import { renderChannelList, beat } from './channels.js';
+import { renderChannelList } from './channels.js';
 import { updateHealthStatus, observeHealth, stopHealthPolling } from './health.js';
 import { updateRecordButton, restoreAudioPrefs } from './audio.js';
 import { renderPicker } from './picker.js';
@@ -67,8 +67,6 @@ export function init() {
   initPlaylistFilter();
   initSidebarTabs();
   pollSource();
-  beat();
-  setInterval(beat, 30000);
 
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('/static/sw.js').catch(function (err) { console.warn('SW registration failed:', err); });
