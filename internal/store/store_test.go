@@ -830,9 +830,10 @@ func TestPlaylistsDueForRefresh(t *testing.T) {
 		{ID: "wk-fresh", UpdateFreq: "weekly", LastRefreshedAt: nowUnix - 3*day}, // not due
 		{ID: "wk-due", UpdateFreq: "weekly", LastRefreshedAt: nowUnix - 8*day},   // due
 		{ID: "3d-due", UpdateFreq: "3days", LastRefreshedAt: nowUnix - 4*day},    // due
+		{ID: "exact", UpdateFreq: "daily", LastRefreshedAt: nowUnix - day}, // due at exactly the boundary
 	}
 	got := playlistsDueForRefresh(pls, nowUnix)
-	want := map[string]bool{"never": true, "stale": true, "wk-due": true, "3d-due": true}
+	want := map[string]bool{"never": true, "stale": true, "wk-due": true, "3d-due": true, "exact": true}
 	if len(got) != len(want) {
 		t.Fatalf("due = %v, want keys %v", got, want)
 	}
