@@ -1056,7 +1056,7 @@ func newMux(proxyHandler *proxy.Handler, viewerStore *viewers.Store, staticSub f
 		}
 		// Verify credentials before persisting anything, so a typo doesn't leave a
 		// dead playlist behind.
-		streams, err := xtream.LiveStreams(server, username, password)
+		streams, streamsRaw, err := xtream.LiveStreamsRaw(server, username, password)
 		if err != nil {
 			log.Printf("xtream: import %q: %v", name, err)
 			http.Error(w, "could not reach the panel or the credentials were rejected", http.StatusBadGateway)
@@ -1067,10 +1067,11 @@ func newMux(proxyHandler *proxy.Handler, viewerStore *viewers.Store, staticSub f
 			serverError(w, "api", err)
 			return
 		}
-		cats, err := xtream.LiveCategories(server, username, password)
+		cats, catsRaw, err := xtream.LiveCategoriesRaw(server, username, password)
 		if err != nil {
 			log.Printf("xtream: categories %q: %v (importing without groups)", name, err)
 			cats = nil
+			catsRaw = nil
 		}
 		added, _, err := importXtreamStreams(st, p, streams, cats)
 		if err != nil {
@@ -1082,7 +1083,15 @@ func newMux(proxyHandler *proxy.Handler, viewerStore *viewers.Store, staticSub f
 		}
 		channels.rebuild()
 		log.Printf("xtream: saved playlist %q (%s), imported %d channel(s)", name, p.ID, added)
-		writeJSON(w, r, map[string]any{"playlist": p, "imported": added})
+		writeJSON(w, r, map[string]any{
+			"playlist": p,
+			"imported": added,
+			"debug": map[string]any{
+				"login":      nil,
+				"categories": catsRaw,
+				"streams":    streamsRaw,
+			},
+		})
 	})
 
 	// List saved playlists (password omitted from the response), each carrying an
@@ -1112,16 +1121,17 @@ func newMux(proxyHandler *proxy.Handler, viewerStore *viewers.Store, staticSub f
 			serverError(w, "api", err)
 			return
 		}
-		streams, err := xtream.LiveStreams(p.Server, p.Username, p.Password)
+		streams, streamsRaw, err := xtream.LiveStreamsRaw(p.Server, p.Username, p.Password)
 		if err != nil {
 			log.Printf("xtream: refresh %q: %v", p.Name, err)
 			http.Error(w, "could not reach the panel or the credentials were rejected", http.StatusBadGateway)
 			return
 		}
-		cats, err := xtream.LiveCategories(p.Server, p.Username, p.Password)
+		cats, catsRaw, err := xtream.LiveCategoriesRaw(p.Server, p.Username, p.Password)
 		if err != nil {
 			log.Printf("xtream: categories %q: %v (refreshing without groups)", p.Name, err)
 			cats = nil
+			catsRaw = nil
 		}
 		added, updated, err := importXtreamStreams(st, p, streams, cats)
 		if err != nil {
@@ -1133,7 +1143,15 @@ func newMux(proxyHandler *proxy.Handler, viewerStore *viewers.Store, staticSub f
 		}
 		channels.rebuild()
 		log.Printf("xtream: refreshed %q (%s): +%d new, %d updated", p.Name, p.ID, added, updated)
-		writeJSON(w, r, map[string]int{"added": added, "updated": updated})
+		writeJSON(w, r, map[string]any{
+			"added":   added,
+			"updated": updated,
+			"debug": map[string]any{
+				"login":      nil, // refresh doesn't call LoginRaw separately; streams call logs in already
+				"categories": catsRaw,
+				"streams":    streamsRaw,
+			},
+		})
 	})
 
 	// Update a saved playlist's per-playlist settings (auto-refresh cadence and

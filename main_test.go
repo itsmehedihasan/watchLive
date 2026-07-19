@@ -412,6 +412,43 @@ func TestXtreamPlaylistHandlers(t *testing.T) {
 	}
 }
 
+func TestRefreshResponseIncludesDebugRaw(t *testing.T) {
+	mux, _, _ := testMux(t)
+	panel := xtreamPanel(t, `[{"stream_id":10,"name":"Alpha"}]`)
+
+	rec := do(t, mux, http.MethodPost, "/api/xtream/playlists",
+		`{"name":"P","server":"`+panel.URL+`","username":"u","password":"p"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("save: got %d body %s", rec.Code, rec.Body.String())
+	}
+	var saved struct {
+		Playlist store.XtreamPlaylist `json:"playlist"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &saved); err != nil {
+		t.Fatalf("decode save: %v", err)
+	}
+
+	rec = do(t, mux, http.MethodPost, "/api/xtream/playlists/"+saved.Playlist.ID+"/refresh", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("refresh: got %d body %s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Added   int `json:"added"`
+		Updated int `json:"updated"`
+		Debug   struct {
+			Login      json.RawMessage `json:"login"`
+			Categories json.RawMessage `json:"categories"`
+			Streams    json.RawMessage `json:"streams"`
+		} `json:"debug"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Debug.Streams) == 0 || string(resp.Debug.Streams) == "null" {
+		t.Fatalf("expected non-null debug.streams, got %q", resp.Debug.Streams)
+	}
+}
+
 func TestXtreamCreateRejectsBadInput(t *testing.T) {
 	mux, _, _ := testMux(t)
 	// Missing scheme on server.
