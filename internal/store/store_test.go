@@ -818,3 +818,27 @@ func TestXtreamChannelsSurvivePrune(t *testing.T) {
 		t.Errorf("xtream channel must survive prune, got %v", err)
 	}
 }
+
+func TestPlaylistsDueForRefresh(t *testing.T) {
+	const day = int64(24 * 3600)
+	nowUnix := int64(1_000_000)
+	pls := []XtreamPlaylist{
+		{ID: "manual", UpdateFreq: "manual", LastRefreshedAt: 0},          // never due
+		{ID: "never", UpdateFreq: "daily", LastRefreshedAt: 0},            // due (0 → always)
+		{ID: "fresh", UpdateFreq: "daily", LastRefreshedAt: nowUnix - 1},  // not due
+		{ID: "stale", UpdateFreq: "daily", LastRefreshedAt: nowUnix - 2*day}, // due
+		{ID: "wk-fresh", UpdateFreq: "weekly", LastRefreshedAt: nowUnix - 3*day}, // not due
+		{ID: "wk-due", UpdateFreq: "weekly", LastRefreshedAt: nowUnix - 8*day},   // due
+		{ID: "3d-due", UpdateFreq: "3days", LastRefreshedAt: nowUnix - 4*day},    // due
+	}
+	got := playlistsDueForRefresh(pls, nowUnix)
+	want := map[string]bool{"never": true, "stale": true, "wk-due": true, "3d-due": true}
+	if len(got) != len(want) {
+		t.Fatalf("due = %v, want keys %v", got, want)
+	}
+	for _, id := range got {
+		if !want[id] {
+			t.Errorf("unexpected due id %q", id)
+		}
+	}
+}

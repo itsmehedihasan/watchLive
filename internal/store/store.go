@@ -1331,3 +1331,36 @@ func manualHash(name, url string) string {
 	sum := sha256.Sum256([]byte(name + "||" + url))
 	return hex.EncodeToString(sum[:6]) // 12 hex chars
 }
+
+// refreshInterval maps an update_freq to its cadence in seconds. "manual" (and
+// any unknown value) returns 0, meaning "never auto-refresh".
+func refreshInterval(freq string) int64 {
+	switch freq {
+	case "daily":
+		return 24 * 3600
+	case "3days":
+		return 3 * 24 * 3600
+	case "weekly":
+		return 7 * 24 * 3600
+	default:
+		return 0
+	}
+}
+
+// playlistsDueForRefresh returns the ids of playlists whose auto-refresh cadence
+// has elapsed as of nowUnix. "manual" playlists are never due; a playlist that
+// has never been refreshed (LastRefreshedAt == 0) with a non-manual cadence is
+// always due.
+func playlistsDueForRefresh(playlists []XtreamPlaylist, nowUnix int64) []string {
+	var due []string
+	for _, p := range playlists {
+		interval := refreshInterval(p.UpdateFreq)
+		if interval == 0 {
+			continue
+		}
+		if nowUnix >= p.LastRefreshedAt+interval {
+			due = append(due, p.ID)
+		}
+	}
+	return due
+}
