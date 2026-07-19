@@ -620,6 +620,14 @@ input { font-family: inherit; }
 }
 .add-hint { font-weight: 500; opacity: .65; text-transform: none; }
 
+/* Per-playlist settings rows: label on the left, control on the right, one per line. */
+.xtream-settings { margin-top: 4px; }
+.xtream-setting-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+}
+.xtream-setting-row > span { flex-shrink: 0; }
+.xtream-setting-row .country-select { flex: 0 0 auto; max-width: 55%; }
+
 /* Stream-link row: the url input + a 3-dot toggle that reveals the license field. */
 .add-link-row { display: flex; align-items: stretch; gap: 8px; }
 .add-link-row input { flex: 1; min-width: 0; }
