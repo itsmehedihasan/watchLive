@@ -39,6 +39,9 @@ const (
 var (
 	ErrNotFound  = errors.New("channel not found")
 	ErrNotManual = errors.New("channel is not a manual entry")
+	// ErrInvalidSetting flags an UpdateXtreamSettings call with an out-of-range
+	// update_freq or stream_type value.
+	ErrInvalidSetting = errors.New("invalid xtream setting")
 )
 
 // now is a seam so tests can drive staleness deterministically.
@@ -69,12 +72,15 @@ CREATE INDEX IF NOT EXISTS idx_channels_checked ON channels(last_checked_at);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 
 CREATE TABLE IF NOT EXISTS xtream_playlists (
-    id         TEXT PRIMARY KEY,
-    name       TEXT NOT NULL,
-    server     TEXT NOT NULL,
-    username   TEXT NOT NULL,
-    password   TEXT NOT NULL,
-    created_at INTEGER NOT NULL
+    id                TEXT PRIMARY KEY,
+    name              TEXT NOT NULL,
+    server            TEXT NOT NULL,
+    username          TEXT NOT NULL,
+    password          TEXT NOT NULL,
+    created_at        INTEGER NOT NULL,
+    update_freq       TEXT NOT NULL DEFAULT 'manual',
+    stream_type       TEXT NOT NULL DEFAULT 'ts',
+    last_refreshed_at INTEGER NOT NULL DEFAULT 0
 );
 `
 
@@ -156,6 +162,19 @@ func Open(path string) (*Store, error) {
 		!strings.Contains(err.Error(), "duplicate column") {
 		db.Close()
 		return nil, fmt.Errorf("store: migrate cat_order: %w", err)
+	}
+	// Per-playlist settings added after the initial xtream_playlists table, same
+	// duplicate-column tolerance as above.
+	for _, col := range []struct{ name, def string }{
+		{"update_freq", `TEXT NOT NULL DEFAULT 'manual'`},
+		{"stream_type", `TEXT NOT NULL DEFAULT 'ts'`},
+		{"last_refreshed_at", `INTEGER NOT NULL DEFAULT 0`},
+	} {
+		if _, err := db.Exec(`ALTER TABLE xtream_playlists ADD COLUMN ` + col.name + ` ` + col.def); err != nil &&
+			!strings.Contains(err.Error(), "duplicate column") {
+			db.Close()
+			return nil, fmt.Errorf("store: migrate %s: %w", col.name, err)
+		}
 	}
 	return &Store{db: db}, nil
 }
@@ -1071,6 +1090,12 @@ type XtreamPlaylist struct {
 	Username  string `json:"username"`
 	Password  string `json:"-"`
 	CreatedAt int64  `json:"created_at"`
+	// UpdateFreq is the auto-refresh cadence: "manual" | "daily" | "3days" |
+	// "weekly". StreamType is the extension used to build stream URLs: "ts" |
+	// "m3u8". LastRefreshedAt (unix seconds) drives the startup interval sweep.
+	UpdateFreq      string `json:"update_freq"`
+	StreamType      string `json:"stream_type"`
+	LastRefreshedAt int64  `json:"-"`
 	// Imported reports whether any channel row already references this playlist;
 	// populated by ListXtreamPlaylists, false elsewhere.
 	Imported bool `json:"imported"`
@@ -1112,6 +1137,10 @@ func (s *Store) SaveXtreamPlaylist(name, server, username, password string) (Xtr
 	if err != nil {
 		return XtreamPlaylist{}, err
 	}
+	// Matches the SQL column defaults so the returned value is accurate without
+	// a round-trip read.
+	p.UpdateFreq = "manual"
+	p.StreamType = "ts"
 	return p, nil
 }
 
@@ -1124,7 +1153,7 @@ func (s *Store) ListXtreamPlaylists() ([]XtreamPlaylist, error) {
 		return nil, err
 	}
 	rows, err := s.db.Query(`
-		SELECT id, name, server, username, password, created_at
+		SELECT id, name, server, username, password, created_at, update_freq, stream_type, last_refreshed_at
 		FROM xtream_playlists ORDER BY created_at DESC, name`)
 	if err != nil {
 		return nil, err
@@ -1133,7 +1162,7 @@ func (s *Store) ListXtreamPlaylists() ([]XtreamPlaylist, error) {
 	var out []XtreamPlaylist
 	for rows.Next() {
 		var p XtreamPlaylist
-		if err := rows.Scan(&p.ID, &p.Name, &p.Server, &p.Username, &p.Password, &p.CreatedAt); err != nil {
+		if err := rows.Scan(&p.ID, &p.Name, &p.Server, &p.Username, &p.Password, &p.CreatedAt, &p.UpdateFreq, &p.StreamType, &p.LastRefreshedAt); err != nil {
 			return nil, err
 		}
 		p.Imported = imported[p.ID]
@@ -1166,13 +1195,42 @@ func (s *Store) importedPlaylistIDs() (map[string]bool, error) {
 func (s *Store) GetXtreamPlaylist(id string) (XtreamPlaylist, error) {
 	var p XtreamPlaylist
 	err := s.db.QueryRow(`
-		SELECT id, name, server, username, password, created_at
+		SELECT id, name, server, username, password, created_at, update_freq, stream_type, last_refreshed_at
 		FROM xtream_playlists WHERE id=?`, id).
-		Scan(&p.ID, &p.Name, &p.Server, &p.Username, &p.Password, &p.CreatedAt)
+		Scan(&p.ID, &p.Name, &p.Server, &p.Username, &p.Password, &p.CreatedAt, &p.UpdateFreq, &p.StreamType, &p.LastRefreshedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return XtreamPlaylist{}, ErrNotFound
 	}
 	return p, err
+}
+
+// validUpdateFreq / validStreamType are the accepted setting values.
+var validUpdateFreq = map[string]bool{"manual": true, "daily": true, "3days": true, "weekly": true}
+var validStreamType = map[string]bool{"ts": true, "m3u8": true}
+
+// UpdateXtreamSettings validates and persists a playlist's auto-refresh cadence
+// and stream type, returning the updated playlist. ErrInvalidSetting on a bad
+// value; ErrNotFound if no such playlist.
+func (s *Store) UpdateXtreamSettings(id, updateFreq, streamType string) (XtreamPlaylist, error) {
+	if !validUpdateFreq[updateFreq] || !validStreamType[streamType] {
+		return XtreamPlaylist{}, ErrInvalidSetting
+	}
+	res, err := s.db.Exec(`UPDATE xtream_playlists SET update_freq=?, stream_type=? WHERE id=?`,
+		updateFreq, streamType, id)
+	if err != nil {
+		return XtreamPlaylist{}, err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return XtreamPlaylist{}, ErrNotFound
+	}
+	return s.GetXtreamPlaylist(id)
+}
+
+// StampXtreamRefreshed records that a playlist was just refreshed, so the
+// startup interval sweep can tell when it is next due.
+func (s *Store) StampXtreamRefreshed(id string) error {
+	_, err := s.db.Exec(`UPDATE xtream_playlists SET last_refreshed_at=? WHERE id=?`, now().Unix(), id)
+	return err
 }
 
 // UpsertXtreamChannels imports (or refreshes) a playlist's live channels in one

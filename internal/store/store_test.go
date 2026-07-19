@@ -654,6 +654,44 @@ func TestXtreamPlaylistCRUD(t *testing.T) {
 	}
 }
 
+func TestUpdateXtreamSettings(t *testing.T) {
+	s := open(t)
+	p, err := s.SaveXtreamPlaylist("KS", "http://p:8080", "u", "pw")
+	if err != nil {
+		t.Fatalf("SaveXtreamPlaylist: %v", err)
+	}
+	// Defaults on a fresh row.
+	if p.UpdateFreq != "manual" || p.StreamType != "ts" {
+		t.Fatalf("defaults = {%q %q}, want {manual ts}", p.UpdateFreq, p.StreamType)
+	}
+	got, err := s.UpdateXtreamSettings(p.ID, "weekly", "m3u8")
+	if err != nil {
+		t.Fatalf("UpdateXtreamSettings: %v", err)
+	}
+	if got.UpdateFreq != "weekly" || got.StreamType != "m3u8" {
+		t.Errorf("updated = {%q %q}, want {weekly m3u8}", got.UpdateFreq, got.StreamType)
+	}
+	// Persisted across a re-read.
+	list, _ := s.ListXtreamPlaylists()
+	if len(list) != 1 || list[0].UpdateFreq != "weekly" || list[0].StreamType != "m3u8" {
+		t.Errorf("reloaded = %+v", list)
+	}
+}
+
+func TestUpdateXtreamSettingsInvalid(t *testing.T) {
+	s := open(t)
+	p, _ := s.SaveXtreamPlaylist("KS", "http://p:8080", "u", "pw")
+	if _, err := s.UpdateXtreamSettings(p.ID, "hourly", "ts"); !errors.Is(err, ErrInvalidSetting) {
+		t.Errorf("bad freq err = %v, want ErrInvalidSetting", err)
+	}
+	if _, err := s.UpdateXtreamSettings(p.ID, "manual", "rtmp"); !errors.Is(err, ErrInvalidSetting) {
+		t.Errorf("bad stream type err = %v, want ErrInvalidSetting", err)
+	}
+	if _, err := s.UpdateXtreamSettings("nope", "manual", "ts"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("unknown id err = %v, want ErrNotFound", err)
+	}
+}
+
 func TestUpsertXtreamChannels(t *testing.T) {
 	s := open(t)
 	p, _ := s.SaveXtreamPlaylist("Panel", "http://p", "u", "pw")
