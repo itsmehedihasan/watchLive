@@ -115,6 +115,30 @@ type rawStream struct {
 	Extension  string       `json:"container_extension"`
 }
 
+// Category is one live-stream category as returned by get_live_categories.
+// ID is decoded via flexString so a numeric or quoted id both land as a string
+// (it is only ever matched against Stream.CategoryID, itself a string).
+type Category struct {
+	ID   string `json:"category_id"`
+	Name string `json:"category_name"`
+}
+
+// rawCategory is the wire shape; category_id may arrive as a number or a quoted
+// string, so it is decoded tolerantly then copied into the exported Category.
+type rawCategory struct {
+	ID   flexString `json:"category_id"`
+	Name string     `json:"category_name"`
+}
+
+// flexString decodes a JSON value that a panel might send as either a number or
+// a quoted string into its string form.
+type flexString string
+
+func (f *flexString) UnmarshalJSON(b []byte) error {
+	*f = flexString(strings.Trim(string(b), `"`))
+	return nil
+}
+
 // NormalizeServer trims a trailing slash and surrounding whitespace. It does NOT
 // add or guess a scheme or port — the caller is required to supply an explicit
 // http:// or https:// (and a port when non-default). Returns the cleaned value.
@@ -185,6 +209,33 @@ func LiveStreams(server, username, password string) ([]Stream, error) {
 			CategoryID: r.CategoryID,
 			Extension:  r.Extension,
 		})
+	}
+	return out, nil
+}
+
+// LiveCategories authenticates and returns the panel's live-stream categories in
+// the order the panel lists them (used to preserve group ordering on import).
+// Auth is verified first so bad credentials surface as ErrAuth, not an empty
+// list. Missing/extra fields are tolerated.
+func LiveCategories(server, username, password string) ([]Category, error) {
+	if _, _, err := Login(server, username, password); err != nil {
+		return nil, err
+	}
+	u := playerAPI(server, username, password, url.Values{"action": {"get_live_categories"}})
+	body, status, err := get(u)
+	if err != nil {
+		return nil, fmt.Errorf("xtream: live categories: %w", err)
+	}
+	if status < 200 || status >= 300 {
+		return nil, fmt.Errorf("xtream: live categories: panel returned status %d", status)
+	}
+	var raw []rawCategory
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, fmt.Errorf("xtream: live categories: decode: %w", err)
+	}
+	out := make([]Category, 0, len(raw))
+	for _, r := range raw {
+		out = append(out, Category{ID: string(r.ID), Name: strings.TrimSpace(r.Name)})
 	}
 	return out, nil
 }
