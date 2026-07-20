@@ -597,6 +597,65 @@ func TestUpdatePlaylistFieldsInvalid(t *testing.T) {
 	}
 }
 
+func TestDeleteXtreamPlaylist(t *testing.T) {
+	s := open(t)
+	p, err := s.SaveXtreamPlaylist("Panel", "http://p", "u", "pw")
+	if err != nil {
+		t.Fatalf("SaveXtreamPlaylist: %v", err)
+	}
+	other, err := s.SaveXtreamPlaylist("Other Panel", "http://q", "u2", "pw2")
+	if err != nil {
+		t.Fatalf("SaveXtreamPlaylist (other): %v", err)
+	}
+
+	streams := []XtreamStream{
+		{StreamID: 1, Name: "A", URL: "http://p/live/u/pw/1.ts"},
+		{StreamID: 2, Name: "B", URL: "http://p/live/u/pw/2.ts"},
+	}
+	if _, _, err := s.UpsertXtreamChannels(p.ID, streams); err != nil {
+		t.Fatalf("UpsertXtreamChannels: %v", err)
+	}
+	otherStreams := []XtreamStream{
+		{StreamID: 9, Name: "C", URL: "http://q/live/u2/pw2/9.ts"},
+	}
+	if _, _, err := s.UpsertXtreamChannels(other.ID, otherStreams); err != nil {
+		t.Fatalf("UpsertXtreamChannels (other): %v", err)
+	}
+
+	// Favourite one of p's channels — DeleteXtreamPlaylist must still remove it.
+	if ok, _ := s.SetFavourite("xtream:"+p.ID+":1", true); !ok {
+		t.Fatal("SetFavourite should report ok")
+	}
+
+	n, err := s.DeleteXtreamPlaylist(p.ID)
+	if err != nil {
+		t.Fatalf("DeleteXtreamPlaylist: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("channelsDeleted = %d, want 2", n)
+	}
+
+	if _, err := s.GetXtreamPlaylist(p.ID); !errors.Is(err, ErrNotFound) {
+		t.Errorf("playlist should be gone, err = %v", err)
+	}
+
+	chans, _ := s.ListChannels()
+	ids := map[string]bool{}
+	for _, c := range chans {
+		ids[c.ID] = true
+	}
+	if ids["xtream:"+p.ID+":1"] || ids["xtream:"+p.ID+":2"] {
+		t.Error("deleted playlist's channels (incl. favourited) must be gone")
+	}
+	if !ids["xtream:"+other.ID+":9"] {
+		t.Error("other playlist's channel must survive")
+	}
+
+	if _, err := s.DeleteXtreamPlaylist("nope"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("unknown id err = %v, want ErrNotFound", err)
+	}
+}
+
 func TestUpsertXtreamChannels(t *testing.T) {
 	s := open(t)
 	p, _ := s.SaveXtreamPlaylist("Panel", "http://p", "u", "pw")

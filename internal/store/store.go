@@ -844,6 +844,43 @@ func (s *Store) UpdatePlaylistFields(id string, name, updateFreq, streamType *st
 	return s.GetXtreamPlaylist(id)
 }
 
+// DeleteXtreamPlaylist removes one saved Xtream playlist together with every
+// channel it imported — favourited or not, since the playlist is going away
+// and its channels can no longer be refreshed. Both deletes run in one
+// transaction. ErrNotFound when the id matches no saved playlist. Returns the
+// channel-delete count (the playlist itself is always exactly one row).
+func (s *Store) DeleteXtreamPlaylist(id string) (channelsDeleted int, err error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer func() {
+		if err != nil {
+			tx.Rollback()
+		}
+	}()
+
+	res, err := tx.Exec(`DELETE FROM channels WHERE xtream_playlist_id = ?`, id)
+	if err != nil {
+		return 0, err
+	}
+	cn, _ := res.RowsAffected()
+
+	res, err = tx.Exec(`DELETE FROM xtream_playlists WHERE id = ?`, id)
+	if err != nil {
+		return 0, err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		err = ErrNotFound
+		return 0, err
+	}
+
+	if err = tx.Commit(); err != nil {
+		return 0, err
+	}
+	return int(cn), nil
+}
+
 // StampXtreamRefreshed records that a playlist was just refreshed, so the
 // startup interval sweep can tell when it is next due.
 func (s *Store) StampXtreamRefreshed(id string) error {
