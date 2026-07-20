@@ -217,6 +217,7 @@
       <div id="addTabs" class="add-tabs">
         <button type="button" id="addTabManual" class="add-tab active" data-tab="manual">Manual</button>
         <button type="button" id="addTabXtream" class="add-tab" data-tab="xtream">Xtream Codes</button>
+        <button type="button" id="addTabPlaylist" class="add-tab" data-tab="playlist">Playlist</button>
       </div>
 
       <!-- Tab 1 — Manual: today's add-a-channel form, unchanged behavior. -->
@@ -303,6 +304,14 @@
           <button type="button" id="xtreamCancel" class="add-btn add-btn-ghost">Cancel</button>
           <button type="button" id="xtreamSave" class="add-btn add-btn-primary">Save &amp; Import</button>
         </div>
+      </div>
+
+      <!-- Tab 3 — Playlist: manage already-saved Xtream playlists (rename,
+           stream type, delete). Adding a playlist stays on the Xtream Codes
+           tab; this tab is management-only. -->
+      <div id="playlistPanel" class="add-form add-tab-panel" data-tab="playlist" hidden>
+        <div id="playlistList" class="playlist-list"></div>
+        <p id="playlistEmpty" class="add-hint" hidden>No saved playlists yet — add one from the Xtream Codes tab.</p>
       </div>
     </div>
   </div>

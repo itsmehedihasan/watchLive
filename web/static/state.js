@@ -69,6 +69,8 @@ export const els = {
   addChannelClose: $('addChannelClose'), addChannelCancel: $('addChannelCancel'),
   addChannelSave: $('addChannelSave'),
   addTabs: $('addTabs'), addTabManual: $('addTabManual'), addTabXtream: $('addTabXtream'),
+  addTabPlaylist: $('addTabPlaylist'),
+  playlistPanel: $('playlistPanel'), playlistList: $('playlistList'), playlistEmpty: $('playlistEmpty'),
   xtreamPanel: $('xtreamPanel'),
   xtreamSavedWrap: $('xtreamSavedWrap'), xtreamSaved: $('xtreamSaved'), xtreamRefresh: $('xtreamRefresh'),
   xtreamSettings: $('xtreamSettings'), xtreamUpdateFreq: $('xtreamUpdateFreq'), xtreamStreamType: $('xtreamStreamType'),

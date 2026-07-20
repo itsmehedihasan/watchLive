@@ -767,3 +767,35 @@ input { font-family: inherit; }
   }
   .grid[data-count="3"] .cell:nth-child(3) { grid-column: auto; }
 }
+
+.playlist-list { display: flex; flex-direction: column; gap: 8px; }
+.playlist-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.playlist-row-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: text;
+  font-weight: 600;
+}
+.playlist-row-name-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  font: inherit;
+  font-weight: 600;
+  background: var(--input-bg);
+  color: #fff;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 2px 6px;
+}
+.playlist-row-type { flex: 0 0 auto; }
+.playlist-row-remove { flex: 0 0 auto; }
