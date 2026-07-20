@@ -1065,26 +1065,29 @@ func newMux(proxyHandler *proxy.Handler, staticSub fs.FS, channels *channelStore
 		})
 	})
 
-	// Update a saved playlist's per-playlist settings (auto-refresh cadence and
-	// stream type). Applying a new stream type takes effect on the next refresh;
-	// this endpoint only persists the choice.
+	// Update a saved playlist's fields. Each of name/update_freq/stream_type is
+	// optional — only fields present in the JSON body are validated and
+	// changed, letting the Playlist tab update one field (e.g. just the name)
+	// without resending the others. Applying a new stream type takes effect on
+	// the next refresh; this endpoint only persists the choice.
 	mux.HandleFunc("PATCH /api/xtream/playlists/{id}", func(w http.ResponseWriter, r *http.Request) {
 		id := r.PathValue("id")
 		var body struct {
-			UpdateFreq string `json:"update_freq"`
-			StreamType string `json:"stream_type"`
+			Name       *string `json:"name"`
+			UpdateFreq *string `json:"update_freq"`
+			StreamType *string `json:"stream_type"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
 		}
-		p, err := st.UpdatePlaylistFields(id, nil, &body.UpdateFreq, &body.StreamType)
+		p, err := st.UpdatePlaylistFields(id, body.Name, body.UpdateFreq, body.StreamType)
 		if errors.Is(err, store.ErrNotFound) {
 			http.Error(w, "playlist not found", http.StatusNotFound)
 			return
 		}
 		if errors.Is(err, store.ErrInvalidSetting) {
-			http.Error(w, "update_freq must be manual/daily/3days/weekly and stream_type ts/m3u8", http.StatusBadRequest)
+			http.Error(w, "name must be non-blank, update_freq must be manual/daily/3days/weekly, and stream_type ts/m3u8", http.StatusBadRequest)
 			return
 		}
 		if err != nil {
@@ -1092,6 +1095,25 @@ func newMux(proxyHandler *proxy.Handler, staticSub fs.FS, channels *channelStore
 			return
 		}
 		writeJSON(w, r, p)
+	})
+
+	// Remove a saved playlist along with every channel it imported. Local
+	// single-user app, DB restorable from backup: a plain browser confirm() is
+	// the only guard, no typed-confirmation ceremony.
+	mux.HandleFunc("DELETE /api/xtream/playlists/{id}", func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("id")
+		deleted, err := st.DeleteXtreamPlaylist(id)
+		if errors.Is(err, store.ErrNotFound) {
+			http.Error(w, "playlist not found", http.StatusNotFound)
+			return
+		}
+		if err != nil {
+			serverError(w, "api", err)
+			return
+		}
+		channels.rebuild()
+		log.Printf("xtream: removed playlist %s, deleted %d channel(s)", id, deleted)
+		writeJSON(w, r, map[string]int{"deleted": deleted})
 	})
 
 	mux.HandleFunc("GET /api/keys", func(w http.ResponseWriter, r *http.Request) {

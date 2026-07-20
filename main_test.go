@@ -410,6 +410,88 @@ func TestXtreamPlaylistHandlers(t *testing.T) {
 	}
 }
 
+func TestXtreamPlaylistPatchAndDelete(t *testing.T) {
+	mux, _, st := testMux(t)
+	panel := xtreamPanel(t, `[{"stream_id":10,"name":"Alpha"}]`)
+
+	rec := do(t, mux, http.MethodPost, "/api/xtream/playlists",
+		`{"name":"Panel","server":"`+panel.URL+`","username":"u","password":"p"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("create: got %d body %s", rec.Code, rec.Body.String())
+	}
+	var created struct {
+		Playlist store.XtreamPlaylist `json:"playlist"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode create: %v", err)
+	}
+	id := created.Playlist.ID
+
+	// PATCH with only stream_type: name must be untouched.
+	rec = do(t, mux, http.MethodPatch, "/api/xtream/playlists/"+id, `{"stream_type":"m3u8"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("patch stream_type: got %d body %s", rec.Code, rec.Body.String())
+	}
+	var p1 store.XtreamPlaylist
+	if err := json.Unmarshal(rec.Body.Bytes(), &p1); err != nil {
+		t.Fatalf("decode patch1: %v", err)
+	}
+	if p1.Name != "Panel" || p1.StreamType != "m3u8" || p1.UpdateFreq != "manual" {
+		t.Errorf("after stream_type-only patch = %+v, want name=Panel stream_type=m3u8 update_freq=manual", p1)
+	}
+
+	// PATCH with only name: stream_type must stay from the previous patch.
+	rec = do(t, mux, http.MethodPatch, "/api/xtream/playlists/"+id, `{"name":"Renamed"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("patch name: got %d body %s", rec.Code, rec.Body.String())
+	}
+	var p2 store.XtreamPlaylist
+	if err := json.Unmarshal(rec.Body.Bytes(), &p2); err != nil {
+		t.Fatalf("decode patch2: %v", err)
+	}
+	if p2.Name != "Renamed" || p2.StreamType != "m3u8" {
+		t.Errorf("after name-only patch = %+v, want name=Renamed stream_type=m3u8", p2)
+	}
+
+	// PATCH with a blank name is rejected.
+	rec = do(t, mux, http.MethodPatch, "/api/xtream/playlists/"+id, `{"name":"   "}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("patch blank name: got %d, want 400", rec.Code)
+	}
+
+	// PATCH of an unknown id is 404.
+	if rec := do(t, mux, http.MethodPatch, "/api/xtream/playlists/nope", `{"name":"X"}`); rec.Code != http.StatusNotFound {
+		t.Errorf("patch unknown: got %d, want 404", rec.Code)
+	}
+
+	// The imported channel is present before delete.
+	findChannel(t, st, "xtream:"+id+":10")
+
+	// DELETE removes the playlist and its channel.
+	rec = do(t, mux, http.MethodDelete, "/api/xtream/playlists/"+id, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("delete: got %d body %s", rec.Code, rec.Body.String())
+	}
+	var delResp struct{ Deleted int }
+	if err := json.Unmarshal(rec.Body.Bytes(), &delResp); err != nil {
+		t.Fatalf("decode delete: %v", err)
+	}
+	if delResp.Deleted != 1 {
+		t.Errorf("deleted = %d, want 1", delResp.Deleted)
+	}
+	chans, _ := st.ListChannels()
+	for _, c := range chans {
+		if c.ID == "xtream:"+id+":10" {
+			t.Error("channel should have been deleted along with its playlist")
+		}
+	}
+
+	// DELETE of an unknown id is 404.
+	if rec := do(t, mux, http.MethodDelete, "/api/xtream/playlists/"+id, ""); rec.Code != http.StatusNotFound {
+		t.Errorf("delete already-removed: got %d, want 404", rec.Code)
+	}
+}
+
 func TestRefreshResponseIncludesDebugRaw(t *testing.T) {
 	mux, _, _ := testMux(t)
 	panel := xtreamPanel(t, `[{"stream_id":10,"name":"Alpha"}]`)
