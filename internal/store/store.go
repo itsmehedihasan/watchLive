@@ -794,15 +794,16 @@ func (s *Store) GetXtreamPlaylist(id string) (XtreamPlaylist, error) {
 var validUpdateFreq = map[string]bool{"manual": true, "daily": true, "3days": true, "weekly": true}
 var validStreamType = map[string]bool{"ts": true, "m3u8": true}
 
-// UpdatePlaylistFields partially updates a saved playlist: name, update_freq
-// and stream_type are each optional (nil leaves that column untouched),
-// letting the Playlist management tab change one field at a time without
-// resending the others. A nil name is "don't touch"; a non-nil name must be
-// non-blank after trimming. updateFreq/streamType, if provided, are validated
-// against the existing enums. Passing all three as nil is a no-op read of the
+// UpdatePlaylistFields partially updates a saved playlist: name, server,
+// update_freq and stream_type are each optional (nil leaves that column
+// untouched), letting the Playlist management tab change one field at a time
+// without resending the others. A nil name/server is "don't touch"; a non-nil
+// name or server must be non-blank after trimming (server URL format is
+// validated by the caller). updateFreq/streamType, if provided, are validated
+// against the existing enums. Passing all as nil is a no-op read of the
 // current row. ErrInvalidSetting on a bad or blank value; ErrNotFound if no
 // such playlist.
-func (s *Store) UpdatePlaylistFields(id string, name, updateFreq, streamType *string) (XtreamPlaylist, error) {
+func (s *Store) UpdatePlaylistFields(id string, name, server, updateFreq, streamType *string) (XtreamPlaylist, error) {
 	var sets []string
 	var args []any
 
@@ -812,6 +813,14 @@ func (s *Store) UpdatePlaylistFields(id string, name, updateFreq, streamType *st
 			return XtreamPlaylist{}, ErrInvalidSetting
 		}
 		sets = append(sets, "name=?")
+		args = append(args, trimmed)
+	}
+	if server != nil {
+		trimmed := strings.TrimSpace(*server)
+		if trimmed == "" {
+			return XtreamPlaylist{}, ErrInvalidSetting
+		}
+		sets = append(sets, "server=?")
 		args = append(args, trimmed)
 	}
 	if updateFreq != nil {

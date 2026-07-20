@@ -53,6 +53,12 @@ input { font-family: inherit; }
   overflow-y: auto;
   z-index: 30;
 }
+.rail-logo {
+  flex-shrink: 0;
+  width: 32px; height: 32px;
+  border-radius: 8px;
+  object-fit: contain;
+}
 .rail-section {
   width: 100%;
   display: flex; flex-direction: column; align-items: center; gap: 8px;
@@ -585,8 +591,35 @@ input { font-family: inherit; }
 }
 
 /* ── Add-channel modal ──────────────────────────────────────── */
-.add-panel { width: 400px; }
+.add-panel {
+  width: 500px; max-width: 100%;
+  min-height: 350px; max-height: 700px;
+  overflow-y: auto;
+}
 .add-form { display: flex; flex-direction: column; gap: 14px; padding: 18px 16px; }
+
+/* Channel List tab — read-only channel/address list. */
+.channel-addr-list { display: flex; flex-direction: column; gap: 8px; }
+.channel-addr-row {
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.channel-addr-name {     
+  font-weight: 500;
+    margin-bottom: 6px;
+    font-size: 12px; }
+.channel-addr-url {
+  font-size: 12px; line-height: 1.4;
+  color: var(--muted, #9aa3b2);
+  word-break: break-all;          /* long URLs wrap rather than scroll */
+  cursor: pointer;
+  transition: color .15s;
+
+  &:hover { color: var(--fg); }
+  &.copied { color: var(--blue-light); font-weight: 600; }
+  & + & { margin-top: 4px; }      /* space between multiple addresses */
+}
 
 /* Tab bar at the top of the add modal (Manual / Xtream Codes). */
 .add-tabs { display: flex; gap: 4px; padding: 10px 16px 0; border-bottom: 1px solid var(--border-dim); }
@@ -771,11 +804,23 @@ input { font-family: inherit; }
 .playlist-list { display: flex; flex-direction: column; gap: 8px; }
 .playlist-row {
   display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 8px 10px;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
   border: 1px solid var(--border);
   border-radius: 8px;
+}
+/* Row 1: name, full width. */
+.playlist-row-line1 {
+  display: flex;
+  min-width: 0;
+}
+/* Row 2: server (70%) · type (20%) · delete (10%). */
+.playlist-row-line2 {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
 }
 .playlist-row-name {
   flex: 1 1 auto;
@@ -785,17 +830,56 @@ input { font-family: inherit; }
   white-space: nowrap;
   cursor: text;
   font-weight: 600;
+  border: 1px solid;
+    border-radius: 6px;
+    padding: 5px 6px;
+}
+.playlist-row-server {
+flex: 1 0 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: text;
+  color: var(--muted, #9aa3b2);
+  font-size: 12px;
+  border: 1px solid;
+    border-radius: 6px;
+    padding: 5px 6px;
 }
 .playlist-row-name-input {
-  flex: 1 1 auto;
-  min-width: 0;
+  flex: 1;
+  min-width: 100%;
   font: inherit;
-  font-weight: 600;
   background: var(--input-bg);
   color: #fff;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 2px 6px;
+border: 1px solid;
+    border-radius: 6px;
+    padding: 5px 6px;
 }
-.playlist-row-type { flex: 0 0 auto; }
-.playlist-row-remove { flex: 0 0 auto; }
+.playlist-row-name-input { font-weight: 600; }
+.playlist-row-server-input { flex: 1; font-size: 12px; background: transparent}
+.playlist-row-type {
+  flex: 0 0 auto;
+  min-width: 0;
+  width: auto;
+  padding: 6px 10px;
+  font-size: 12px;
+}
+.playlist-row-remove {
+  flex: 0 0 10%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 6px;
+  color: #f87171;
+  border-color: #ef4444;
+}
+.playlist-row-remove svg {
+  display: block;
+}
+.playlist-row-remove:hover {
+  color: #fff;
+  background: #ef4444;
+  border-color: #ef4444;
+}

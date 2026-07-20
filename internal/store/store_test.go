@@ -537,7 +537,7 @@ func TestUpdatePlaylistFields(t *testing.T) {
 	}
 
 	// Update only stream_type; name and update_freq must be untouched.
-	got, err := s.UpdatePlaylistFields(p.ID, nil, nil, strp("m3u8"))
+	got, err := s.UpdatePlaylistFields(p.ID, nil, nil, nil, strp("m3u8"))
 	if err != nil {
 		t.Fatalf("UpdatePlaylistFields (stream_type only): %v", err)
 	}
@@ -546,7 +546,7 @@ func TestUpdatePlaylistFields(t *testing.T) {
 	}
 
 	// Update only update_freq; name and stream_type must be untouched.
-	got, err = s.UpdatePlaylistFields(p.ID, nil, strp("weekly"), nil)
+	got, err = s.UpdatePlaylistFields(p.ID, nil, nil, strp("weekly"), nil)
 	if err != nil {
 		t.Fatalf("UpdatePlaylistFields (update_freq only): %v", err)
 	}
@@ -554,23 +554,32 @@ func TestUpdatePlaylistFields(t *testing.T) {
 		t.Errorf("after update_freq-only update = %+v, want name=KS update_freq=weekly stream_type=m3u8", got)
 	}
 
+	// Update only server; everything else must be untouched.
+	got, err = s.UpdatePlaylistFields(p.ID, nil, strp("http://new:9090"), nil, nil)
+	if err != nil {
+		t.Fatalf("UpdatePlaylistFields (server only): %v", err)
+	}
+	if got.Server != "http://new:9090" || got.Name != "KS" || got.UpdateFreq != "weekly" || got.StreamType != "m3u8" {
+		t.Errorf("after server-only update = %+v, want server=http://new:9090 name=KS update_freq=weekly stream_type=m3u8", got)
+	}
+
 	// Update only name; settings must be untouched.
-	got, err = s.UpdatePlaylistFields(p.ID, strp("Renamed"), nil, nil)
+	got, err = s.UpdatePlaylistFields(p.ID, strp("Renamed"), nil, nil, nil)
 	if err != nil {
 		t.Fatalf("UpdatePlaylistFields (name only): %v", err)
 	}
-	if got.Name != "Renamed" || got.UpdateFreq != "weekly" || got.StreamType != "m3u8" {
-		t.Errorf("after name-only update = %+v, want name=Renamed update_freq=weekly stream_type=m3u8", got)
+	if got.Name != "Renamed" || got.Server != "http://new:9090" || got.UpdateFreq != "weekly" || got.StreamType != "m3u8" {
+		t.Errorf("after name-only update = %+v, want name=Renamed server=http://new:9090 update_freq=weekly stream_type=m3u8", got)
 	}
 
 	// Persisted across a re-read.
 	list, _ := s.ListXtreamPlaylists()
-	if len(list) != 1 || list[0].Name != "Renamed" || list[0].UpdateFreq != "weekly" || list[0].StreamType != "m3u8" {
+	if len(list) != 1 || list[0].Name != "Renamed" || list[0].Server != "http://new:9090" || list[0].UpdateFreq != "weekly" || list[0].StreamType != "m3u8" {
 		t.Errorf("reloaded = %+v", list)
 	}
 
 	// All-nil is a no-op read, not an error.
-	got, err = s.UpdatePlaylistFields(p.ID, nil, nil, nil)
+	got, err = s.UpdatePlaylistFields(p.ID, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("UpdatePlaylistFields (no-op): %v", err)
 	}
@@ -583,16 +592,19 @@ func TestUpdatePlaylistFieldsInvalid(t *testing.T) {
 	s := open(t)
 	p, _ := s.SaveXtreamPlaylist("KS", "http://p:8080", "u", "pw")
 
-	if _, err := s.UpdatePlaylistFields(p.ID, nil, strp("hourly"), nil); !errors.Is(err, ErrInvalidSetting) {
+	if _, err := s.UpdatePlaylistFields(p.ID, nil, nil, strp("hourly"), nil); !errors.Is(err, ErrInvalidSetting) {
 		t.Errorf("bad freq err = %v, want ErrInvalidSetting", err)
 	}
-	if _, err := s.UpdatePlaylistFields(p.ID, nil, nil, strp("rtmp")); !errors.Is(err, ErrInvalidSetting) {
+	if _, err := s.UpdatePlaylistFields(p.ID, nil, nil, nil, strp("rtmp")); !errors.Is(err, ErrInvalidSetting) {
 		t.Errorf("bad stream type err = %v, want ErrInvalidSetting", err)
 	}
-	if _, err := s.UpdatePlaylistFields(p.ID, strp("  "), nil, nil); !errors.Is(err, ErrInvalidSetting) {
+	if _, err := s.UpdatePlaylistFields(p.ID, strp("  "), nil, nil, nil); !errors.Is(err, ErrInvalidSetting) {
 		t.Errorf("blank name err = %v, want ErrInvalidSetting", err)
 	}
-	if _, err := s.UpdatePlaylistFields("nope", nil, strp("manual"), nil); !errors.Is(err, ErrNotFound) {
+	if _, err := s.UpdatePlaylistFields(p.ID, nil, strp("  "), nil, nil); !errors.Is(err, ErrInvalidSetting) {
+		t.Errorf("blank server err = %v, want ErrInvalidSetting", err)
+	}
+	if _, err := s.UpdatePlaylistFields("nope", nil, nil, strp("manual"), nil); !errors.Is(err, ErrNotFound) {
 		t.Errorf("unknown id err = %v, want ErrNotFound", err)
 	}
 }

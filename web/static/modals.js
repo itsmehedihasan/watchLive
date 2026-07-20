@@ -2,6 +2,7 @@ import { state, els } from './state.js';
 import { loadKeys, loadChannels } from './init.js';
 import { initXtreamTab, resetXtreamTab } from './xtream.js';
 import { initPlaylistTab } from './playlist-tab.js';
+import { initChannelListTab } from './channel-list-tab.js';
 
 function maybeHideScrim() {
   const anyOpen = els.sidebar.classList.contains('open') || !els.picker.hidden ||
@@ -35,25 +36,30 @@ function setLicenseOpen(on) {
   els.addChannelLicWrap2.classList.toggle('show', on);
 }
 
-// setAddTab switches between the Manual, Xtream Codes, and Playlist tabs of
-// the add modal.
+// setAddTab switches between the Manual, Xtream Codes, Playlist, and Channel
+// List tabs of the add modal.
 function setAddTab(tab) {
   els.addTabManual.classList.toggle('active', tab === 'manual');
   els.addTabXtream.classList.toggle('active', tab === 'xtream');
   els.addTabPlaylist.classList.toggle('active', tab === 'playlist');
+  els.addTabChannels.classList.toggle('active', tab === 'channels');
   els.addChannelForm.hidden = tab !== 'manual';
   els.xtreamPanel.hidden = tab !== 'xtream';
   els.playlistPanel.hidden = tab !== 'playlist';
+  els.channelListPanel.hidden = tab !== 'channels';
   els.addChannelTitle.textContent =
     tab === 'xtream' ? 'Add from Xtream Codes' :
-    tab === 'playlist' ? 'Manage playlists' : 'Add a channel';
+    tab === 'playlist' ? 'Manage playlists' :
+    tab === 'channels' ? 'Channel list' : 'Add a channel';
   if (tab === 'xtream') initXtreamTab();
   if (tab === 'playlist') initPlaylistTab();
+  if (tab === 'channels') initChannelListTab();
 }
 
 els.addTabManual.addEventListener('click', function () { setAddTab('manual'); });
 els.addTabXtream.addEventListener('click', function () { setAddTab('xtream'); });
 els.addTabPlaylist.addEventListener('click', function () { setAddTab('playlist'); });
+els.addTabChannels.addEventListener('click', function () { setAddTab('channels'); });
 
 export function openChannelModal(mode, ch) {
   closeDrawers();

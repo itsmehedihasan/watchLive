@@ -9,6 +9,7 @@
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="apple-mobile-web-app-title" content="LiveTV">
+  <link rel="icon" type="image/x-icon" href="/static/wl.ico">
   <link rel="manifest" href="/static/manifest.json">
   <link rel="apple-touch-icon" href="/static/icon-192.svg">
   <title>LiveTV — Multi-View</title>
@@ -21,6 +22,8 @@
 
     <!-- ── Left tool rail ─────────────────────────────────────────── -->
     <aside class="rail">
+      <!-- App logo -->
+      <img class="rail-logo" src="/static/wl.ico" alt="LiveTV" width="32" height="32">
       <!-- Grid size -->
       <section class="rail-section rail-volume">
         <div class="rail-label">Grid</div>
@@ -218,6 +221,7 @@
         <button type="button" id="addTabManual" class="add-tab active" data-tab="manual">Manual</button>
         <button type="button" id="addTabXtream" class="add-tab" data-tab="xtream">Xtream Codes</button>
         <button type="button" id="addTabPlaylist" class="add-tab" data-tab="playlist">Playlist</button>
+        <button type="button" id="addTabChannels" class="add-tab" data-tab="channels">Channel List</button>
       </div>
 
       <!-- Tab 1 — Manual: today's add-a-channel form, unchanged behavior. -->
@@ -312,6 +316,16 @@
       <div id="playlistPanel" class="add-form add-tab-panel" data-tab="playlist" hidden>
         <div id="playlistList" class="playlist-list"></div>
         <p id="playlistEmpty" class="add-hint" hidden>No saved playlists yet — add one from the Xtream Codes tab.</p>
+      </div>
+
+      <!-- Tab 4 — Channel List: pick a playlist, view its channels' addresses (read-only). -->
+      <div id="channelListPanel" class="add-form add-tab-panel" data-tab="channels" hidden>
+        <label class="add-field">
+          <span>Playlist</span>
+          <select id="channelListFilter" class="country-select"></select>
+        </label>
+        <div id="channelListItems" class="channel-addr-list"></div>
+        <p id="channelListEmpty" class="add-hint" hidden>No channels in this playlist.</p>
       </div>
     </div>
   </div>

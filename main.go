@@ -1065,15 +1065,16 @@ func newMux(proxyHandler *proxy.Handler, staticSub fs.FS, channels *channelStore
 		})
 	})
 
-	// Update a saved playlist's fields. Each of name/update_freq/stream_type is
-	// optional — only fields present in the JSON body are validated and
-	// changed, letting the Playlist tab update one field (e.g. just the name)
-	// without resending the others. Applying a new stream type takes effect on
-	// the next refresh; this endpoint only persists the choice.
+	// Update a saved playlist's fields. Each of name/server/update_freq/
+	// stream_type is optional — only fields present in the JSON body are
+	// validated and changed, letting the Playlist tab update one field (e.g.
+	// just the name) without resending the others. A new server or stream type
+	// takes effect on the next refresh; this endpoint only persists the choice.
 	mux.HandleFunc("PATCH /api/xtream/playlists/{id}", func(w http.ResponseWriter, r *http.Request) {
 		id := r.PathValue("id")
 		var body struct {
 			Name       *string `json:"name"`
+			Server     *string `json:"server"`
 			UpdateFreq *string `json:"update_freq"`
 			StreamType *string `json:"stream_type"`
 		}
@@ -1081,13 +1082,17 @@ func newMux(proxyHandler *proxy.Handler, staticSub fs.FS, channels *channelStore
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
 		}
-		p, err := st.UpdatePlaylistFields(id, body.Name, body.UpdateFreq, body.StreamType)
+		if body.Server != nil && !isStreamURL(strings.TrimSpace(*body.Server)) {
+			http.Error(w, "server must be an http(s) url", http.StatusBadRequest)
+			return
+		}
+		p, err := st.UpdatePlaylistFields(id, body.Name, body.Server, body.UpdateFreq, body.StreamType)
 		if errors.Is(err, store.ErrNotFound) {
 			http.Error(w, "playlist not found", http.StatusNotFound)
 			return
 		}
 		if errors.Is(err, store.ErrInvalidSetting) {
-			http.Error(w, "name must be non-blank, update_freq must be manual/daily/3days/weekly, and stream_type ts/m3u8", http.StatusBadRequest)
+			http.Error(w, "name and server must be non-blank, update_freq must be manual/daily/3days/weekly, and stream_type ts/m3u8", http.StatusBadRequest)
 			return
 		}
 		if err != nil {
