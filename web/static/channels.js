@@ -41,11 +41,6 @@ export function onFavChanged() {
   });
 }
 
-export function passesHealth(ch) {
-  if (!state.healthOn) return true;
-  return state.health[ch.id] !== false;
-}
-
 export function activeIds() {
   const ids = {};
   cells.forEach(function (c) { if (c.channel) ids[c.channel.id] = true; });
@@ -105,9 +100,9 @@ export function refreshHighlights() {
   });
 }
 
-// workingSet applies the browse filter pipeline in order: country facet →
-// health → text search. Category grouping happens in the renderer. The country
-// facet matches ch.group (which holds the country code) against state.country.
+// workingSet applies the browse filter pipeline in order: country facet → text
+// search. Category grouping happens in the renderer. The country facet matches
+// ch.group (which holds the country code) against state.country.
 function workingSet() {
   let base = state.channels;
   if (state.selectedPlaylist) {
@@ -120,7 +115,6 @@ function workingSet() {
     const c = state.country.toLowerCase();
     base = base.filter(function (ch) { return (ch.group || '').toLowerCase() === c; });
   }
-  if (state.healthOn) base = base.filter(passesHealth);
   if (state.search) {
     const q = state.search.toLowerCase();
     base = base.filter(function (ch) {
@@ -168,7 +162,6 @@ function buildFavSection(searching) {
       return ch.xtream_playlist_id === pid || isManual(ch);
     });
   }
-  if (state.healthOn) favList = favList.filter(passesHealth);
   const open = state.favOpen || searching;
   const section = document.createElement('div');
   section.className = 'group-section fav-section';
@@ -196,7 +189,7 @@ function buildFavSection(searching) {
 }
 
 // renderChannelList is the single browse renderer: it applies the country +
-// health + search pipeline, then lays the results out as category-grouped
+// search pipeline, then lays the results out as category-grouped
 // sections with a Favourites section on top. While a search is active the
 // category sections auto-expand so matches are visible without a click.
 export function renderChannelList() {
@@ -295,7 +288,7 @@ export function renderChannelList() {
   const shown = matches.length;
   els.channelCount.textContent = searching
     ? shown + ' match' + (shown === 1 ? '' : 'es')
-    : shown + (state.healthOn ? ' working' : ' channels');
+    : shown + ' channels';
 }
 
 function browseSelect(ch) {
@@ -308,8 +301,9 @@ function targetCellForBrowse() {
   return state.audioCell >= 0 ? state.audioCell : 0;
 }
 
-// beat is retained as a no-op: the live-viewers heartbeat (/api/viewers) was
-// removed from the client. Call sites remain harmless.
+// beat is a no-op: the live-viewers heartbeat it used to send was removed with
+// server-side viewer counting. The stub is retained so its call sites (cell,
+// grid, audio) stay harmless.
 export function beat() {}
 
 function setSearch(value) {

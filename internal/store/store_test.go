@@ -3,7 +3,6 @@ package store
 import (
 	"errors"
 	"testing"
-	"time"
 
 	"watchlive/internal/playlist"
 )
@@ -47,12 +46,9 @@ func TestUpsertPreservesUserState(t *testing.T) {
 	if _, _, _, err := s.UpsertCatalog([]playlist.Channel{ch("tvg:a", "Alpha", "http://a/1")}); err != nil {
 		t.Fatalf("first upsert: %v", err)
 	}
-	// User favourites it and the prober marks it working.
+	// User favourites it.
 	if ok, _ := s.SetFavourite("tvg:a", true); !ok {
 		t.Fatal("SetFavourite should report ok")
-	}
-	if err := s.SetHealth(map[string]bool{"tvg:a": true}, time.Unix(1000, 0)); err != nil {
-		t.Fatalf("SetHealth: %v", err)
 	}
 
 	// Re-sync with a changed URL for the same channel.
@@ -77,9 +73,6 @@ func TestUpsertPreservesUserState(t *testing.T) {
 	}
 	if !got.IsFavourite {
 		t.Error("favourite not preserved across sync")
-	}
-	if got.IsWorking == nil || !*got.IsWorking {
-		t.Error("working verdict not preserved across sync")
 	}
 }
 
@@ -123,7 +116,7 @@ func TestAddManualIdempotentAndNamespaced(t *testing.T) {
 	if a.ID[:7] != "manual:" {
 		t.Errorf("manual id not namespaced: %q", a.ID)
 	}
-	if !a.IsFavourite || a.IsWorking == nil || !*a.IsWorking {
+	if !a.IsFavourite {
 		t.Errorf("manual defaults wrong: %+v", a)
 	}
 	if n, _ := s.Count(); n != 1 {
@@ -162,9 +155,8 @@ func TestUpdateManual(t *testing.T) {
 	s := open(t)
 	m, _ := s.AddManual("Mine", "http://m/old", nil, "", "")
 	s.SetFavourite(m.ID, true)
-	s.SetHealth(map[string]bool{m.ID: true}, time.Unix(1000, 0))
 
-	// Updating keeps the same id, so favourite/health state survives.
+	// Updating keeps the same id, so favourite state survives.
 	got, err := s.UpdateManual(m.ID, "  Mine HD  ", "  http://m/new  ", "", "")
 	if err != nil {
 		t.Fatalf("UpdateManual: %v", err)
@@ -180,9 +172,6 @@ func TestUpdateManual(t *testing.T) {
 	}
 	if !got.IsFavourite {
 		t.Error("favourite lost on update")
-	}
-	if got.IsWorking == nil || !*got.IsWorking {
-		t.Error("health verdict lost on update")
 	}
 
 	// The new URL is indexed; the old one is gone.
@@ -260,74 +249,6 @@ func TestAddResolvable(t *testing.T) {
 	}
 }
 
-func TestSetHealthOnlyTouchesMapped(t *testing.T) {
-	s := open(t)
-	s.UpsertCatalog([]playlist.Channel{ch("a", "A", "http://a"), ch("b", "B", "http://b")})
-
-	if err := s.SetHealth(map[string]bool{"a": true}, time.Unix(2000, 0)); err != nil {
-		t.Fatalf("SetHealth: %v", err)
-	}
-	chans, _ := s.ListChannels()
-	byID := map[string]Channel{}
-	for _, c := range chans {
-		byID[c.ID] = c
-	}
-	if byID["a"].IsWorking == nil || !*byID["a"].IsWorking {
-		t.Error("a should be working")
-	}
-	if byID["b"].IsWorking != nil {
-		t.Error("b should remain unprobed (nil)")
-	}
-}
-
-func TestStaleTargetsTTLBoundary(t *testing.T) {
-	s := open(t)
-	s.UpsertCatalog([]playlist.Channel{
-		ch("fresh", "Fresh", "http://fresh"),
-		ch("old", "Old", "http://old"),
-		ch("never", "Never", "http://never"),
-	})
-
-	// Pin "now" so the boundary is deterministic.
-	base := time.Unix(100000, 0)
-	now = func() time.Time { return base }
-	defer func() { now = time.Now }()
-
-	s.SetHealth(map[string]bool{"fresh": true}, base.Add(-1*time.Hour)) // 1h old
-	s.SetHealth(map[string]bool{"old": true}, base.Add(-10*time.Hour))  // 10h old
-	// "never" left unprobed.
-
-	stale, err := s.StaleTargets(6*time.Hour, false)
-	if err != nil {
-		t.Fatalf("StaleTargets: %v", err)
-	}
-	got := map[string]bool{}
-	for _, tgt := range stale {
-		got[tgt.ID] = true
-	}
-	if got["fresh"] {
-		t.Error("fresh (1h < 6h ttl) should not be stale")
-	}
-	if !got["old"] {
-		t.Error("old (10h > 6h ttl) should be stale")
-	}
-	if !got["never"] {
-		t.Error("never-probed should be stale")
-	}
-
-	// force returns everything.
-	all, _ := s.StaleTargets(6*time.Hour, true)
-	if len(all) != 3 {
-		t.Errorf("force should return all 3, got %d", len(all))
-	}
-	// URLs are carried through.
-	for _, tgt := range all {
-		if len(tgt.URLs) == 0 {
-			t.Errorf("target %s has no URLs", tgt.ID)
-		}
-	}
-}
-
 func TestPruneOrphans(t *testing.T) {
 	s := open(t)
 	s.UpsertCatalog([]playlist.Channel{
@@ -391,9 +312,6 @@ func TestImportManual(t *testing.T) {
 		}
 		if c.IsFavourite {
 			t.Errorf("imported channels must NOT be auto-favourited: %+v", c)
-		}
-		if c.IsWorking == nil || !*c.IsWorking {
-			t.Errorf("imported channels should default to working: %+v", c)
 		}
 	}
 
@@ -511,55 +429,6 @@ func TestHeaderHintsRoundTrip(t *testing.T) {
 	got, _ = s.getChannel("tvg:plain")
 	if got.UserAgent != "" || got.Referer != "" {
 		t.Errorf("plain channel should have empty hints: %+v", got)
-	}
-}
-
-func TestBackfillHeaders(t *testing.T) {
-	s := open(t)
-	// Catalog: three feed channels, no headers (as a pre-columns catalog would be).
-	if _, _, _, err := s.UpsertCatalog([]playlist.Channel{
-		ch("tvg:a", "A", "https://cdn.a/x.m3u8"),
-		ch("tvg:b", "B", "https://cdn.b/y.m3u8"),
-		ch("tvg:c", "C", "https://cdn.c/z.m3u8"),
-	}); err != nil {
-		t.Fatalf("UpsertCatalog: %v", err)
-	}
-
-	// Seed: A has UA+referer, B has UA only, Ghost's URL isn't in the catalog.
-	seed := []playlist.Channel{
-		{Name: "A", UserAgent: "UA-A", Referer: "https://site.a/p", Servers: []playlist.Server{{URL: "https://cdn.a/x.m3u8"}}},
-		{Name: "B", UserAgent: "UA-B", Servers: []playlist.Server{{URL: "https://cdn.b/y.m3u8"}}},
-		{Name: "Ghost", UserAgent: "UA-G", Servers: []playlist.Server{{URL: "https://not.in.catalog/q.m3u8"}}},
-	}
-	n, err := s.BackfillHeaders(seed)
-	if err != nil {
-		t.Fatalf("BackfillHeaders: %v", err)
-	}
-	if n != 2 {
-		t.Errorf("updated = %d, want 2 (Ghost has no catalog match)", n)
-	}
-
-	if a, _ := s.getChannel("tvg:a"); a.UserAgent != "UA-A" || a.Referer != "https://site.a/p" {
-		t.Errorf("A not filled: ua=%q ref=%q", a.UserAgent, a.Referer)
-	}
-	if b, _ := s.getChannel("tvg:b"); b.UserAgent != "UA-B" || b.Referer != "" {
-		t.Errorf("B (UA-only) wrong: ua=%q ref=%q", b.UserAgent, b.Referer)
-	}
-	if c, _ := s.getChannel("tvg:c"); c.UserAgent != "" || c.Referer != "" {
-		t.Errorf("C (no seed hint) should stay blank: ua=%q ref=%q", c.UserAgent, c.Referer)
-	}
-	if cnt, _ := s.Count(); cnt != 3 {
-		t.Errorf("channel count = %d, want 3 (no adds/removes)", cnt)
-	}
-
-	// Fill-only: adding a referer to B must NOT clear its existing UA.
-	if _, err := s.BackfillHeaders([]playlist.Channel{
-		{Name: "B", Referer: "https://site.b/r", Servers: []playlist.Server{{URL: "https://cdn.b/y.m3u8"}}},
-	}); err != nil {
-		t.Fatalf("BackfillHeaders fill-only: %v", err)
-	}
-	if b, _ := s.getChannel("tvg:b"); b.UserAgent != "UA-B" || b.Referer != "https://site.b/r" {
-		t.Errorf("fill-only failed: ua=%q ref=%q (want UA-B + referer)", b.UserAgent, b.Referer)
 	}
 }
 
@@ -738,10 +607,9 @@ func TestUpsertXtreamChannels(t *testing.T) {
 		t.Error("playlist with channels should report Imported=true")
 	}
 
-	// User favourites Alpha and the prober marks it working; a refresh with a
-	// changed name/URL must UPDATE in place, preserving that user state.
+	// User favourites Alpha; a refresh with a changed name/URL must UPDATE in
+	// place, preserving that user state.
 	s.SetFavourite(alpha.ID, true)
-	s.SetHealth(map[string]bool{alpha.ID: true}, time.Unix(1000, 0))
 
 	added2, updated2, err := s.UpsertXtreamChannels(p.ID, []XtreamStream{
 		{StreamID: 101, Name: "Alpha HD", URL: "http://p/live/u/pw/101.m3u8"},
@@ -760,9 +628,6 @@ func TestUpsertXtreamChannels(t *testing.T) {
 	}
 	if !got.IsFavourite {
 		t.Error("refresh must preserve favourite")
-	}
-	if got.IsWorking == nil || !*got.IsWorking {
-		t.Error("refresh must preserve health verdict")
 	}
 	if len(got.Servers) != 1 || got.Servers[0].URL != "http://p/live/u/pw/101.m3u8" {
 		t.Errorf("refresh should update servers, got %+v", got.Servers)
