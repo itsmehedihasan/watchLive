@@ -36,6 +36,8 @@ export const state = {
 };
 
 export const cells = [];
+// Up to a 2×2 layout: browser video cells, or native screen tiles (each tile is
+// its own mpv window, auto-tiled by Go).
 export const MAX_CELLS = 4;
 export const RENDER_CAP = 500;
 export const CATEGORY_ORDER = ['News', 'Sports', 'Movies', 'Music', 'Kids', 'Religious', 'Entertainment'];

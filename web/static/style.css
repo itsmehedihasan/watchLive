@@ -398,6 +398,29 @@ input { font-family: inherit; }
 }
 .cell-settings-empty { font-size: 12px; color: var(--muted); }
 
+/* ── Native shell: screen tiles ──────────────────────────────────
+   In the native (WebView2 remote) build a cell is a video-less "screen tile"
+   1:1 with an external mpv player window (video lives in mpv, auto-tiled by Go).
+   The tile shows the channel identity + status and hosts audio/focus/close.
+   Scoped to .native so the browser build is untouched. */
+.native .cell-screen .cell-stage {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 10px; padding: 18px; text-align: center;
+}
+.native .cell-screen .screen-logo {
+  max-width: 55%; max-height: 45%; object-fit: contain; border-radius: 8px;
+}
+.native .cell-screen .screen-name {
+  position: static; transform: none; background: transparent; padding: 0;
+  max-width: 90%; font-size: 1.05rem; font-weight: 600; line-height: 1.25;
+  -webkit-backdrop-filter: none; backdrop-filter: none;
+}
+.native .cell-screen .screen-hint { font-size: .8rem; color: var(--muted, #8a93a6); }
+/* Idle (unfilled) tile hides identity/hint; the .cell-empty pick button shows. */
+.native .cell-screen:not(.filled) .screen-logo,
+.native .cell-screen:not(.filled) .screen-name,
+.native .cell-screen:not(.filled) .screen-hint { display: none; }
+
 /* ── Floating scrim ─────────────────────────────────────────── */
 .scrim {
   position: fixed; inset: 0; z-index: 100;

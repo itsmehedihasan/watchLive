@@ -1,4 +1,5 @@
 import { state, els, MAX_CELLS } from './state.js';
+import { NATIVE } from './native.js';
 import { addCell, updatePickLabels } from './grid.js';
 import { renderCategorySidebar, renderChannelList, beat } from './channels.js';
 import { updateHealthStatus, observeHealth, stopHealthPolling } from './health.js';
@@ -69,7 +70,10 @@ export function init() {
   beat();
   setInterval(beat, 30000);
 
-  if ('serviceWorker' in navigator) {
+  // The service worker only benefits the browser PWA (offline shell, cached
+  // vendored players). The native shell has none of that and would just
+  // accumulate per-origin caches, so skip it there.
+  if (!NATIVE && 'serviceWorker' in navigator) {
     navigator.serviceWorker.register('/static/sw.js').catch(function (err) { console.warn('SW registration failed:', err); });
   }
 }

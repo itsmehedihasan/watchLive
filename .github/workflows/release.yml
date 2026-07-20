@@ -20,17 +20,32 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Build Windows binary
+      - name: Build Windows binaries
         env:
           GOOS: windows
           GOARCH: amd64
           CGO_ENABLED: '0'
-        run: go build -ldflags "-s -w" -o dist/watchlive.exe .
+        run: |
+          go build -ldflags "-s -w" -o dist/watchlive.exe ./cmd/watchlive
+          go build -ldflags "-s -w" -o dist/watchlive-native.exe ./cmd/watchlive-native
+
+      - name: Fetch mpv.exe (native player)
+        run: |
+          sudo apt-get update && sudo apt-get install -y p7zip-full
+          # Newest baseline mpv-x86_64 player build (exclude -v3) from the
+          # shinchiro SourceForge feed. curl follows the mirror redirect on Linux.
+          url=$(curl -sL 'https://sourceforge.net/projects/mpv-player-windows/rss?path=/64bit' \
+            | grep -oE 'https://[^<]*mpv-x86_64-[0-9][^<]*\.7z/download' | grep -v 'v3' | head -1)
+          echo "mpv: $url"
+          curl -sL "$url" -o mpv.7z
+          7z e mpv.7z mpv.exe -odist -y
+          ls -la dist/mpv.exe
 
       - name: Stage bundle
         run: |
           cp WatchLive.bat dist/
           cp README.md dist/
+          cp THIRD-PARTY-NOTICES.md dist/
 
       - name: Zip bundle
         run: |

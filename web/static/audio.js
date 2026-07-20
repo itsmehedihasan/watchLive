@@ -1,16 +1,26 @@
 import { state, cells, els } from './state.js';
 import { currentServerForCell } from './player.js';
+import { NATIVE, audioScreen } from './native.js';
 
 export function applyAudio() {
   cells.forEach(function (c, i) {
     const isAudio = i === state.audioCell && !state.globalMuted;
-    c.video.muted = !isAudio;
-    c.video.volume = state.volume;
-    const on = c.els.mic.querySelector('.ico-on');
-    const off = c.els.mic.querySelector('.ico-off');
-    if (on && off) { on.hidden = !isAudio; off.hidden = isAudio; }
-    c.els.mic.classList.toggle('active', isAudio);
+    if (c.video) { c.video.muted = !isAudio; c.video.volume = state.volume; }
+    const mic = c.els && c.els.mic;
+    if (mic) {
+      const on = mic.querySelector('.ico-on');
+      const off = mic.querySelector('.ico-off');
+      if (on && off) { on.hidden = !isAudio; off.hidden = isAudio; }
+      mic.classList.toggle('active', isAudio);
+    }
   });
+  if (NATIVE) {
+    // The tiles carry no audio — mpv does. Tell Go which screen owns audio; it
+    // unmutes that mpv window and mutes the rest. id -1 (muted or none) mutes all.
+    const a = cells[state.audioCell];
+    const target = (state.globalMuted || !a) ? -1 : a.nid;
+    audioScreen(target);
+  }
   els.muteBtn.querySelector('.ico-vol').hidden = state.globalMuted;
   els.muteBtn.querySelector('.ico-muted').hidden = !state.globalMuted;
   els.muteBtn.setAttribute('aria-pressed', state.globalMuted ? 'true' : 'false');

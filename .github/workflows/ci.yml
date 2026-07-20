@@ -29,6 +29,14 @@ jobs:
       - name: vet
         run: go vet ./...
 
+      # The native shell (cmd/watchlive-native, internal/native) is //go:build
+      # windows and is skipped by the Ubuntu vet/test steps above. This gate
+      # cross-compiles the whole module for Windows so those files can't rot
+      # unnoticed. Pure-Go (CGO off, purego libmpv / modernc sqlite), so it
+      # cross-builds from Ubuntu with no MinGW toolchain.
+      - name: windows cross-build
+        run: GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build ./...
+
       # Ubuntu runners ship gcc, so the race detector works here even though the
       # local Windows dev box has no cgo toolchain.
       - name: test (race)

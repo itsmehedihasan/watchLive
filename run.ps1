@@ -12,7 +12,7 @@ $root = $PSScriptRoot
 $exe  = Join-Path $root 'watchlive.exe'
 
 Write-Host 'Building watchlive.exe...'
-go build -o $exe .
+go build -o $exe ./cmd/watchlive
 if ($LASTEXITCODE -ne 0) { throw "go build failed ($LASTEXITCODE)" }
 
 & $exe @args

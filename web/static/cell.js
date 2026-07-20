@@ -3,10 +3,17 @@ import { destroyCellPlayer, setCellState, updatePlayIcon, startCellPlayback, ret
 import { applyAudio, renderAudioButtons, stopRecording } from './audio.js';
 import { refreshHighlights, beat } from './channels.js';
 import { openPicker } from './picker.js';
+import { NATIVE, openScreen, focusScreen } from './native.js';
+
+// nextNid hands each cell a stable native id used as the mpv-screen key in the
+// bridge protocol. Monotonic (never reused) so a closing window can't collide
+// with a freshly-added tile.
+let nextNid = 1;
 
 export function makeCell(idx) {
   const cell = {
     idx: idx,
+    nid: nextNid++,
     channel: null,
     serverIdx: 0,
     failedServers: {},
@@ -17,6 +24,10 @@ export function makeCell(idx) {
     root: null,
     video: null,
   };
+
+  // Native shell: a cell is a video-less "screen tile" 1:1 with an external mpv
+  // window (video lives in mpv, auto-tiled by Go). Build the tile and return.
+  if (NATIVE) return makeScreenTile(cell);
 
   const root = document.createElement('section');
   root.className = 'cell';
@@ -203,6 +214,106 @@ export function makeCell(idx) {
   cell.root = root;
   cell.video = video;
   cell.els = { stage: stage, empty: empty, loading: loading, buffering: buffering, error: error, mic: mic, play: play, label: label, settings: settings, pickLabel: pick.querySelector('.cell-pick-label') };
+
+  return cell;
+}
+
+// makeScreenTile builds the native-mode cell: a control tile for one mpv window.
+// No <video>, players, or buffering monitor — mpv owns playback and its own OSC.
+// It reuses the loading/error overlays, label, mic, and pick button so the shared
+// assignChannel / clearCell / setCellState / audio machinery works unchanged.
+function makeScreenTile(cell) {
+  const root = document.createElement('section');
+  root.className = 'cell cell-screen';
+  root.dataset.idx = String(cell.idx);
+
+  const stage = document.createElement('div');
+  stage.className = 'cell-stage';
+
+  const logo = document.createElement('img');
+  logo.className = 'screen-logo';
+  logo.alt = '';
+  logo.hidden = true;
+  stage.appendChild(logo);
+
+  const label = document.createElement('div');
+  label.className = 'cell-label screen-name';
+  stage.appendChild(label);
+
+  const hint = document.createElement('div');
+  hint.className = 'screen-hint';
+  hint.textContent = 'Playing in its own window';
+  stage.appendChild(hint);
+
+  const loading = document.createElement('div');
+  loading.className = 'cell-overlay cell-loading';
+  loading.innerHTML = '<div class="spinner"></div><p class="overlay-muted">Opening…</p>';
+  loading.hidden = true;
+  stage.appendChild(loading);
+
+  const error = document.createElement('div');
+  error.className = 'cell-overlay cell-error';
+  error.hidden = true;
+  const errEmoji = document.createElement('div'); errEmoji.className = 'overlay-emoji'; errEmoji.textContent = '📡';
+  const errTitle = document.createElement('p'); errTitle.className = 'error-title'; errTitle.textContent = 'Stream unavailable';
+  const errBtn = document.createElement('button'); errBtn.className = 'primary-btn'; errBtn.textContent = '↺ Retry';
+  errBtn.addEventListener('click', function () { retryCell(cell); });
+  error.appendChild(errEmoji); error.appendChild(errTitle); error.appendChild(errBtn);
+  stage.appendChild(error);
+
+  const mic = document.createElement('button');
+  mic.className = 'cell-mic';
+  mic.title = 'Use this screen’s audio';
+  mic.innerHTML =
+    '<svg class="ico-on" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">' +
+      '<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/></svg>' +
+    '<svg class="ico-off" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" hidden>' +
+      '<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="22" y1="9" x2="16" y2="15"/><line x1="16" y1="9" x2="22" y2="15"/></svg>';
+  mic.addEventListener('click', function () { setAudioCell(cell.idx); });
+  stage.appendChild(mic);
+
+  const controls = document.createElement('div');
+  controls.className = 'cell-controls';
+  const focusBtn = document.createElement('button');
+  focusBtn.className = 'cell-ctl';
+  focusBtn.title = 'Bring this player window to the front';
+  focusBtn.innerHTML = '<svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>';
+  focusBtn.addEventListener('click', function () { focusScreen(cell.nid); });
+  const close = document.createElement('button');
+  close.className = 'cell-ctl';
+  close.title = 'Stop this screen';
+  close.innerHTML = '<svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
+  close.addEventListener('click', function () { clearCell(cell); });
+  controls.appendChild(focusBtn);
+  controls.appendChild(close);
+  stage.appendChild(controls);
+
+  root.appendChild(stage);
+
+  const empty = document.createElement('div');
+  empty.className = 'cell-empty';
+  const pick = document.createElement('button');
+  pick.className = 'cell-pick';
+  pick.innerHTML =
+    '<svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">' +
+      '<rect x="2" y="6" width="14" height="12" rx="2"/><path d="M16 10l6-3v10l-6-3"/><line x1="9" y1="9" x2="9" y2="15"/><line x1="6" y1="12" x2="12" y2="12"/></svg>' +
+    '<span class="cell-pick-label"></span>';
+  pick.addEventListener('click', function () { openPicker(cell.idx); });
+  empty.appendChild(pick);
+  root.appendChild(empty);
+
+  cell.root = root;
+  cell.video = null;
+  cell.hideBuffering = function () {};
+  cell.els = {
+    stage: stage, empty: empty, loading: loading, error: error,
+    mic: mic, label: label, logo: logo, hint: hint,
+    settings: null, play: null, buffering: null,
+    pickLabel: pick.querySelector('.cell-pick-label'),
+  };
+
+  // Open the mpv window immediately (idle, ready) — "+ opens a window now".
+  openScreen(cell.nid);
   return cell;
 }
 
@@ -216,6 +327,7 @@ function setAudioCell(idx) {
 }
 
 function toggleCellFullscreen(cell) {
+  // Browser only — native screen tiles have no expand button (mpv owns fullscreen).
   if (!document.fullscreenElement) cell.els.stage.requestFullscreen().catch(function () {});
   else document.exitFullscreen();
 }
@@ -357,6 +469,11 @@ export function assignChannel(cellIdx, ch) {
   cell.failedServers = {};
   cell.root.classList.add('filled');
   cell.els.label.textContent = ch.name;
+  // Native screen tiles show the channel logo (no video preview).
+  if (cell.els.logo) {
+    if (ch.logo) { cell.els.logo.src = ch.logo; cell.els.logo.hidden = false; }
+    else { cell.els.logo.removeAttribute('src'); cell.els.logo.hidden = true; }
+  }
   if (state.audioCell === -1) state.audioCell = cellIdx;
   if (ch.resolver) {
     // Dynamic channel: fetch a fresh signed URL before playing. The backend caches
@@ -397,6 +514,7 @@ export function clearCell(cell) {
   cell.channel = null;
   cell.root.classList.remove('filled');
   cell.els.label.textContent = '';
+  if (cell.els.logo) { cell.els.logo.removeAttribute('src'); cell.els.logo.hidden = true; }
   setCellState(cell, 'idle');
   if (state.audioCell === cell.idx) {
     state.audioCell = -1;

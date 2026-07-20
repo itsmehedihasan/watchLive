@@ -7,37 +7,37 @@
 // from a custom playlist: a separate DB that is reset on every start and seeded
 // only from that file, with the API refresh and Sync disabled and your real
 // catalog left untouched.
-package main
+//
+// This root package is `app`: an importable library that builds the whole
+// server (Build/Run in app.go). The web binary lives in cmd/watchlive; the
+// native WebView2+mpv shell (cmd/watchlive-native) imports it too. web/ and
+// seed.m3u stay at the root so the //go:embed directives below remain valid
+// (embed paths can't reach above their package directory).
+package app
 
 import (
 	"bytes"
 	"compress/gzip"
-	"context"
 	"crypto/sha256"
 	"embed"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"html/template"
 	"io"
 	"io/fs"
 	"log"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
-	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
-	"watchlive/internal/ffmpeg"
 	"watchlive/internal/genre"
 	"watchlive/internal/health"
 	"watchlive/internal/keystore"
@@ -262,273 +262,6 @@ func fetchAndEnrich(sourceURL string) ([]byte, int, error) {
 	}
 	enriched, n := db.Enrich(data)
 	return enriched, n, nil
-}
-
-func main() {
-	addr := flag.String("addr", ":3000", "listen address")
-	dbPath := flag.String("db", "", "path to the SQLite catalog (default: catalog.db next to the binary)")
-	playlistPath := flag.String("playlist", "", "run a throwaway session from this .m3u file: a fresh separate DB seeded only from it, API refresh and Sync off, real catalog untouched")
-	sourceURL := flag.String("source-url", "https://iptv-org.github.io/iptv/index.m3u", "upstream playlist fetched at startup and by Sync")
-	noRefresh := flag.Bool("no-refresh", false, "skip the startup fetch from -source-url and use the catalog as-is")
-	prune := flag.Bool("prune", false, "on sync, delete channels no longer upstream (keeps favourited and manual ones)")
-	cacheMB := flag.Int64("cache-mb", 200, "segment cache size in MB")
-	recDir := flag.String("rec-dir", "recordings", "directory for saved screen recordings")
-	open := flag.Bool("open", true, "open the web UI in the default browser once the server is listening")
-	allowPrivate := flag.Bool("allow-private-upstreams", false, "allow the proxy to fetch loopback/private/link-local addresses (off by default to block SSRF)")
-	flag.Parse()
-
-	// baseDir is where the catalog directory and keys.json live: beside the
-	// executable for a distributed single binary, so it keeps its state next to
-	// it across restarts. EXCEPTION: under `go run` the binary lives in a temp
-	// go-build dir that's deleted on exit, so exe-relative state would be
-	// ephemeral (favourites/manual adds/keys would vanish every run). Detect that
-	// and fall back to the working directory instead.
-	baseDir := "."
-	if exe, err := os.Executable(); err == nil && !isEphemeralExe(exe) {
-		baseDir = filepath.Dir(exe)
-	}
-
-	// Playlist mode: -playlist FILE runs a throwaway session from a custom .m3u.
-	// Read and validate the file up front so a missing/empty/non-m3u path fails
-	// fast before we touch any database.
-	var seedFromPlaylist []byte
-	playlistMode := *playlistPath != ""
-	if playlistMode {
-		data, err := os.ReadFile(*playlistPath)
-		if err != nil {
-			log.Fatalf("playlist: read %s: %v", *playlistPath, err)
-		}
-		if len(playlist.Parse(string(data))) == 0 {
-			log.Fatalf("playlist: %s contains no channels (is it a valid .m3u?)", *playlistPath)
-		}
-		seedFromPlaylist = data
-	}
-
-	path := *dbPath
-	if path == "" {
-		// Playlist mode gets its own DB so the real catalog is never involved.
-		name := "catalog.db"
-		if playlistMode {
-			name = "playlist.db"
-		}
-		path = filepath.Join(baseDir, "store", name)
-	}
-	if dir := filepath.Dir(path); dir != "" && dir != "." {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			log.Fatalf("store: create %s: %v", dir, err)
-		}
-	}
-
-	// Reset the playlist-mode DB (and its WAL/SHM sidecars) before opening so each
-	// run starts clean — "like a new server" — discarding any state from a prior
-	// -playlist session. The real catalog.db is only ever wiped this way if the
-	// user explicitly points -playlist at it via -db.
-	if playlistMode {
-		for _, p := range []string{path, path + "-wal", path + "-shm"} {
-			if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
-				log.Fatalf("playlist: reset %s: %v", p, err)
-			}
-		}
-		log.Printf("playlist mode: throwaway session from %s (catalog %s reset, API refresh off)", *playlistPath, path)
-	}
-
-	st, err := store.Open(path)
-	if err != nil {
-		log.Fatalf("store: open %s: %v", path, err)
-	}
-	defer st.Close()
-
-	// ClearKey keystore: a standalone keys.json beside the catalog dir (NOT inside
-	// it), so DRM keys survive a catalog wipe and apply globally to any DASH
-	// stream whose manifest KID matches. Seed the keys we've already captured so a
-	// fresh file still has them; Merge is idempotent and only writes on a change.
-	keysPath := filepath.Join(baseDir, "keys.json")
-	ks, err := keystore.Open(keysPath)
-	if err != nil {
-		log.Fatalf("keystore: open %s: %v", keysPath, err)
-	}
-	// Seed only KIDs not already present, so a hand-edit or a UI update to one of
-	// these keys is never reverted on the next startup.
-	existing := ks.All()
-	toSeed := map[string]string{}
-	for kid, key := range seedClearKeys {
-		if _, ok := existing[kid]; !ok {
-			toSeed[kid] = key
-		}
-	}
-	if n, err := ks.Merge(toSeed); err != nil {
-		log.Printf("keystore: seed: %v", err)
-	} else if n > 0 {
-		log.Printf("keystore: seeded %d known key(s)", n)
-	}
-	log.Printf("keystore: %d ClearKey pair(s) in %s", ks.Count(), keysPath)
-
-	channels := newChannelStore(st, *sourceURL, *prune)
-	channels.playlistMode = playlistMode
-	// Seed an empty catalog synchronously before serving so the first paint is
-	// never blank. In playlist mode the DB was just reset, so this loads the
-	// custom file; otherwise it's the embedded starter list (offline cold start).
-	seed := seedPlaylist
-	if playlistMode {
-		seed = seedFromPlaylist
-	}
-	if err := channels.seedIfEmpty(seed); err != nil {
-		log.Printf("playlist: seed: %v", err)
-	}
-	log.Printf("playlist: %d channels in catalog %s", channels.channelCount(), path)
-
-	viewerStore := viewers.NewStore()
-	proxyHandler := proxy.New(*cacheMB << 20)
-	proxyHandler.SetAllowPrivateUpstreams(*allowPrivate)
-
-	// Per-channel upstream header overrides (UA / referer from #EXTVLCOPT) live in
-	// the catalog. Rebuild the proxy's host→header map on every catalog change so a
-	// CDN that gates on a specific UA/referer gets exactly what its channel
-	// prescribes. The constructor's rebuild ran before this hook was set, so push
-	// the initial map explicitly too.
-	channels.afterRebuild = func(chs []store.Channel) {
-		proxyHandler.SetUpstreamHeaders(upstreamHeadersFromCatalog(chs))
-	}
-	if chs, err := st.ListChannels(); err == nil {
-		proxyHandler.SetUpstreamHeaders(upstreamHeadersFromCatalog(chs))
-	}
-
-	// seed.m3u is the source of truth for header hints: backfill http-user-agent /
-	// http-referrer onto matching catalog channels (by exact stream URL) from the
-	// embedded seed. Fill-only and header-only — favourites, health, logos, and
-	// categories are untouched. Skipped in playlist mode (that DB IS the file).
-	if !playlistMode {
-		if n, err := st.BackfillHeaders(playlist.Parse(string(seedPlaylist))); err != nil {
-			log.Printf("backfill headers: %v", err)
-		} else {
-			log.Printf("backfill: filled UA/referer on %d channel(s) from seed (exact-URL match)", n)
-			if n > 0 {
-				channels.rebuild() // refresh proxy header map + /api/channels payload
-			}
-		}
-	}
-
-	// Screen recording: resolve an ffmpeg (embedded copy, else PATH) and wire a
-	// recorder that transcodes to 720p H.264/AAC MP4. Absent ffmpeg → recording
-	// is simply disabled and the UI hides the button.
-	rec := recorder.New(ffmpeg.Resolve(), *recDir)
-	if rec.Available() {
-		log.Printf("recording: enabled, saving to %s", rec.Dir())
-	} else {
-		log.Printf("recording: disabled (ffmpeg not found)")
-	}
-
-	prober := health.New()
-	// Verdicts persist in the catalog (channels.is_working). On completion of a
-	// pass, write them back and rebuild the payload so the new state ships in
-	// /api/channels. Seed the prober from the catalog so a fresh process serves
-	// health results for the current list without re-probing until they go stale.
-	prober.OnFinish(func(verdicts map[string]bool, at time.Time) {
-		if err := st.SetHealth(verdicts, at); err != nil {
-			log.Printf("health: persist verdicts: %v", err)
-		}
-		if err := channels.rebuild(); err != nil {
-			log.Printf("health: rebuild after verdicts: %v", err)
-		}
-	})
-	if verdicts, err := st.HealthVerdicts(); err == nil && len(verdicts) > 0 {
-		prober.Seed(channels.etagValue(), verdicts, time.Now())
-	}
-
-	// startStaleProbe kicks a silent background pass over channels whose verdict
-	// is missing or older than healthTTL. It is a no-op when nothing is stale, so
-	// a restart right after a probe costs nothing; a fresh DB probes everything
-	// once. The server owns this (not the page), so browser refreshes just observe
-	// the running pass instead of each starting their own.
-	startStaleProbe := func() {
-		targets, err := st.StaleTargets(healthTTL, false)
-		if err != nil {
-			log.Printf("health: stale targets: %v", err)
-			return
-		}
-		if len(targets) == 0 {
-			return
-		}
-		// Targets are already filtered to the stale set, so force past the
-		// prober's own freshness gate.
-		prober.Start(targets, channels.etagValue(), true)
-		log.Printf("health: background re-check of %d stale channel(s)", len(targets))
-	}
-
-	// Live background sync from -source-url is DISABLED: seed.m3u is the source of
-	// truth. refresh()/fetchAndEnrich and the -source-url/-no-refresh/-prune flags
-	// remain in place for a future sync rework, but nothing fetches the API on its
-	// own now. Just re-check stale stream health in the background.
-	_ = *noRefresh // flag retained for the future sync rework; sync is off regardless
-	go startStaleProbe()
-
-	indexTmpl := template.Must(template.ParseFS(templateFS, "web/templates/index.html"))
-	staticSub, err := fs.Sub(staticFS, "web/static")
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	// Resolver: some embed providers serve only short-lived signed URLs that must
-	// be fetched fresh at play time (the token is unforgeable). Register provider
-	// families here; channels store a recipe (resolver + arg) instead of a URL.
-	resolverMgr := resolver.NewManager()
-	resolverMgr.Add(resolver.Exposestrat{})
-
-	mux := newMux(proxyHandler, viewerStore, staticSub, channels, st, ks, rec, prober, resolverMgr, indexTmpl)
-
-	srv := &http.Server{
-		Addr:              *addr,
-		Handler:           mux,
-		ReadHeaderTimeout: 10 * time.Second,
-		// IdleTimeout reaps dead keep-alive connections. Deliberately NO
-		// WriteTimeout: it would abort long-lived live-stream responses.
-		IdleTimeout: 120 * time.Second,
-	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
-	// Background maintenance: prune stale viewer sessions.
-	go func() {
-		ticker := time.NewTicker(10 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				viewerStore.Prune()
-			}
-		}
-	}()
-
-	// Bind explicitly before serving so a failure (e.g. the port is already in
-	// use) is reported clearly and we only open the browser once the listener is
-	// actually accepting connections — no "can't connect" race.
-	ln, err := net.Listen("tcp", *addr)
-	if err != nil {
-		log.Fatalf("listen on %s: %v (is the port already in use? pass -addr to pick another)", *addr, err)
-	}
-	url := "http://localhost" + displayAddr(*addr)
-	go func() {
-		log.Printf("listening on %s", url)
-		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("server: %v", err)
-		}
-	}()
-
-	if *open {
-		openBrowser(url)
-	}
-
-	<-ctx.Done()
-	log.Println("shutting down…")
-	rec.StopAll() // finalize any in-progress recordings into playable files
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := srv.Shutdown(shutdownCtx); err != nil {
-		log.Printf("shutdown: %v", err)
-	}
 }
 
 // isStreamURL reports whether line is an http(s) URL — used to validate a

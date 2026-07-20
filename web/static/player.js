@@ -1,6 +1,7 @@
 import { state, cells } from './state.js';
 import { proxyUrl, streamKind } from './util.js';
 import { setDead } from './channels.js';
+import { NATIVE, openScreen, playScreen, stopScreen, onNativeScreen, onNativeClosed } from './native.js';
 
 export function destroyCellPlayer(cell) {
   cell.token++;
@@ -8,6 +9,7 @@ export function destroyCellPlayer(cell) {
   // without going via clearCell, so without this the per-cell setInterval would
   // keep firing against a detached <video>.
   if (cell.hideBuffering) cell.hideBuffering();
+  if (NATIVE) { stopScreen(cell.nid); return; } // native tiles have no <video>/players
   if (cell.hls) { cell.hls.destroy(); cell.hls = null; }
   if (cell.shaka) { try { cell.shaka.destroy(); } catch (e) { /* ignore */ } cell.shaka = null; }
   if (cell.mpegts) { try { cell.mpegts.destroy(); } catch (e) { /* ignore */ } cell.mpegts = null; }
@@ -72,6 +74,17 @@ export function startCellPlayback(cell) {
   destroyCellPlayer(cell);
   const token = cell.token;
   setCellState(cell, 'loading');
+
+  if (NATIVE) {
+    // Hand the resolved upstream URL to Go, which wraps it through /api/proxy
+    // (PNG-unwrap, per-host UA/referer, SSRF, cache) and sends `loadfile` to this
+    // tile's mpv window. openScreen is idempotent — it re-opens the window if the
+    // user had closed it. The browser players are skipped entirely.
+    const ch = cell.channel || {};
+    openScreen(cell.nid);
+    playScreen(cell.nid, server.url, ch.http_referer, ch.http_user_agent);
+    return;
+  }
 
   switch (streamKind(server.url)) {
     case 'dash': playDash(cell, server, token); break;
@@ -199,4 +212,24 @@ function refreshCellSettings(cell) {
 
 function applyAudio() {
   import('./audio.js').then(function(m) { m.applyAudio(); });
+}
+
+// Native shell: map mpv state (per screen id) onto the matching tile's state
+// machine, and empty a tile when the user closes its mpv window.
+function cellByNid(id) {
+  for (let i = 0; i < cells.length; i++) { if (cells[i].nid === id) return cells[i]; }
+  return null;
+}
+if (NATIVE) {
+  onNativeScreen(function (ev) {
+    const cell = cellByNid(ev && ev.id);
+    if (!cell || !cell.channel) return;
+    if (ev.state === 'playing') { setCellState(cell, 'playing'); setDead(cell.channel, false); }
+    else if (ev.state === 'loading') setCellState(cell, 'loading');
+    else if (ev.state === 'error') setCellState(cell, 'error');
+  });
+  onNativeClosed(function (ev) {
+    const cell = cellByNid(ev && ev.id);
+    if (cell) import('./cell.js').then(function (m) { m.clearCell(cell); });
+  });
 }

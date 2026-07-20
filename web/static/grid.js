@@ -3,6 +3,7 @@ import { makeCell, closeCellSettings } from './cell.js';
 import { setCellState, destroyCellPlayer } from './player.js';
 import { applyAudio, renderAudioButtons, stopRecording } from './audio.js';
 import { refreshHighlights, beat } from './channels.js';
+import { NATIVE, closeScreen } from './native.js';
 
 export function renderGridControls() {
   els.gridAdd.disabled = cells.length >= MAX_CELLS;
@@ -38,6 +39,9 @@ export function removeCell() {
   const cell = cells.pop();
   if (state.openSettingsCell === cell) closeCellSettings();
   if (state.recId && cell.idx === state.recCellIdx) stopRecording();
+  // Native shell: removing a tile closes its mpv window entirely (destroyCellPlayer
+  // only stops playback; close quits the process).
+  if (NATIVE) closeScreen(cell.nid);
   destroyCellPlayer(cell);
   if (cell.root.parentNode) cell.root.parentNode.removeChild(cell.root);
   if (state.audioCell >= cells.length) {

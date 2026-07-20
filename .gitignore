@@ -1,6 +1,12 @@
 watchlive.exe
 watchlive.exe~
-watchlive
+watchlive-native.exe
+# Anchored to the repo root so it ignores a root-built `watchlive` binary
+# WITHOUT also ignoring the cmd/watchlive/ package directory.
+/watchlive
+# mpv.exe is fetched by fetch-mpv.ps1, not committed (~40-80 MB, GPL player build).
+mpv/
+mpv.exe
 list.m3u
 list.txt.bak
 list.m3u.bak
@@ -25,3 +31,6 @@ keys.json.tmp
 # Embedded ffmpeg is fetched by build.ps1, not committed (keep bin/.gitkeep).
 internal/ffmpeg/bin/ffmpeg.exe
 internal/ffmpeg/bin/ffmpeg
+libmpv/*
+# libmpv shared library (~117 MB) — fetched by fetch-mpv.ps1, never committed.
+libmpv-2.dll
