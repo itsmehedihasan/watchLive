@@ -37,8 +37,8 @@ const (
 var (
 	ErrNotFound  = errors.New("channel not found")
 	ErrNotManual = errors.New("channel is not a manual entry")
-	// ErrInvalidSetting flags an UpdateXtreamSettings call with an out-of-range
-	// update_freq or stream_type value.
+	// ErrInvalidSetting flags an UpdatePlaylistFields call with a blank name or
+	// an out-of-range update_freq or stream_type value.
 	ErrInvalidSetting = errors.New("invalid xtream setting")
 )
 
@@ -794,15 +794,47 @@ func (s *Store) GetXtreamPlaylist(id string) (XtreamPlaylist, error) {
 var validUpdateFreq = map[string]bool{"manual": true, "daily": true, "3days": true, "weekly": true}
 var validStreamType = map[string]bool{"ts": true, "m3u8": true}
 
-// UpdateXtreamSettings validates and persists a playlist's auto-refresh cadence
-// and stream type, returning the updated playlist. ErrInvalidSetting on a bad
-// value; ErrNotFound if no such playlist.
-func (s *Store) UpdateXtreamSettings(id, updateFreq, streamType string) (XtreamPlaylist, error) {
-	if !validUpdateFreq[updateFreq] || !validStreamType[streamType] {
-		return XtreamPlaylist{}, ErrInvalidSetting
+// UpdatePlaylistFields partially updates a saved playlist: name, update_freq
+// and stream_type are each optional (nil leaves that column untouched),
+// letting the Playlist management tab change one field at a time without
+// resending the others. A nil name is "don't touch"; a non-nil name must be
+// non-blank after trimming. updateFreq/streamType, if provided, are validated
+// against the existing enums. Passing all three as nil is a no-op read of the
+// current row. ErrInvalidSetting on a bad or blank value; ErrNotFound if no
+// such playlist.
+func (s *Store) UpdatePlaylistFields(id string, name, updateFreq, streamType *string) (XtreamPlaylist, error) {
+	var sets []string
+	var args []any
+
+	if name != nil {
+		trimmed := strings.TrimSpace(*name)
+		if trimmed == "" {
+			return XtreamPlaylist{}, ErrInvalidSetting
+		}
+		sets = append(sets, "name=?")
+		args = append(args, trimmed)
 	}
-	res, err := s.db.Exec(`UPDATE xtream_playlists SET update_freq=?, stream_type=? WHERE id=?`,
-		updateFreq, streamType, id)
+	if updateFreq != nil {
+		if !validUpdateFreq[*updateFreq] {
+			return XtreamPlaylist{}, ErrInvalidSetting
+		}
+		sets = append(sets, "update_freq=?")
+		args = append(args, *updateFreq)
+	}
+	if streamType != nil {
+		if !validStreamType[*streamType] {
+			return XtreamPlaylist{}, ErrInvalidSetting
+		}
+		sets = append(sets, "stream_type=?")
+		args = append(args, *streamType)
+	}
+
+	if len(sets) == 0 {
+		return s.GetXtreamPlaylist(id)
+	}
+
+	args = append(args, id)
+	res, err := s.db.Exec(`UPDATE xtream_playlists SET `+strings.Join(sets, ", ")+` WHERE id=?`, args...)
 	if err != nil {
 		return XtreamPlaylist{}, err
 	}

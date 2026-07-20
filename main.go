@@ -1078,7 +1078,7 @@ func newMux(proxyHandler *proxy.Handler, staticSub fs.FS, channels *channelStore
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
 		}
-		p, err := st.UpdateXtreamSettings(id, body.UpdateFreq, body.StreamType)
+		p, err := st.UpdatePlaylistFields(id, nil, &body.UpdateFreq, &body.StreamType)
 		if errors.Is(err, store.ErrNotFound) {
 			http.Error(w, "playlist not found", http.StatusNotFound)
 			return
