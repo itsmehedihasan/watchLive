@@ -373,23 +373,40 @@ func (h *Handler) fetchUpstream(target string) fetchResult {
 		return fetchResult{status: resp.StatusCode}
 	}
 
+	// finalURL is the URL after any redirects the client followed. Manifest
+	// URLs commonly 302 from an entry host to a tokenized edge host+port (e.g.
+	// Xtream: s.host:8080/…/x.m3u8 → edge.host:25463/…/x.m3u8?token=…), and the
+	// playlist body's relative segment paths (/hlsr/<token>/…) are scoped to
+	// that EDGE. Resolving them against the original `target` would point every
+	// segment at the entry host, whose token binding is edge-scoped → 401. So
+	// rewrite/resolve against finalURL, not target. content-type sniffing still
+	// uses target's extension since resp.Request.URL may carry a ?token=… query.
+	finalURL := target
+	if resp.Request != nil && resp.Request.URL != nil {
+		finalURL = resp.Request.URL.String()
+	}
+
 	contentType := resp.Header.Get("Content-Type")
 	isHLS := strings.Contains(contentType, "mpegurl") ||
 		strings.Contains(contentType, "m3u8") ||
-		m3u8URLRe.MatchString(target)
-	isDASH := strings.Contains(contentType, "dash+xml") || mpdURLRe.MatchString(target)
+		m3u8URLRe.MatchString(target) || m3u8URLRe.MatchString(finalURL)
+	isDASH := strings.Contains(contentType, "dash+xml") ||
+		mpdURLRe.MatchString(target) || mpdURLRe.MatchString(finalURL)
 
 	if isHLS {
 		body, err := io.ReadAll(io.LimitReader(resp.Body, maxPlaylistLen))
 		if err != nil {
 			return fetchResult{err: err}
 		}
-		rewritten := []byte(RewritePlaylist(string(body), target))
+		rewritten := []byte(RewritePlaylist(string(body), finalURL))
 		h.playlists.set(target, rewritten, "application/vnd.apple.mpegurl", playlistTTL)
 		// Warm the listed segments into the cache so the player's own requests
 		// for them hit the fast path instead of paying an upstream round trip.
 		// Throttled to once per playlist refresh by the 2s playlist micro-cache.
-		h.schedulePrefetch(mediaSegments(string(body), target))
+		// Resolve against finalURL (the post-redirect edge host) so warm-ups hit
+		// the same tokenized host the player will request — resolving against the
+		// original entry host would 401 (see finalURL note above).
+		h.schedulePrefetch(mediaSegments(string(body), finalURL))
 		return fetchResult{data: rewritten, contentType: "application/vnd.apple.mpegurl", status: resp.StatusCode, isPlaylist: true}
 	}
 
@@ -406,7 +423,7 @@ func (h *Handler) fetchUpstream(target string) fetchResult {
 		if err != nil {
 			return fetchResult{err: err}
 		}
-		body = []byte(injectDASHBaseURL(string(body), target))
+		body = []byte(injectDASHBaseURL(string(body), finalURL))
 		ct := contentType
 		if ct == "" {
 			ct = "application/dash+xml"
@@ -557,7 +574,9 @@ func urlResolver(targetURL string) func(string) string {
 // an HLS MEDIA playlist, in playback order. It returns nil for a MASTER
 // playlist (a list of variant renditions) so we don't waste bandwidth warming
 // every rendition the player will never pick — the chosen variant's own media
-// playlist triggers prefetch when the player loads it.
+// playlist triggers prefetch when the player loads it. targetURL should be the
+// playlist's final (post-redirect) URL so relative segment paths resolve to the
+// same tokenized edge host the player will fetch from.
 func mediaSegments(text, targetURL string) []string {
 	if strings.Contains(text, "#EXT-X-STREAM-INF") {
 		return nil // master playlist

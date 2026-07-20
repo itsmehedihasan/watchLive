@@ -142,6 +142,54 @@ func TestProxyPlaylistRewriteEndToEnd(t *testing.T) {
 	}
 }
 
+// TestProxyPlaylistRewriteAfterRedirect covers the Xtream pattern: the manifest
+// URL 302-redirects from an entry host to a tokenized edge host, and the edge's
+// playlist body has root-relative segment paths. Those must be resolved against
+// the EDGE (the final URL after redirects), not the originally-requested entry
+// host — otherwise every segment points at the entry host and 401s.
+func TestProxyPlaylistRewriteAfterRedirect(t *testing.T) {
+	// Edge host: serves the real (redirected) media playlist with a root-relative
+	// tokenized segment path.
+	edgeMux := http.NewServeMux()
+	edgeMux.HandleFunc("/live/index.m3u8", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-mpegurl")
+		fmt.Fprint(w, "#EXTM3U\n#EXTINF:6.0,\n/hlsr/TOKEN123/seg1.ts\n")
+	})
+	edge := httptest.NewServer(edgeMux)
+	defer edge.Close()
+
+	// Entry host: 302-redirects the manifest request to the edge, preserving the
+	// path (the token would normally ride the query string).
+	entryMux := http.NewServeMux()
+	entryMux.HandleFunc("/live/index.m3u8", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, edge.URL+"/live/index.m3u8?token=abc", http.StatusFound)
+	})
+	entry := httptest.NewServer(entryMux)
+	defer entry.Close()
+
+	h := New(10 << 20)
+	h.SetAllowPrivateUpstreams(true) // httptest binds loopback
+
+	req := httptest.NewRequest(http.MethodGet, "/api/proxy?url="+url.QueryEscape(entry.URL+"/live/index.m3u8"), nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d", rec.Code)
+	}
+	// The root-relative /hlsr/TOKEN123/seg1.ts must resolve against the EDGE host,
+	// not the entry host.
+	wantSeg := "/api/proxy?url=" + url.QueryEscape(edge.URL+"/hlsr/TOKEN123/seg1.ts")
+	if !strings.Contains(rec.Body.String(), wantSeg) {
+		t.Errorf("segment resolved against wrong host:\n%s\nwant substring %q", rec.Body.String(), wantSeg)
+	}
+	// It must NOT resolve against the entry host.
+	badSeg := "/api/proxy?url=" + url.QueryEscape(entry.URL+"/hlsr/TOKEN123/seg1.ts")
+	if strings.Contains(rec.Body.String(), badSeg) {
+		t.Errorf("segment wrongly resolved against entry host:\n%s", rec.Body.String())
+	}
+}
+
 func TestProxyDASHBaseURLInjected(t *testing.T) {
 	const manifest = `<?xml version="1.0"?>
 <MPD><Period><AdaptationSet><Representation><BaseURL>video/</BaseURL>
@@ -354,6 +402,48 @@ func TestProxyPrefetchWarmsSegments(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&segHits); got != 2 {
 		t.Errorf("cache HIT reached upstream: %d hits, want 2", got)
+	}
+}
+
+// TestProxyPrefetchResolvesEdgeAfterRedirect guards against prefetch warming the
+// wrong host: when the manifest 302-redirects to a tokenized edge, the warm-ups
+// must target the edge (where root-relative segment paths + token are valid),
+// not the entry host — otherwise every warm-up 401s and the player pays the full
+// round trip anyway.
+func TestProxyPrefetchResolvesEdgeAfterRedirect(t *testing.T) {
+	var edgeHits int32
+	edgeMux := http.NewServeMux()
+	edgeMux.HandleFunc("/live/index.m3u8", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-mpegurl")
+		fmt.Fprint(w, "#EXTM3U\n#EXTINF:6.0,\n/hlsr/TOKEN/seg1.ts\n")
+	})
+	edgeMux.HandleFunc("/hlsr/TOKEN/seg1.ts", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&edgeHits, 1)
+		w.Header().Set("Content-Type", "video/MP2T")
+		fmt.Fprint(w, "SEGDATA")
+	})
+	edge := httptest.NewServer(edgeMux)
+	defer edge.Close()
+
+	entryMux := http.NewServeMux()
+	entryMux.HandleFunc("/live/index.m3u8", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, edge.URL+"/live/index.m3u8?token=abc", http.StatusFound)
+	})
+	entry := httptest.NewServer(entryMux)
+	defer entry.Close()
+
+	h := New(10 << 20)
+	h.SetAllowPrivateUpstreams(true) // httptest binds loopback
+
+	plReq := httptest.NewRequest(http.MethodGet, "/api/proxy?url="+url.QueryEscape(entry.URL+"/live/index.m3u8"), nil)
+	h.ServeHTTP(httptest.NewRecorder(), plReq)
+
+	// Prefetch must warm the EDGE segment URL, not an entry-host one.
+	if !waitCached(h, edge.URL+"/hlsr/TOKEN/seg1.ts") {
+		t.Fatalf("edge segment not warmed by prefetch (edge hits=%d)", atomic.LoadInt32(&edgeHits))
+	}
+	if got := atomic.LoadInt32(&edgeHits); got != 1 {
+		t.Errorf("expected 1 edge prefetch fetch, got %d", got)
 	}
 }
 
