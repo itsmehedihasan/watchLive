@@ -11,14 +11,12 @@ import (
 
 	"html/template"
 
-	"watchlive/internal/health"
 	"watchlive/internal/keystore"
 	"watchlive/internal/playlist"
 	"watchlive/internal/proxy"
 	"watchlive/internal/recorder"
 	"watchlive/internal/resolver"
 	"watchlive/internal/store"
-	"watchlive/internal/viewers"
 	"watchlive/internal/xtream"
 )
 
@@ -41,8 +39,8 @@ func testMux(t *testing.T) (*http.ServeMux, *channelStore, *store.Store) {
 	rmgr := resolver.NewManager()
 	rmgr.Add(resolver.Exposestrat{})
 	mux := newMux(
-		proxy.New(1<<20), viewers.NewStore(), fstest.MapFS{}, cs, st, ks,
-		recorder.New("", dir), health.New(), rmgr, tmpl,
+		proxy.New(1<<20), fstest.MapFS{}, cs, st, ks,
+		recorder.New("", dir), rmgr, tmpl,
 	)
 	return mux, cs, st
 }
@@ -265,8 +263,8 @@ func TestChannelsETagAndGzip(t *testing.T) {
 	if rec.Code != http.StatusOK || etag == "" {
 		t.Fatalf("channels: code=%d etag=%q", rec.Code, etag)
 	}
-	if !strings.Contains(rec.Body.String(), `"is_favourite"`) || !strings.Contains(rec.Body.String(), `"is_working"`) {
-		t.Errorf("channels payload missing is_favourite/is_working fields")
+	if !strings.Contains(rec.Body.String(), `"is_favourite"`) {
+		t.Errorf("channels payload missing is_favourite field")
 	}
 
 	// If-None-Match → 304.

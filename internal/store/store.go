@@ -1,13 +1,13 @@
 // Package store is the SQLite-backed catalog of record for watchLive. It holds
 // every channel (fetched from the iptv-org API, or added manually) together with
 // the user state that used to live in the browser and on-disk JSON: which
-// channels are favourited, and which the health prober found reachable.
+// channels are favourited.
 //
 // The catalog is the source of truth; the m3u feed is only the transport format
 // it is populated from. Channel IDs are the stable IDs minted by package
-// playlist, so favourites and health verdicts re-attach to the right rows across
-// re-syncs (the old positional IDs shifted every sync, which is why the browser
-// keyed favourites by name).
+// playlist, so favourites re-attach to the right rows across re-syncs (the old
+// positional IDs shifted every sync, which is why the browser keyed favourites
+// by name).
 package store
 
 import (
@@ -18,11 +18,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/url"
 	"strings"
 	"time"
 
-	"watchlive/internal/health"
 	"watchlive/internal/playlist"
 
 	_ "modernc.org/sqlite"
@@ -60,14 +58,11 @@ CREATE TABLE IF NOT EXISTS channels (
     http_referer    TEXT NOT NULL DEFAULT '',
     resolver        TEXT NOT NULL DEFAULT '',
     resolver_arg    TEXT NOT NULL DEFAULT '',
-    is_working      INTEGER,
-    last_checked_at INTEGER,
     is_favourite    INTEGER NOT NULL DEFAULT 0,
     is_manual       INTEGER NOT NULL DEFAULT 0,
     sort_name       TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_channels_sort    ON channels(sort_name);
-CREATE INDEX IF NOT EXISTS idx_channels_checked ON channels(last_checked_at);
 
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 
@@ -107,9 +102,6 @@ type Channel struct {
 	Resolver    string `json:"resolver,omitempty"`
 	ResolverArg string `json:"resolver_arg,omitempty"`
 	IsFavourite bool   `json:"is_favourite"`
-	// IsWorking is null until the channel has been probed, then true/false. The
-	// frontend treats only an explicit false as "hide when working-only".
-	IsWorking *bool `json:"is_working"`
 	// CatOrder is the category's position in its source Xtream panel, used to
 	// render Xtream groups in panel order. 0 for non-Xtream channels.
 	CatOrder int `json:"cat_order"`
@@ -200,10 +192,10 @@ func (s *Store) IsEmpty() (bool, error) {
 }
 
 // ListChannels returns the whole catalog in display order (A→Z), each row
-// carrying its favourite and working state.
+// carrying its favourite state.
 func (s *Store) ListChannels() ([]Channel, error) {
 	rows, err := s.db.Query(`
-		SELECT id, name, logo, grp, typ, servers, clear_keys, http_user_agent, http_referer, resolver, resolver_arg, is_favourite, is_working, cat_order, xtream_playlist_id
+		SELECT id, name, logo, grp, typ, servers, clear_keys, http_user_agent, http_referer, resolver, resolver_arg, is_favourite, cat_order, xtream_playlist_id
 		FROM channels ORDER BY sort_name, name`)
 	if err != nil {
 		return nil, err
@@ -231,9 +223,8 @@ func scanChannel(row scanner) (Channel, error) {
 		serversJS string
 		clearJS   string
 		fav       int
-		working   sql.NullInt64
 	)
-	if err := row.Scan(&ch.ID, &ch.Name, &ch.Logo, &ch.Group, &ch.Type, &serversJS, &clearJS, &ch.UserAgent, &ch.Referer, &ch.Resolver, &ch.ResolverArg, &fav, &working, &ch.CatOrder, &ch.XtreamPlaylistID); err != nil {
+	if err := row.Scan(&ch.ID, &ch.Name, &ch.Logo, &ch.Group, &ch.Type, &serversJS, &clearJS, &ch.UserAgent, &ch.Referer, &ch.Resolver, &ch.ResolverArg, &fav, &ch.CatOrder, &ch.XtreamPlaylistID); err != nil {
 		return Channel{}, err
 	}
 	if serversJS != "" {
@@ -247,17 +238,13 @@ func scanChannel(row scanner) (Channel, error) {
 		}
 	}
 	ch.IsFavourite = fav != 0
-	if working.Valid {
-		b := working.Int64 != 0
-		ch.IsWorking = &b
-	}
 	return ch, nil
 }
 
 // UpsertCatalog inserts new channels and updates the feed-sourced fields of
-// existing ones, preserving user state (favourite, working verdict, manual
-// rows). It returns counts and the set of IDs present in this feed, which the
-// caller can pass to PruneOrphans.
+// existing ones, preserving user state (favourite, manual rows). It returns
+// counts and the set of IDs present in this feed, which the caller can pass to
+// PruneOrphans.
 func (s *Store) UpsertCatalog(chs []playlist.Channel) (ins, upd int, seen map[string]bool, err error) {
 	seen = make(map[string]bool, len(chs))
 	existing, err := s.idSet()
@@ -275,9 +262,9 @@ func (s *Store) UpsertCatalog(chs []playlist.Channel) (ins, upd int, seen map[st
 		}
 	}()
 
-	// is_favourite / is_working / last_checked_at are intentionally absent from
-	// the SET list so they survive a re-sync; the WHERE keeps manual rows (which
-	// never appear in the feed anyway) untouched even on an ID collision.
+	// is_favourite is intentionally absent from the SET list so it survives a
+	// re-sync; the WHERE keeps manual rows (which never appear in the feed
+	// anyway) untouched even on an ID collision.
 	stmt, err := tx.Prepare(`
 		INSERT INTO channels (id, name, logo, grp, typ, servers, clear_keys, http_user_agent, http_referer, sort_name, is_manual)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
@@ -349,9 +336,9 @@ func (s *Store) SetFavourite(id string, on bool) (ok bool, err error) {
 	return n > 0, nil
 }
 
-// AddManual inserts a user-provided channel. It is favourited and marked working
-// by default (the user just gave us a URL they want), and idempotent on the same
-// name+url so a re-add doesn't duplicate.
+// AddManual inserts a user-provided channel. It is favourited by default (the
+// user just gave us a URL they want), and idempotent on the same name+url so a
+// re-add doesn't duplicate.
 func (s *Store) AddManual(name, url string, clearKeys map[string]string, referer, userAgent string) (Channel, error) {
 	name, url = strings.TrimSpace(name), strings.TrimSpace(url)
 	referer, userAgent = strings.TrimSpace(referer), strings.TrimSpace(userAgent)
@@ -360,12 +347,12 @@ func (s *Store) AddManual(name, url string, clearKeys map[string]string, referer
 
 	_, err := s.db.Exec(`
 		INSERT INTO channels
-			(id, name, logo, grp, typ, servers, clear_keys, http_referer, http_user_agent, is_working, last_checked_at, is_favourite, is_manual, sort_name)
-		VALUES (?, ?, '', ?, ?, ?, ?, ?, ?, 1, ?, 1, 1, ?)
+			(id, name, logo, grp, typ, servers, clear_keys, http_referer, http_user_agent, is_favourite, is_manual, sort_name)
+		VALUES (?, ?, '', ?, ?, ?, ?, ?, ?, 1, 1, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			name=excluded.name, servers=excluded.servers, clear_keys=excluded.clear_keys,
 			http_referer=excluded.http_referer, http_user_agent=excluded.http_user_agent, sort_name=excluded.sort_name`,
-		id, name, manualGroup, manualType, string(serversJS), marshalKeys(clearKeys), referer, userAgent, now().Unix(), strings.ToLower(name))
+		id, name, manualGroup, manualType, string(serversJS), marshalKeys(clearKeys), referer, userAgent, strings.ToLower(name))
 	if err != nil {
 		return Channel{}, err
 	}
@@ -375,7 +362,7 @@ func (s *Store) AddManual(name, url string, clearKeys map[string]string, referer
 // AddResolvable inserts a dynamic channel whose playable URL is not stored but
 // resolved at play time by the named provider from arg (e.g. a stream slug).
 // referer/userAgent are the headers the *resolved* stream needs when played.
-// Like AddManual it is favourited + working by default and idempotent on
+// Like AddManual it is favourited by default and idempotent on
 // name+provider+arg. Servers starts empty and is filled by SetResolvedURL after
 // the first resolve.
 func (s *Store) AddResolvable(name, provider, arg, referer, userAgent string) (Channel, error) {
@@ -384,12 +371,12 @@ func (s *Store) AddResolvable(name, provider, arg, referer, userAgent string) (C
 	id := "manual:" + manualHash(name, provider+"|"+arg)
 	_, err := s.db.Exec(`
 		INSERT INTO channels
-			(id, name, logo, grp, typ, servers, clear_keys, http_referer, http_user_agent, resolver, resolver_arg, is_working, last_checked_at, is_favourite, is_manual, sort_name)
-		VALUES (?, ?, '', ?, ?, '[]', '', ?, ?, ?, ?, 1, ?, 1, 1, ?)
+			(id, name, logo, grp, typ, servers, clear_keys, http_referer, http_user_agent, resolver, resolver_arg, is_favourite, is_manual, sort_name)
+		VALUES (?, ?, '', ?, ?, '[]', '', ?, ?, ?, ?, 1, 1, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			name=excluded.name, http_referer=excluded.http_referer, http_user_agent=excluded.http_user_agent,
 			resolver=excluded.resolver, resolver_arg=excluded.resolver_arg, sort_name=excluded.sort_name`,
-		id, name, manualGroup, manualType, referer, userAgent, provider, arg, now().Unix(), strings.ToLower(name))
+		id, name, manualGroup, manualType, referer, userAgent, provider, arg, strings.ToLower(name))
 	if err != nil {
 		return Channel{}, err
 	}
@@ -462,65 +449,10 @@ func (s *Store) URLIndex() (map[string]ChannelRef, error) {
 	return idx, rows.Err()
 }
 
-// BackfillHeaders fills the http_user_agent / http_referer columns of EXISTING
-// channels from seed channels matched by EXACT stream URL. It is fill-only (a
-// blank seed value never clears an existing column), touches no other column,
-// and adds or removes no channel — so it is safe to run repeatedly and never
-// disturbs favourites, health verdicts, logos, or categories. Returns the number
-// of channels updated. Used to seed header hints into a catalog that predates
-// the columns, without re-syncing or wiping it.
-func (s *Store) BackfillHeaders(chs []playlist.Channel) (updated int, err error) {
-	idx, err := s.URLIndex()
-	if err != nil {
-		return 0, err
-	}
-	tx, err := s.db.Begin()
-	if err != nil {
-		return 0, err
-	}
-	defer func() {
-		if err != nil {
-			tx.Rollback()
-		}
-	}()
-	stmt, err := tx.Prepare(`
-		UPDATE channels SET
-			http_user_agent = CASE WHEN ? <> '' THEN ? ELSE http_user_agent END,
-			http_referer    = CASE WHEN ? <> '' THEN ? ELSE http_referer END
-		WHERE id = ?`)
-	if err != nil {
-		return 0, err
-	}
-	defer stmt.Close()
-
-	done := make(map[string]bool) // one update per channel (first matching URL wins)
-	for _, ch := range chs {
-		if ch.UserAgent == "" && ch.Referer == "" {
-			continue
-		}
-		for _, sv := range ch.Servers {
-			ref, ok := idx[sv.URL]
-			if !ok || done[ref.ID] {
-				continue
-			}
-			if _, err = stmt.Exec(ch.UserAgent, ch.UserAgent, ch.Referer, ch.Referer, ref.ID); err != nil {
-				return 0, err
-			}
-			done[ref.ID] = true
-			updated++
-			break // this seed channel's headers are now placed on its catalog match
-		}
-	}
-	if err = tx.Commit(); err != nil {
-		return 0, err
-	}
-	return updated, nil
-}
-
 // ImportManual bulk-inserts reviewed playlist entries as manual channels in one
-// transaction. Like AddManual they are marked working and survive re-syncs, but
-// they are NOT auto-favourited (importing a list shouldn't flood Favourites —
-// the single "+" add does favourite, since that's a deliberate one-off).
+// transaction. Like AddManual they survive re-syncs, but they are NOT
+// auto-favourited (importing a list shouldn't flood Favourites — the single "+"
+// add does favourite, since that's a deliberate one-off).
 //
 // Dedupe is by LINK (exact URL), not name: an entry whose URL already exists
 // anywhere in the catalog is skipped, as is a repeated URL within the batch.
@@ -543,8 +475,8 @@ func (s *Store) ImportManual(entries []ImportEntry) (added int, err error) {
 	}()
 	stmt, err := tx.Prepare(`
 		INSERT INTO channels
-			(id, name, logo, grp, typ, servers, clear_keys, is_working, last_checked_at, is_favourite, is_manual, sort_name)
-		VALUES (?, ?, '', ?, ?, ?, ?, 1, ?, 0, 1, ?)
+			(id, name, logo, grp, typ, servers, clear_keys, is_favourite, is_manual, sort_name)
+		VALUES (?, ?, '', ?, ?, ?, ?, 0, 1, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			name=excluded.name, servers=excluded.servers, clear_keys=excluded.clear_keys, sort_name=excluded.sort_name`)
 	if err != nil {
@@ -552,7 +484,6 @@ func (s *Store) ImportManual(entries []ImportEntry) (added int, err error) {
 	}
 	defer stmt.Close()
 
-	ts := now().Unix()
 	seenURL := make(map[string]bool, len(entries))
 	for _, e := range entries {
 		name, url := strings.TrimSpace(e.Name), strings.TrimSpace(e.URL)
@@ -568,7 +499,7 @@ func (s *Store) ImportManual(entries []ImportEntry) (added int, err error) {
 		seenURL[url] = true
 		id := "manual:" + manualHash(name, url)
 		serversJS, _ := json.Marshal([]playlist.Server{{URL: url}})
-		if _, err = stmt.Exec(id, name, manualGroup, manualType, string(serversJS), marshalKeys(e.ClearKeys), ts, strings.ToLower(name)); err != nil {
+		if _, err = stmt.Exec(id, name, manualGroup, manualType, string(serversJS), marshalKeys(e.ClearKeys), strings.ToLower(name)); err != nil {
 			return 0, err
 		}
 		added++
@@ -580,7 +511,7 @@ func (s *Store) ImportManual(entries []ImportEntry) (added int, err error) {
 }
 
 // UpdateManual replaces a manual channel's name and stream link in place, keyed
-// by ID so the favourite/health state tied to that ID survives the edit (the ID
+// by ID so the favourite state tied to that ID survives the edit (the ID
 // is opaque after creation, so it intentionally does NOT track the new
 // name/url hash). It refuses feed channels (their fields are overwritten on the
 // next sync anyway), mirroring DeleteManual's errors: ErrNotFound when the id is
@@ -638,335 +569,9 @@ func (s *Store) Get(id string) (Channel, error) {
 
 func (s *Store) getChannel(id string) (Channel, error) {
 	row := s.db.QueryRow(`
-		SELECT id, name, logo, grp, typ, servers, clear_keys, http_user_agent, http_referer, resolver, resolver_arg, is_favourite, is_working, cat_order, xtream_playlist_id
+		SELECT id, name, logo, grp, typ, servers, clear_keys, http_user_agent, http_referer, resolver, resolver_arg, is_favourite, cat_order, xtream_playlist_id
 		FROM channels WHERE id=?`, id)
 	return scanChannel(row)
-}
-
-// SetHealth records probe verdicts: for each mapped channel it stores the
-// reachable flag and the check time. Channels absent from the map keep their
-// prior verdict (a selective re-probe only touches stale rows).
-func (s *Store) SetHealth(verdicts map[string]bool, at time.Time) error {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if err != nil {
-			tx.Rollback()
-		}
-	}()
-	stmt, err := tx.Prepare(`UPDATE channels SET is_working=?, last_checked_at=? WHERE id=?`)
-	if err != nil {
-		return err
-	}
-	defer stmt.Close()
-	ts := at.Unix()
-	for id, alive := range verdicts {
-		v := 0
-		if alive {
-			v = 1
-		}
-		if _, err = stmt.Exec(v, ts, id); err != nil {
-			return err
-		}
-	}
-	return tx.Commit()
-}
-
-// StaleTargets returns probe targets for channels whose verdict is missing or
-// older than ttl. force returns every channel regardless of age (the "Working
-// only" toggle re-checks the whole catalog).
-func (s *Store) StaleTargets(ttl time.Duration, force bool) ([]health.Target, error) {
-	var (
-		rows *sql.Rows
-		err  error
-	)
-	if force {
-		rows, err = s.db.Query(`SELECT id, servers, http_user_agent, http_referer FROM channels`)
-	} else {
-		cutoff := now().Add(-ttl).Unix()
-		rows, err = s.db.Query(`
-			SELECT id, servers, http_user_agent, http_referer FROM channels
-			WHERE last_checked_at IS NULL OR last_checked_at < ?`, cutoff)
-	}
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var targets []health.Target
-	for rows.Next() {
-		var id, serversJS, ua, referer string
-		if err := rows.Scan(&id, &serversJS, &ua, &referer); err != nil {
-			return nil, err
-		}
-		var servers []playlist.Server
-		if serversJS != "" {
-			if err := json.Unmarshal([]byte(serversJS), &servers); err != nil {
-				return nil, err
-			}
-		}
-		urls := make([]string, 0, len(servers))
-		for _, sv := range servers {
-			urls = append(urls, sv.URL)
-		}
-		targets = append(targets, health.Target{ID: id, URLs: urls, UserAgent: ua, Referer: referer})
-	}
-	return targets, rows.Err()
-}
-
-// urlHost returns the lowercase host[:port] of a URL, or "" if unparseable.
-func urlHost(raw string) string {
-	u, err := url.Parse(raw)
-	if err != nil {
-		return ""
-	}
-	return strings.ToLower(u.Host)
-}
-
-// RefreshLinksByHost updates stale stream URLs in place from a seed playlist,
-// matched per channel (by stable ID) and per server (by exact host). For a
-// catalog server whose URL is absent from the seed channel but whose host
-// matches exactly one seed URL not already in the catalog, the URL is swapped to
-// that seed URL. It is deliberately narrow and mismatch-safe:
-//
-//   - the channel join is by stable ID, so a shared CDN host can never pull in a
-//     different channel's stream;
-//   - the host is unchanged, so any http_user_agent / http_referer hint still
-//     applies;
-//   - a changed channel's health verdict is reset (is_working / last_checked_at
-//     → NULL) so the prober re-checks the new URL instead of trusting the old.
-//
-// Servers whose old host maps to MORE THAN ONE candidate seed path are skipped
-// (ambiguous) and counted in skipped. Host changes (no host match) are out of
-// scope and left untouched. With dryRun the work is computed and rolled back.
-// Returns channels changed, links replaced, and ambiguous servers skipped.
-func (s *Store) RefreshLinksByHost(chs []playlist.Channel, dryRun bool) (chChanged, linksReplaced, skipped int, err error) {
-	seed := make(map[string][]string, len(chs))
-	for _, ch := range chs {
-		urls := make([]string, 0, len(ch.Servers))
-		for _, sv := range ch.Servers {
-			if sv.URL != "" {
-				urls = append(urls, sv.URL)
-			}
-		}
-		seed[ch.ID] = urls
-	}
-
-	// Read every catalog channel first (single connection: no updates mid-query).
-	type row struct {
-		id      string
-		servers []playlist.Server
-	}
-	rows, err := s.db.Query(`SELECT id, servers FROM channels`)
-	if err != nil {
-		return 0, 0, 0, err
-	}
-	var all []row
-	for rows.Next() {
-		var id, sj string
-		if err := rows.Scan(&id, &sj); err != nil {
-			rows.Close()
-			return 0, 0, 0, err
-		}
-		var servers []playlist.Server
-		if sj != "" {
-			if err := json.Unmarshal([]byte(sj), &servers); err != nil {
-				rows.Close()
-				return 0, 0, 0, err
-			}
-		}
-		all = append(all, row{id: id, servers: servers})
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return 0, 0, 0, err
-	}
-
-	tx, err := s.db.Begin()
-	if err != nil {
-		return 0, 0, 0, err
-	}
-	defer func() {
-		if err != nil {
-			tx.Rollback()
-		}
-	}()
-	stmt, err := tx.Prepare(`UPDATE channels SET servers=?, is_working=NULL, last_checked_at=NULL WHERE id=?`)
-	if err != nil {
-		return 0, 0, 0, err
-	}
-	defer stmt.Close()
-
-	for _, r := range all {
-		seedURLs, ok := seed[r.id]
-		if !ok || len(r.servers) == 0 {
-			continue
-		}
-		seedSet := make(map[string]bool, len(seedURLs))
-		for _, u := range seedURLs {
-			seedSet[u] = true
-		}
-		dbSet := make(map[string]bool, len(r.servers))
-		for _, sv := range r.servers {
-			dbSet[sv.URL] = true
-		}
-
-		changed := false
-		for i, sv := range r.servers {
-			if seedSet[sv.URL] {
-				continue // still current
-			}
-			h := urlHost(sv.URL)
-			if h == "" {
-				continue
-			}
-			var cands []string
-			for _, su := range seedURLs {
-				if !dbSet[su] && urlHost(su) == h {
-					cands = append(cands, su)
-				}
-			}
-			switch {
-			case len(cands) == 1:
-				r.servers[i].URL = cands[0]
-				linksReplaced++
-				changed = true
-			case len(cands) > 1:
-				skipped++
-			}
-		}
-		if !changed {
-			continue
-		}
-		chChanged++
-		js, merr := json.Marshal(r.servers)
-		if merr != nil {
-			err = merr
-			return 0, 0, 0, err
-		}
-		if _, err = stmt.Exec(string(js), r.id); err != nil {
-			return 0, 0, 0, err
-		}
-	}
-
-	if dryRun {
-		err = tx.Rollback()
-		return chChanged, linksReplaced, skipped, nil
-	}
-	if err = tx.Commit(); err != nil {
-		return 0, 0, 0, err
-	}
-	return chChanged, linksReplaced, skipped, nil
-}
-
-// SyncLinksFromSeed makes each shared channel's stream links match the seed
-// exactly: for a catalog channel whose ID is also in the seed and whose server
-// URL set differs, its servers are replaced wholesale with the seed channel's
-// servers (URLs + quality labels). It is links-only and membership-safe:
-//
-//   - matched by stable ID, so only channels already in the catalog change;
-//   - name, logo, group, category, favourite, manual flag and the backfilled
-//     header hints are left untouched — only the servers column is rewritten;
-//   - no channel is inserted or deleted;
-//   - a changed channel's health verdict is reset (is_working / last_checked_at
-//     → NULL) so the prober re-checks the new links.
-//
-// With dryRun the work is computed and rolled back. Returns the number of
-// channels whose links changed.
-func (s *Store) SyncLinksFromSeed(chs []playlist.Channel, dryRun bool) (changed int, err error) {
-	seed := make(map[string][]playlist.Server, len(chs))
-	for _, ch := range chs {
-		seed[ch.ID] = ch.Servers
-	}
-
-	rows, err := s.db.Query(`SELECT id, servers FROM channels`)
-	if err != nil {
-		return 0, err
-	}
-	type row struct {
-		id     string
-		urlSet map[string]bool
-	}
-	var all []row
-	for rows.Next() {
-		var id, sj string
-		if err := rows.Scan(&id, &sj); err != nil {
-			rows.Close()
-			return 0, err
-		}
-		var servers []playlist.Server
-		if sj != "" {
-			if err := json.Unmarshal([]byte(sj), &servers); err != nil {
-				rows.Close()
-				return 0, err
-			}
-		}
-		set := make(map[string]bool, len(servers))
-		for _, sv := range servers {
-			set[sv.URL] = true
-		}
-		all = append(all, row{id: id, urlSet: set})
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return 0, err
-	}
-
-	tx, err := s.db.Begin()
-	if err != nil {
-		return 0, err
-	}
-	defer func() {
-		if err != nil {
-			tx.Rollback()
-		}
-	}()
-	stmt, err := tx.Prepare(`UPDATE channels SET servers=?, is_working=NULL, last_checked_at=NULL WHERE id=?`)
-	if err != nil {
-		return 0, err
-	}
-	defer stmt.Close()
-
-	for _, r := range all {
-		seedServers, ok := seed[r.id]
-		if !ok {
-			continue
-		}
-		// Differ only when the URL sets are not equal (order/label-only changes
-		// are ignored to avoid needless health resets).
-		same := len(seedServers) == len(r.urlSet)
-		if same {
-			for _, sv := range seedServers {
-				if !r.urlSet[sv.URL] {
-					same = false
-					break
-				}
-			}
-		}
-		if same {
-			continue
-		}
-		js, merr := json.Marshal(seedServers)
-		if merr != nil {
-			err = merr
-			return 0, err
-		}
-		if _, err = stmt.Exec(string(js), r.id); err != nil {
-			return 0, err
-		}
-		changed++
-	}
-
-	if dryRun {
-		err = tx.Rollback()
-		return changed, nil
-	}
-	if err = tx.Commit(); err != nil {
-		return 0, err
-	}
-	return changed, nil
 }
 
 // PruneOrphans deletes channels that are no longer in the latest feed (not in
@@ -1040,29 +645,6 @@ func (s *Store) PruneUnkept() (int, error) {
 	}
 	n, _ := res.RowsAffected()
 	return int(n), nil
-}
-
-// HealthVerdicts returns the persisted reachable/unreachable verdict for every
-// channel that has been probed (is_working not null). It seeds the in-memory
-// prober at startup so a fresh process reports health without re-probing.
-func (s *Store) HealthVerdicts() (map[string]bool, error) {
-	rows, err := s.db.Query(`SELECT id, is_working FROM channels WHERE is_working IS NOT NULL`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := make(map[string]bool)
-	for rows.Next() {
-		var (
-			id      string
-			working int
-		)
-		if err := rows.Scan(&id, &working); err != nil {
-			return nil, err
-		}
-		out[id] = working != 0
-	}
-	return out, rows.Err()
 }
 
 // GetMeta returns a meta value, or "" when the key is absent.
@@ -1281,12 +863,12 @@ func (s *Store) UpsertXtreamChannels(playlistID string, streams []XtreamStream) 
 			tx.Rollback()
 		}
 	}()
-	// is_favourite / is_working / last_checked_at are absent from the SET list so
-	// a refresh preserves the user's favourite and the prober's verdict.
+	// is_favourite is absent from the SET list so a refresh preserves the user's
+	// favourite.
 	stmt, err := tx.Prepare(`
 		INSERT INTO channels
-			(id, name, logo, grp, typ, servers, is_working, last_checked_at, is_favourite, is_manual, sort_name, xtream_playlist_id, cat_order)
-		VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, 0, 1, ?, ?, ?)
+			(id, name, logo, grp, typ, servers, is_favourite, is_manual, sort_name, xtream_playlist_id, cat_order)
+		VALUES (?, ?, ?, ?, ?, ?, 0, 1, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			name=excluded.name, logo=excluded.logo, grp=excluded.grp, typ=excluded.typ,
 			servers=excluded.servers, sort_name=excluded.sort_name,

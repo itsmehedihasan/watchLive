@@ -18,12 +18,6 @@ export const state = {
   volume: 1,
   pickerTarget: -1,
   deadMarks: {},
-  healthOn: true,
-  health: {},
-  healthProbing: false,
-  healthDone: 0,
-  healthTotal: 0,
-  healthPoll: null,
   openSettingsCell: null,
   channelModalMode: 'add',
   channelModalId: null,
@@ -61,7 +55,6 @@ export const els = {
   channelList: $('channelList'), listLoading: $('listLoading'),
   emptyState: $('emptyState'), emptyClear: $('emptyClear'),
   channelCount: $('channelCount'),
-  healthToggle: $('healthToggle'), healthStatus: $('healthStatus'),
   picker: $('picker'), pickerTitle: $('pickerTitle'), pickerClose: $('pickerClose'),
   pickerSearch: $('pickerSearch'), pickerSearchClear: $('pickerSearchClear'),
   pickerList: $('pickerList'), pickerCount: $('pickerCount'),
@@ -90,4 +83,3 @@ export const els = {
 };
 
 try { state.deadMarks = JSON.parse(localStorage.getItem('livetv_dead')) || {}; } catch(e) {}
-state.healthOn = localStorage.getItem('livetv_health_on') !== '0';

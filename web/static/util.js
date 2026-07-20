@@ -8,8 +8,6 @@ export function streamKind(url) {
   return 'hls';
 }
 
-export function formatViewers(n) { return n >= 1000 ? (n / 1000).toFixed(1) + 'K' : String(n); }
-
 export function logoOrFallback(ch, imgClass, fbClass) {
   const fallback = document.createElement('div');
   fallback.className = fbClass;

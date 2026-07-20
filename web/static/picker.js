@@ -1,5 +1,5 @@
 import { state, cells, els, RENDER_CAP } from './state.js';
-import { passesHealth, makeChannelButton } from './channels.js';
+import { makeChannelButton } from './channels.js';
 import { assignChannel } from './cell.js';
 
 export function openPicker(cellIdx) {
@@ -25,7 +25,7 @@ export function closePicker() {
 }
 
 function pickerChannels() {
-  let base = state.channels.filter(passesHealth);
+  let base = state.channels;
   if (state.pickerSearch) {
     const q = state.pickerSearch.toLowerCase();
     base = base.filter(function (ch) {
@@ -50,7 +50,7 @@ export function renderPicker() {
   els.pickerList.scrollTop = 0;
   const n = matches.length;
   els.pickerCount.textContent = state.channelsLoading ? 'Loading…'
-    : n === 0 ? (state.sourceRefreshing ? 'Fetching channels…' : (state.healthOn ? 'No working channels found yet — health check may still be running' : 'No channels found'))
+    : n === 0 ? (state.sourceRefreshing ? 'Fetching channels…' : 'No channels found')
     : n > RENDER_CAP ? ('Showing first ' + RENDER_CAP + ' of ' + n + ' — search to narrow')
     : (n + ' live channel' + (n === 1 ? '' : 's'));
 }

@@ -1,10 +1,10 @@
 # watchlive (Go)
 
-Single-binary live TV streaming server: web UI, HLS/DASH stream proxy, screen recording, and a live viewer counter in one executable with near-zero runtime dependencies. Web assets and a starter playlist are embedded, so it runs with no external files.
+Single-binary live TV streaming server: web UI, HLS/DASH stream proxy, and screen recording in one executable with near-zero runtime dependencies. Web assets are embedded, so it runs with no external files.
 
-Channels live in a local **SQLite catalog** (`store/catalog.db`, created next to the binary). On first run the catalog is seeded from the embedded playlist so the UI is never blank — even offline — then a background fetch from the [iptv-org](https://github.com/iptv-org/iptv) API fills it with the full catalogue (~11k channels). Your favourites, manually-added channels, and stream-health verdicts persist in that DB and survive re-syncs.
+Channels live in a local **SQLite catalog** (`store/catalog.db`, created next to the binary). Your favourites and manually-added channels persist in that DB and survive re-syncs. (The upstream [iptv-org](https://github.com/iptv-org/iptv) refresh and Sync are wired but currently disabled.)
 
-The UI is a multi-cell **video wall**: each cell plays its own channel. Browse via a **category** panel (News / Sports / Movies / Music / Kids / Religious / Entertainment, joined from iptv-org's database on `tvg-id`) and a **country** panel with search. Plus: a **Favourites** section, a **working-only** health filter, manual channel add, **.m3u import** with duplicate detection, optional **screen recording** to MP4, and **ClearKey** decryption for CENC-protected DASH streams.
+The UI is a multi-cell **video wall**: each cell plays its own channel. Browse via a **category** panel (News / Sports / Movies / Music / Kids / Religious / Entertainment, joined from iptv-org's database on `tvg-id`) and a **country** panel with search. Plus: a **Favourites** section, manual channel add, **.m3u import** with duplicate detection, optional **screen recording** to MP4, and **ClearKey** decryption for CENC-protected DASH streams.
 
 ---
 
@@ -16,10 +16,8 @@ No install, no Go, no config:
 2. Unzip it anywhere.
 3. Double-click **`WatchLive.bat`**.
 
-The server starts, your browser opens to `http://localhost:3000`, and channels appear
-immediately — a default playlist is bundled into the binary, so it works even offline.
-With internet, the catalog refreshes from iptv-org in the background. Close the console
-window to stop the server.
+The server starts, your browser opens to `http://localhost:3000`, and channels are served
+from the local `store/catalog.db`. Close the console window to stop the server.
 
 > Building from source instead? See [Build](#build) below.
 
@@ -78,10 +76,9 @@ Omit `-ldflags "-s -w"` if you need a debuggable build.
 
 The catalog is a SQLite database; the M3U feed is only the transport format it is
 populated from. Channels carry stable IDs (derived from `tvg-id`, else a content hash),
-so favourites and health verdicts re-attach to the right rows across re-syncs.
+so favourites re-attach to the right rows across re-syncs.
 
-- **First run:** seeded from the embedded `seed.m3u` so the UI shows channels instantly, then a background fetch from `-source-url` upserts the full catalogue.
-- **Sync** (button in the UI, or `POST /api/sync`): re-fetches the API and **upserts** by stable ID — new channels added, existing ones updated, your favourites / health / manual rows preserved. With `-prune`, channels that vanished upstream are removed (favourited and manual ones are always kept).
+- **Sync** (`POST /api/sync`) and the background iptv-org refresh are wired but **currently disabled** — the server serves the catalog as-is. `refresh()` / `fetchAndEnrich()` and the `-source-url` / `-no-refresh` / `-prune` flags remain in place for a future sync rework. When re-enabled, Sync **upserts** by stable ID — new channels added, existing ones updated, favourites and manual rows preserved.
 
 ### Custom playlist mode
 
@@ -153,8 +150,7 @@ The resulting file can be fed to the server with `--playlist`.
 | `GET`         | `/`                        | Web UI                                                                                         |
 | `GET`         | `/api/channels`            | Catalog as JSON; gzip-compressed, ETag revalidation (304 when unchanged)                      |
 | `GET`         | `/api/proxy?url=<url>`     | HLS/DASH proxy: spoofs browser headers, rewrites playlist URLs, prefetches & serves segments from an LRU cache; blocks private/loopback upstreams (SSRF guard) |
-| `GET\|POST`   | `/api/viewers`             | Heartbeat + live counts (`{total, channelCount, top}`); sessions expire 60 s after last beat  |
-| `POST`        | `/api/sync`                | Re-fetch upstream and upsert into the catalog. Returns `{channels}`. *(409 in `--playlist` mode)* |
+| `POST`        | `/api/sync`                | Sync is disabled — always returns `403`                                                       |
 | `GET`         | `/api/source`              | Refresh status (`{refreshing, channels, recordingAvailable}`) for the UI to poll              |
 | `POST`        | `/api/favourite`           | `{id, on}` — toggle a channel's favourite flag                                                |
 | `POST`        | `/api/channels/add`        | `{name, url, license?}` — add a manual channel                                                |
@@ -164,7 +160,6 @@ The resulting file can be fed to the server with `--playlist`.
 | `POST`        | `/api/import/check`        | `{entries}` → `{new, duplicates}` (link de-dup vs catalog; no save)                           |
 | `POST`        | `/api/import/save`         | `{entries}` → `{added}` — persist reviewed entries as manual channels                         |
 | `GET`         | `/api/keys`                | ClearKey DRM map (`{kid: key}`)                                                               |
-| `GET\|POST`   | `/api/health`              | Stream health: `POST` probes stale (or all, `?force=1`) channels; `GET` returns progress + verdicts |
 | `POST`        | `/api/record/start\|stop`  | Start/stop a server-side recording (ffmpeg → 720p H.264/AAC MP4)                              |
 | `GET`         | `/api/record`              | List recordings (active and finished)                                                         |
 | `GET`         | `/api/record/file?name=`   | Download a saved recording                                                                    |
@@ -182,18 +177,15 @@ go test ./...
 ## Layout
 
 ```
-main.go                    server wiring, flags, embeds, catalog refresh, graceful shutdown
-internal/store/            SQLite catalog (channels, favourites, health, manual rows)
+main.go                    server wiring, flags, embeds, graceful shutdown
+internal/store/            SQLite catalog (channels, favourites, manual rows)
 internal/playlist/         M3U parser, stable channel IDs, ClearKey extraction
 internal/genre/            iptv-org category lookup + tvg-genre enrichment
 internal/proxy/            HLS/DASH proxy, LRU segment cache, prefetch, SSRF guard
-internal/health/           server-side stream-health prober
 internal/keystore/         ClearKey DRM key store (keys.json)
 internal/recorder/         ffmpeg-driven screen recording to MP4
 internal/ffmpeg/           ffmpeg resolver (embedded copy or PATH)
-internal/viewers/          session-derived live viewer counts
 web/templates/index.html   page template
 web/static/                ES-module frontend, style.css, vendored hls.js / shaka / mpegts
 cmd/import/                CLI tool to fetch and enrich streams from iptv-org
-seed.m3u                   embedded starter catalog (//go:embed)
 ```
