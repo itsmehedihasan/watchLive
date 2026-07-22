@@ -6,6 +6,7 @@
 package proxy
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"net"
@@ -19,15 +20,18 @@ import (
 
 const (
 	playlistTTL    = 2 * time.Second  // live playlists refresh every target-duration; a micro-cache absorbs herd refreshes
+	playlistLKGTTL = 30 * time.Second // last-known-good retention: how long a stale playlist may be served when the upstream refresh fails
 	segmentTTL     = 5 * time.Minute  // live segments are write-once; 5 min covers any replay window
 	maxPlaylistLen = 10 << 20         // 10 MB — sanity cap for playlist bodies
 	upstreamLimit  = 30 * time.Second // total budget for one upstream fetch
 
-	// prefetchConcurrency caps simultaneous background segment warm-ups so the
-	// proxy never opens an unbounded number of upstream connections. A live
-	// media playlist lists only a handful of segments, so this comfortably
-	// covers several channels playing at once.
-	prefetchConcurrency = 12
+	// prefetchConcurrency caps simultaneous background segment warm-ups. Kept
+	// deliberately low: many IPTV edges pace segment delivery at ~1x real time and
+	// meter bandwidth, so a wide fanout of concurrent warm-ups competes with — and
+	// starves — the segment the player actually needs now, and piles load onto
+	// edges that rate-limit. A small lead (warm the next couple of segments) is the
+	// sweet spot: it still hides latency on fast CDNs without swamping slow ones.
+	prefetchConcurrency = 2
 )
 
 // browserHeaders spoof a real browser so stream servers don't block us.
@@ -70,6 +74,11 @@ type Handler struct {
 	// playlists caches *rewritten* playlist bodies; rewriting is
 	// deterministic for a given URL so caching post-rewrite is safe.
 	playlists *lruCache
+	// playlistsLKG holds the last-known-good rewritten playlist per URL for a
+	// longer window than the fresh micro-cache. It is served only when an upstream
+	// refresh fails (e.g. an edge rate-limiting playlist reloads with 403), so a
+	// transient upstream error doesn't turn into a client reload-storm.
+	playlistsLKG *lruCache
 
 	mu       sync.Mutex
 	inflight map[string]*inflightCall
@@ -142,6 +151,7 @@ func New(cacheBytes int64) *Handler {
 		streamClient: &http.Client{Transport: transport},
 		segments:     newLRUCache(cacheBytes, perItem),
 		playlists:    newLRUCache(16<<20, maxPlaylistLen),
+		playlistsLKG: newLRUCache(16<<20, maxPlaylistLen),
 		inflight:     make(map[string]*inflightCall),
 		sem:          make(chan struct{}, prefetchConcurrency),
 		pf:           make(map[string]struct{}),
@@ -198,12 +208,26 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	res := h.fetchShared(target)
-	if res.err != nil {
-		http.Error(w, "Proxy fetch failed", http.StatusBadGateway)
-		return
-	}
-	if res.status < 200 || res.status > 299 {
-		http.Error(w, fmt.Sprintf("Upstream returned %d", res.status), res.status)
+	if res.err != nil || res.status < 200 || res.status > 299 {
+		// Upstream failed or refused. If this is a playlist we recently fetched
+		// successfully, serve the last-known-good copy instead of propagating the
+		// error: a live HLS client reacts to a playlist error with an immediate
+		// reload, and an edge that rate-limits playlist refreshes (403) would only
+		// see that as more load. Serving stale keeps the player on its normal
+		// cadence and lets the rate-limit cool down. Segments have no LKG entry, so
+		// their errors still surface honestly.
+		if body, ct, ok := h.playlistsLKG.get(target); ok {
+			writePlaylistHeaders(w.Header(), ct)
+			w.Header().Set("X-Cache", "STALE")
+			w.WriteHeader(http.StatusOK)
+			w.Write(body)
+			return
+		}
+		if res.err != nil {
+			http.Error(w, "Proxy fetch failed", http.StatusBadGateway)
+		} else {
+			http.Error(w, fmt.Sprintf("Upstream returned %d", res.status), res.status)
+		}
 		return
 	}
 
@@ -400,6 +424,7 @@ func (h *Handler) fetchUpstream(target string) fetchResult {
 		}
 		rewritten := []byte(RewritePlaylist(string(body), finalURL))
 		h.playlists.set(target, rewritten, "application/vnd.apple.mpegurl", playlistTTL)
+		h.playlistsLKG.set(target, rewritten, "application/vnd.apple.mpegurl", playlistLKGTTL)
 		// Warm the listed segments into the cache so the player's own requests
 		// for them hit the fast path instead of paying an upstream round trip.
 		// Throttled to once per playlist refresh by the 2s playlist micro-cache.
@@ -429,6 +454,7 @@ func (h *Handler) fetchUpstream(target string) fetchResult {
 			ct = "application/dash+xml"
 		}
 		h.playlists.set(target, body, ct, playlistTTL)
+		h.playlistsLKG.set(target, body, ct, playlistLKGTTL)
 		return fetchResult{data: body, contentType: ct, status: resp.StatusCode, isPlaylist: true}
 	}
 
@@ -445,11 +471,17 @@ func (h *Handler) fetchUpstream(target string) fetchResult {
 	return fetchResult{data: body, contentType: contentType, status: resp.StatusCode}
 }
 
-// serveTS handles .ts URLs. A finite body (Content-Length set — the typical HLS
-// segment) is buffered and cached like any other segment. A body of unknown
-// length is a continuous live MPEG-TS channel: it is streamed straight to the
-// client with periodic flushing, bypassing the cache and single-flight (those
-// assume a finite, shareable body — a live stream is neither).
+// serveTS handles .ts URLs. Bytes are always streamed to the client as they
+// arrive (with periodic flushing) — never buffered whole before the first byte.
+// This matters because some Xtream edges pace segment delivery at ~1x real time
+// (a ~10s segment takes ~10s to download); buffer-then-forward would make the
+// player wait a full segment-duration per segment and abort on its load timeout.
+//
+// A finite segment (Content-Length set and within the per-item cap) is *also*
+// tee'd into a buffer and cached once fully read, so repeat viewers hit the fast
+// path — but the live client never waits on that. A body of unknown length is a
+// continuous live MPEG-TS channel: streamed straight through, never cached
+// (single-flight and the cache both assume a finite, shareable body).
 func (h *Handler) serveTS(w http.ResponseWriter, r *http.Request, target string) {
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, target, nil)
 	if err != nil {
@@ -473,41 +505,50 @@ func (h *Handler) serveTS(w http.ResponseWriter, r *http.Request, target string)
 
 	contentType := resp.Header.Get("Content-Type")
 
-	// Finite segment: buffer, cache, serve — same behavior as fetchUpstream.
-	if resp.ContentLength >= 0 && resp.ContentLength <= h.segments.maxItem {
-		body, err := io.ReadAll(io.LimitReader(resp.Body, h.segments.maxItem+1))
-		if err != nil {
-			http.Error(w, "Proxy fetch failed", http.StatusBadGateway)
-			return
-		}
-		if int64(len(body)) <= h.segments.maxItem {
-			h.segments.set(target, body, contentType, segmentTTL)
-		}
-		writeSegmentHeaders(w.Header(), contentType)
-		w.Header().Set("X-Cache", "MISS")
-		w.WriteHeader(http.StatusOK)
-		w.Write(body)
-		return
-	}
+	// A finite segment within the cache's per-item cap is worth caching; capture a
+	// copy as we stream. Unknown-length (live) or oversized bodies stream without
+	// caching. X-Cache reflects which path this is (STREAM = not cached).
+	cacheable := resp.ContentLength >= 0 && resp.ContentLength <= h.segments.maxItem
 
-	// Continuous live stream: stream through, flushing as bytes arrive.
 	writeSegmentHeaders(w.Header(), contentType)
-	w.Header().Set("X-Cache", "STREAM")
+	if cacheable {
+		w.Header().Set("X-Cache", "MISS")
+	} else {
+		w.Header().Set("X-Cache", "STREAM")
+	}
 	w.WriteHeader(http.StatusOK)
+
 	flusher, _ := w.(http.Flusher)
+	var capture bytes.Buffer // holds a copy for caching; used only while cacheable
 	buf := make([]byte, 64<<10)
 	for {
 		n, rerr := resp.Body.Read(buf)
 		if n > 0 {
 			if _, werr := w.Write(buf[:n]); werr != nil {
-				return
+				return // client gone — abandon; never cache a partial body
 			}
 			if flusher != nil {
 				flusher.Flush()
 			}
+			if cacheable {
+				capture.Write(buf[:n])
+				// A server may lie about Content-Length; if the body outgrows the
+				// per-item cap, stop caching (but keep streaming to the client).
+				if int64(capture.Len()) > h.segments.maxItem {
+					cacheable = false
+					capture.Reset()
+				}
+			}
+		}
+		if rerr == io.EOF {
+			// Full body delivered. Cache it only on a clean, complete read.
+			if cacheable {
+				h.segments.set(target, capture.Bytes(), contentType, segmentTTL)
+			}
+			return
 		}
 		if rerr != nil {
-			return
+			return // upstream error mid-stream — client got what we had; don't cache
 		}
 	}
 }

@@ -2,10 +2,12 @@ package proxy
 
 import (
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -318,6 +320,145 @@ func TestProxyRawTSStreaming(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&hits); got != 1 {
 		t.Errorf("finite .ts not cached: %d upstream hits, want 1", got)
+	}
+}
+
+// TestProxyFiniteSegmentStreamsProgressively reproduces the real-world stall:
+// some Xtream edges deliver each finite segment at ~1x real time (a ~10s segment
+// takes ~10s to download). If serveTS buffers the whole segment before writing a
+// single byte to the client, the player sees nothing until the full body lands and
+// aborts on its segment-load timeout — no segment ever plays. The proxy must stream
+// finite segments through as bytes arrive, exactly as a direct player would receive
+// them. We assert on time-to-first-byte against a paced upstream.
+func TestProxyFiniteSegmentStreamsProgressively(t *testing.T) {
+	const chunk = "DATA"
+	const chunks = 4
+	const pace = 150 * time.Millisecond // total body spread over ~600ms
+	bodyLen := len(chunk) * chunks
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Explicit Content-Length + flushing = a finite, known-length body delivered
+		// slowly (the paced-edge case), NOT chunked/unknown-length.
+		w.Header().Set("Content-Type", "video/MP2T")
+		w.Header().Set("Content-Length", strconv.Itoa(bodyLen))
+		w.WriteHeader(http.StatusOK)
+		fl, _ := w.(http.Flusher)
+		for i := 0; i < chunks; i++ {
+			io.WriteString(w, chunk)
+			if fl != nil {
+				fl.Flush()
+			}
+			time.Sleep(pace)
+		}
+	}))
+	defer upstream.Close()
+
+	h := New(10 << 20)
+	h.SetAllowPrivateUpstreams(true) // httptest binds loopback
+	front := httptest.NewServer(h)   // a real server so response streaming is observable
+	defer front.Close()
+
+	segURL := upstream.URL + "/seg.ts"
+	start := time.Now()
+	resp, err := http.Get(front.URL + "/api/proxy?url=" + url.QueryEscape(segURL))
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+
+	// Read just the first chunk and measure how long it took to arrive.
+	first := make([]byte, len(chunk))
+	if _, err := io.ReadFull(resp.Body, first); err != nil {
+		t.Fatalf("reading first chunk: %v", err)
+	}
+	ttfb := time.Since(start)
+	// The upstream spreads the body over ~4*150ms = ~600ms. Buffer-then-forward
+	// delivers the first byte only after the whole body (~600ms). Streaming delivers
+	// the first chunk almost immediately. A 300ms bar cleanly separates the two.
+	if ttfb > 300*time.Millisecond {
+		t.Fatalf("time-to-first-byte %v: proxy buffered the whole segment instead of streaming it", ttfb)
+	}
+
+	rest, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading body: %v", err)
+	}
+	if got := string(first) + string(rest); got != strings.Repeat(chunk, chunks) {
+		t.Fatalf("bad body %q", got)
+	}
+
+	// A finite segment must still be cached: the next request is a HIT with no new
+	// upstream fetch.
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/proxy?url="+url.QueryEscape(segURL), nil))
+	if rec.Header().Get("X-Cache") != "HIT" || rec.Body.String() != strings.Repeat(chunk, chunks) {
+		t.Errorf("finite segment not cached after streaming: X-Cache=%q body=%q", rec.Header().Get("X-Cache"), rec.Body.String())
+	}
+}
+
+// TestProxyServesStalePlaylistOnUpstreamError reproduces the edge rate-limit
+// spiral: the edge serves a playlist fine, then starts 403ing refreshes. Rather
+// than propagate the 403 (which makes a live HLS client reload-storm and deepen
+// the rate-limit), the proxy must serve the last-known-good playlist it already
+// has. Segments, which never have a last-good entry, must still surface errors.
+func TestProxyServesStalePlaylistOnUpstreamError(t *testing.T) {
+	var hits int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&hits, 1) == 1 {
+			w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+			fmt.Fprint(w, "#EXTM3U\n#EXTINF:6.0,\nseg1.ts\n")
+			return
+		}
+		w.WriteHeader(http.StatusForbidden) // edge now rate-limits refreshes
+	}))
+	defer upstream.Close()
+
+	h := New(10 << 20)
+	h.SetAllowPrivateUpstreams(true) // httptest binds loopback
+	// Shared controllable clock so we can expire the fresh micro-cache (forcing a
+	// re-fetch) while staying inside the longer last-known-good window.
+	now := time.Now()
+	clock := func() time.Time { return now }
+	h.playlists.now = clock
+	h.playlistsLKG.now = clock
+
+	plURL := upstream.URL + "/live/index.m3u8"
+	do := func() *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/proxy?url="+url.QueryEscape(plURL), nil))
+		return rec
+	}
+	wantSeg := "/api/proxy?url=" + url.QueryEscape(upstream.URL+"/live/seg1.ts")
+
+	// 1) First fetch succeeds and is remembered as last-known-good.
+	if rec := do(); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), wantSeg) {
+		t.Fatalf("first fetch: code=%d body=%q", rec.Code, rec.Body.String())
+	}
+
+	// Expire the fresh micro-cache so the next request re-fetches upstream (403),
+	// but stay well inside the last-known-good retention.
+	now = now.Add(playlistTTL + time.Second)
+
+	// 2) Upstream 403s — the proxy must serve the stale playlist, not the 403.
+	rec := do()
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected stale 200 on upstream 403, got %d", rec.Code)
+	}
+	if rec.Header().Get("X-Cache") != "STALE" {
+		t.Errorf("expected X-Cache STALE, got %q", rec.Header().Get("X-Cache"))
+	}
+	if !strings.Contains(rec.Body.String(), wantSeg) {
+		t.Errorf("stale playlist not served:\n%s", rec.Body.String())
+	}
+
+	// A segment (no last-known-good entry) must still propagate the upstream error.
+	segRec := httptest.NewRecorder()
+	h.ServeHTTP(segRec, httptest.NewRequest(http.MethodGet, "/api/proxy?url="+url.QueryEscape(upstream.URL+"/live/other.m4s"), nil))
+	if segRec.Code != http.StatusForbidden {
+		t.Errorf("segment error should propagate, got %d", segRec.Code)
 	}
 }
 
